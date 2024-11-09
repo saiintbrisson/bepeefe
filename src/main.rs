@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 #![feature(debug_closure_helpers)]
 
 mod isa;
@@ -11,12 +10,12 @@ fn main() {
 
     let (prog, main) = loader::load_elf(&file, entry.as_bytes());
 
-    let instructions: Vec<_> = prog
+    let code: Vec<_> = prog
         .chunks_exact(8)
         .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
         .collect();
 
-    for (idx, insn) in instructions.iter().enumerate() {
+    for (idx, insn) in code.iter().enumerate() {
         let op = insn & 0xFF;
 
         let name = isa::INSTRUCTION_NAME_TABLE[op as usize];
@@ -28,6 +27,7 @@ fn main() {
     }
 
     let mut state = State {
+        code,
         registers: Default::default(),
         program_counter: main as i32,
         stack: Default::default(),
@@ -41,7 +41,7 @@ fn main() {
     while !state.exit {
         let pc = state.program_counter as usize;
 
-        let Some(&instruction) = instructions.get(pc) else {
+        let Some(&instruction) = state.code.get(pc) else {
             eprintln!("no PC at {}", state.program_counter);
             break;
         };
@@ -57,22 +57,23 @@ fn main() {
         let offset = (instruction >> 16) as i16;
         eprintln!("insn @ {:>2}: {name:<14} ({op:02X?}), src: {src:>2}, dst: {dst:>2}, offset: {offset:>5}, imm: {imm:08X?} ({imm:>5}) ({instruction:016X?})", state.program_counter - 1);
 
-        isa::INSTRUCTION_TABLE[op as usize](
-            &mut state,
-            instruction,
-            instructions.get(pc + 1).copied(),
-        );
+        let next = state.code.get(pc + 1).copied();
+        isa::INSTRUCTION_TABLE[op as usize](&mut state, instruction, next);
     }
 
     dbg!(&state);
-    eprintln!("result = {}", state.registers[0]);
+    eprintln!("result = {}", state.registers[0] as i32);
 }
 
 pub struct State {
-    registers: [u64; 11],
+    code: Vec<u64>,
     program_counter: i32,
+
+    registers: [u64; 11],
     stack: Vec<u8>,
+
     call_stack: Vec<CallStackEntry>,
+
     exit: bool,
 }
 

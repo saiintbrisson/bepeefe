@@ -1,30 +1,24 @@
 #include <linux/bpf.h>
 
 static __attribute__((noinline)) __attribute__((section("sec1")))
-long circle(long num) {
+int circle(int num) {
     return num * 10;
 }
 
 static __attribute__((noinline)) __attribute__((section("sec2")))
-long square_the_circle(long num) {
+int square_the_circle(int num) {
     return circle(num) * circle(num);
 }
 
 
-long tringulate_the_squared_the_circle(long num) {
+int tringulate_the_squared_the_circle(int num) {
     return square_the_circle(num) * 3;
 }
 
-// long global __attribute__((section("sec3")));
+int main() {
+    int acc = 0;
 
-// void foo(long* num) {
-//     *num += 1;
-// }
-
-long main() {
-    long acc = 0;
-
-    for (long i = 0; i < 10; i++) {
+    for (int i = 0; i < 10; i++) {
         acc += square_the_circle(3);
     }
 
@@ -36,14 +30,6 @@ long main() {
         }
     }
 
-    acc += 1;
-
-    acc += (long) 783467328445424L;
-
-    // acc += global;
-
-    // foo(&acc);
-    
     return acc;
 }
 

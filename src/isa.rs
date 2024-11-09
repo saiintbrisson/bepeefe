@@ -1,5 +1,5 @@
 //! Implementation of the BPF instruction set architecture.
-//! This was based on the newley released ISA V4, RFC 9669.
+//! This was based on the newly released ISA V4, RFC 9669.
 //!
 //! Reference: <https://datatracker.ietf.org/doc/rfc9669/>
 
@@ -47,144 +47,145 @@ macro_rules! instruction_table {
 }
 
 instruction_table! {
-    BPF_ADD | BPF_X | BPF_ALU =>   add_src_32;
-    BPF_ADD | BPF_X | BPF_ALU64 => add_src_64;
-    BPF_ADD | BPF_K | BPF_ALU =>   add_imm_32;
-    BPF_ADD | BPF_K | BPF_ALU64 => add_imm_64;
+    BPF_ALU   | BPF_X | BPF_ADD => add_src_32;
+    BPF_ALU64 | BPF_X | BPF_ADD => add_src_64;
+    BPF_ALU   | BPF_K | BPF_ADD => add_imm_32;
+    BPF_ALU64 | BPF_K | BPF_ADD => add_imm_64;
 
-    BPF_SUB | BPF_X | BPF_ALU =>   sub_src_32;
-    BPF_SUB | BPF_X | BPF_ALU64 => sub_src_64;
-    BPF_SUB | BPF_K | BPF_ALU =>   sub_imm_32;
-    BPF_SUB | BPF_K | BPF_ALU64 => sub_imm_64;
+    BPF_ALU   | BPF_X | BPF_SUB => sub_src_32;
+    BPF_ALU64 | BPF_X | BPF_SUB => sub_src_64;
+    BPF_ALU   | BPF_K | BPF_SUB => sub_imm_32;
+    BPF_ALU64 | BPF_K | BPF_SUB => sub_imm_64;
 
-    BPF_MUL | BPF_X | BPF_ALU =>   mul_src_32;
-    BPF_MUL | BPF_X | BPF_ALU64 => mul_src_64;
-    BPF_MUL | BPF_K | BPF_ALU =>   mul_imm_32;
-    BPF_MUL | BPF_K | BPF_ALU64 => mul_imm_64;
+    BPF_ALU   | BPF_X | BPF_MUL => mul_src_32;
+    BPF_ALU64 | BPF_X | BPF_MUL => mul_src_64;
+    BPF_ALU   | BPF_K | BPF_MUL => mul_imm_32;
+    BPF_ALU64 | BPF_K | BPF_MUL => mul_imm_64;
 
-    BPF_DIV | BPF_X | BPF_ALU =>   div_src_32;
-    BPF_DIV | BPF_X | BPF_ALU64 => div_src_64;
-    BPF_DIV | BPF_K | BPF_ALU =>   div_imm_32;
-    BPF_DIV | BPF_K | BPF_ALU64 => div_imm_64;
+    BPF_ALU   | BPF_X | BPF_DIV => div_src_32;
+    BPF_ALU64 | BPF_X | BPF_DIV => div_src_64;
+    BPF_ALU   | BPF_K | BPF_DIV => div_imm_32;
+    BPF_ALU64 | BPF_K | BPF_DIV => div_imm_64;
 
-    BPF_OR | BPF_X | BPF_ALU =>   or_src_32;
-    BPF_OR | BPF_X | BPF_ALU64 => or_src_64;
-    BPF_OR | BPF_K | BPF_ALU =>   or_imm_32;
-    BPF_OR | BPF_K | BPF_ALU64 => or_imm_64;
+    BPF_ALU   | BPF_X | BPF_OR => or_src_32;
+    BPF_ALU64 | BPF_X | BPF_OR => or_src_64;
+    BPF_ALU   | BPF_K | BPF_OR => or_imm_32;
+    BPF_ALU64 | BPF_K | BPF_OR => or_imm_64;
 
-    BPF_AND | BPF_X | BPF_ALU =>   and_src_32;
-    BPF_AND | BPF_X | BPF_ALU64 => and_src_64;
-    BPF_AND | BPF_K | BPF_ALU =>   and_imm_32;
-    BPF_AND | BPF_K | BPF_ALU64 => and_imm_64;
+    BPF_ALU   | BPF_X | BPF_AND => and_src_32;
+    BPF_ALU64 | BPF_X | BPF_AND => and_src_64;
+    BPF_ALU   | BPF_K | BPF_AND => and_imm_32;
+    BPF_ALU64 | BPF_K | BPF_AND => and_imm_64;
 
-    BPF_LSH | BPF_X | BPF_ALU =>   lsh_src_32;
-    BPF_LSH | BPF_X | BPF_ALU64 => lsh_src_64;
-    BPF_LSH | BPF_K | BPF_ALU =>   lsh_imm_32;
-    BPF_LSH | BPF_K | BPF_ALU64 => lsh_imm_64;
+    BPF_ALU   | BPF_X | BPF_LSH => lsh_src_32;
+    BPF_ALU64 | BPF_X | BPF_LSH => lsh_src_64;
+    BPF_ALU   | BPF_K | BPF_LSH => lsh_imm_32;
+    BPF_ALU64 | BPF_K | BPF_LSH => lsh_imm_64;
 
-    BPF_RSH | BPF_X | BPF_ALU =>   rsh_src_32;
-    BPF_RSH | BPF_X | BPF_ALU64 => rsh_src_64;
-    BPF_RSH | BPF_K | BPF_ALU =>   rsh_imm_32;
-    BPF_RSH | BPF_K | BPF_ALU64 => rsh_imm_64;
+    BPF_ALU   | BPF_X | BPF_RSH => rsh_src_32;
+    BPF_ALU64 | BPF_X | BPF_RSH => rsh_src_64;
+    BPF_ALU   | BPF_K | BPF_RSH => rsh_imm_32;
+    BPF_ALU64 | BPF_K | BPF_RSH => rsh_imm_64;
 
-    BPF_NEG | BPF_X | BPF_ALU =>   neg_src_32;
-    BPF_NEG | BPF_X | BPF_ALU64 => neg_src_64;
-    BPF_NEG | BPF_K | BPF_ALU =>   neg_imm_32_64;
-    BPF_NEG | BPF_K | BPF_ALU64 => neg_imm_32_64;
+    BPF_ALU   | BPF_K | BPF_NEG => neg_imm_32;
+    BPF_ALU64 | BPF_K | BPF_NEG => neg_imm_64;
 
-    BPF_MOD | BPF_X | BPF_ALU =>   mod_src_32;
-    BPF_MOD | BPF_X | BPF_ALU64 => mod_src_64;
-    BPF_MOD | BPF_K | BPF_ALU =>   mod_imm_32;
-    BPF_MOD | BPF_K | BPF_ALU64 => mod_imm_64;
+    BPF_ALU   | BPF_X | BPF_MOD => mod_src_32;
+    BPF_ALU64 | BPF_X | BPF_MOD => mod_src_64;
+    BPF_ALU   | BPF_K | BPF_MOD => mod_imm_32;
+    BPF_ALU64 | BPF_K | BPF_MOD => mod_imm_64;
 
-    BPF_XOR | BPF_X | BPF_ALU =>   xor_src_32;
-    BPF_XOR | BPF_X | BPF_ALU64 => xor_src_64;
-    BPF_XOR | BPF_K | BPF_ALU =>   xor_imm_32;
-    BPF_XOR | BPF_K | BPF_ALU64 => xor_imm_64;
+    BPF_ALU   | BPF_X | BPF_XOR => xor_src_32;
+    BPF_ALU64 | BPF_X | BPF_XOR => xor_src_64;
+    BPF_ALU   | BPF_K | BPF_XOR => xor_imm_32;
+    BPF_ALU64 | BPF_K | BPF_XOR => xor_imm_64;
 
-    BPF_MOV | BPF_X | BPF_ALU =>   mov_src_32;
-    BPF_MOV | BPF_X | BPF_ALU64 => mov_src_64;
-    BPF_MOV | BPF_K | BPF_ALU =>   mov_imm_32_64;
-    BPF_MOV | BPF_K | BPF_ALU64 => mov_imm_32_64;
+    BPF_ALU   | BPF_X | BPF_MOV => mov_src_32;
+    BPF_ALU64 | BPF_X | BPF_MOV => mov_src_64;
+    BPF_ALU   | BPF_K | BPF_MOV => mov_imm_32;
+    BPF_ALU64 | BPF_K | BPF_MOV => mov_imm_64;
 
-    BPF_ARSH | BPF_X | BPF_ALU =>   arsh_src_32;
-    BPF_ARSH | BPF_X | BPF_ALU64 => arsh_src_64;
-    BPF_ARSH | BPF_K | BPF_ALU =>   arsh_imm_32;
-    BPF_ARSH | BPF_K | BPF_ALU64 => arsh_imm_64;
+    BPF_ALU   | BPF_X | BPF_ARSH => arsh_src_32;
+    BPF_ALU64 | BPF_X | BPF_ARSH => arsh_src_64;
+    BPF_ALU   | BPF_K | BPF_ARSH => arsh_imm_32;
+    BPF_ALU64 | BPF_K | BPF_ARSH => arsh_imm_64;
 
-    BPF_END | BPF_TO_LE | BPF_ALU => le;
-    BPF_END | BPF_TO_BE | BPF_ALU => be;
+    BPF_ALU   | BPF_TO_LE | BPF_END => le;
+    BPF_ALU   | BPF_TO_BE | BPF_END => be;
+    BPF_ALU64 | BPF_END => swap;
 
-    BPF_JA | BPF_K | BPF_JMP32 => ja_32;
-    BPF_JA | BPF_K | BPF_JMP =>   ja_64;
+    BPF_JMP32 | BPF_K | BPF_JA => ja_32;
+    BPF_JMP   | BPF_K | BPF_JA => ja_64;
 
-    BPF_JEQ | BPF_X | BPF_JMP32 => jeq_src_32;
-    BPF_JEQ | BPF_K | BPF_JMP32 => jeq_imm_32;
-    BPF_JEQ | BPF_X | BPF_JMP =>   jeq_src_64;
-    BPF_JEQ | BPF_K | BPF_JMP =>   jeq_imm_64;
+    BPF_JMP32 | BPF_X | BPF_JEQ => jeq_src_32;
+    BPF_JMP32 | BPF_K | BPF_JEQ => jeq_imm_32;
+    BPF_JMP   | BPF_X | BPF_JEQ => jeq_src_64;
+    BPF_JMP   | BPF_K | BPF_JEQ => jeq_imm_64;
 
-    BPF_JGT | BPF_X | BPF_JMP32 => jgt_src_32;
-    BPF_JGT | BPF_K | BPF_JMP32 => jgt_imm_32;
-    BPF_JGT | BPF_X | BPF_JMP =>   jgt_src_64;
-    BPF_JGT | BPF_K | BPF_JMP =>   jgt_imm_64;
+    BPF_JMP32 | BPF_X | BPF_JGT => jgt_src_32;
+    BPF_JMP32 | BPF_K | BPF_JGT => jgt_imm_32;
+    BPF_JMP   | BPF_X | BPF_JGT => jgt_src_64;
+    BPF_JMP   | BPF_K | BPF_JGT => jgt_imm_64;
 
-    BPF_JGE | BPF_X | BPF_JMP32 => jge_src_32;
-    BPF_JGE | BPF_K | BPF_JMP32 => jge_imm_32;
-    BPF_JGE | BPF_X | BPF_JMP =>   jge_src_64;
-    BPF_JGE | BPF_K | BPF_JMP =>   jge_imm_64;
+    BPF_JMP32 | BPF_X | BPF_JGE => jge_src_32;
+    BPF_JMP32 | BPF_K | BPF_JGE => jge_imm_32;
+    BPF_JMP   | BPF_X | BPF_JGE => jge_src_64;
+    BPF_JMP   | BPF_K | BPF_JGE => jge_imm_64;
 
-    BPF_JSET | BPF_X | BPF_JMP32 => jset_src_32;
-    BPF_JSET | BPF_K | BPF_JMP32 => jset_imm_32;
-    BPF_JSET | BPF_X | BPF_JMP =>   jset_src_64;
-    BPF_JSET | BPF_K | BPF_JMP =>   jset_imm_64;
+    BPF_JMP32 | BPF_X | BPF_JSET => jset_src_32;
+    BPF_JMP32 | BPF_K | BPF_JSET => jset_imm_32;
+    BPF_JMP   | BPF_X | BPF_JSET => jset_src_64;
+    BPF_JMP   | BPF_K | BPF_JSET => jset_imm_64;
 
-    BPF_JNE | BPF_X | BPF_JMP32 => jne_src_32;
-    BPF_JNE | BPF_K | BPF_JMP32 => jne_imm_32;
-    BPF_JNE | BPF_X | BPF_JMP =>   jne_src_64;
-    BPF_JNE | BPF_K | BPF_JMP =>   jne_imm_64;
+    BPF_JMP32 | BPF_X | BPF_JNE => jne_src_32;
+    BPF_JMP32 | BPF_K | BPF_JNE => jne_imm_32;
+    BPF_JMP   | BPF_X | BPF_JNE => jne_src_64;
+    BPF_JMP   | BPF_K | BPF_JNE => jne_imm_64;
 
-    BPF_JSGT | BPF_X | BPF_JMP32 => jsgt_src_32;
-    BPF_JSGT | BPF_K | BPF_JMP32 => jsgt_imm_32;
-    BPF_JSGT | BPF_X | BPF_JMP =>   jsgt_src_64;
-    BPF_JSGT | BPF_K | BPF_JMP =>   jsgt_imm_64;
+    BPF_JMP32 | BPF_X | BPF_JSGT => jsgt_src_32;
+    BPF_JMP32 | BPF_K | BPF_JSGT => jsgt_imm_32;
+    BPF_JMP   | BPF_X | BPF_JSGT => jsgt_src_64;
+    BPF_JMP   | BPF_K | BPF_JSGT => jsgt_imm_64;
 
-    BPF_JSGE | BPF_X | BPF_JMP32 => jsge_src_32;
-    BPF_JSGE | BPF_K | BPF_JMP32 => jsge_imm_32;
-    BPF_JSGE | BPF_X | BPF_JMP =>   jsge_src_64;
-    BPF_JSGE | BPF_K | BPF_JMP =>   jsge_imm_64;
+    BPF_JMP32 | BPF_X | BPF_JSGE => jsge_src_32;
+    BPF_JMP32 | BPF_K | BPF_JSGE => jsge_imm_32;
+    BPF_JMP   | BPF_X | BPF_JSGE => jsge_src_64;
+    BPF_JMP   | BPF_K | BPF_JSGE => jsge_imm_64;
 
-    BPF_JLT | BPF_X | BPF_JMP32 => jlt_src_32;
-    BPF_JLT | BPF_K | BPF_JMP32 => jlt_imm_32;
-    BPF_JLT | BPF_X | BPF_JMP =>   jlt_src_64;
-    BPF_JLT | BPF_K | BPF_JMP =>   jlt_imm_64;
+    BPF_JMP32 | BPF_X | BPF_JLT => jlt_src_32;
+    BPF_JMP32 | BPF_K | BPF_JLT => jlt_imm_32;
+    BPF_JMP   | BPF_X | BPF_JLT => jlt_src_64;
+    BPF_JMP   | BPF_K | BPF_JLT => jlt_imm_64;
 
-    BPF_JLE | BPF_X | BPF_JMP32 => jle_src_32;
-    BPF_JLE | BPF_K | BPF_JMP32 => jle_imm_32;
-    BPF_JLE | BPF_X | BPF_JMP =>   jle_src_64;
-    BPF_JLE | BPF_K | BPF_JMP =>   jle_imm_64;
+    BPF_JMP32 | BPF_X | BPF_JLE => jle_src_32;
+    BPF_JMP32 | BPF_K | BPF_JLE => jle_imm_32;
+    BPF_JMP   | BPF_X | BPF_JLE => jle_src_64;
+    BPF_JMP   | BPF_K | BPF_JLE => jle_imm_64;
 
-    BPF_JSLT | BPF_X | BPF_JMP32 => jslt_src_32;
-    BPF_JSLT | BPF_K | BPF_JMP32 => jslt_imm_32;
-    BPF_JSLT | BPF_X | BPF_JMP =>   jslt_src_64;
-    BPF_JSLT | BPF_K | BPF_JMP =>   jslt_imm_64;
+    BPF_JMP32 | BPF_X | BPF_JSLT => jslt_src_32;
+    BPF_JMP32 | BPF_K | BPF_JSLT => jslt_imm_32;
+    BPF_JMP   | BPF_X | BPF_JSLT => jslt_src_64;
+    BPF_JMP   | BPF_K | BPF_JSLT => jslt_imm_64;
 
-    BPF_JSLE | BPF_X | BPF_JMP32 => jsle_src_32;
-    BPF_JSLE | BPF_K | BPF_JMP32 => jsle_imm_32;
-    BPF_JSLE | BPF_X | BPF_JMP =>   jsle_src_64;
-    BPF_JSLE | BPF_K | BPF_JMP =>   jsle_imm_64;
+    BPF_JMP32 | BPF_X | BPF_JSLE => jsle_src_32;
+    BPF_JMP32 | BPF_K | BPF_JSLE => jsle_imm_32;
+    BPF_JMP   | BPF_X | BPF_JSLE => jsle_src_64;
+    BPF_JMP   | BPF_K | BPF_JSLE => jsle_imm_64;
 
-    BPF_CALL | BPF_K | BPF_JMP => jmp_call;
-    BPF_EXIT | BPF_K | BPF_JMP => exit;
+    BPF_JMP | BPF_K | BPF_CALL => jmp_call;
+    BPF_JMP | BPF_K | BPF_EXIT => exit;
 
-    MODE_MEM | SIZE_W | BPF_LDX => ldx_mem_w;
-    MODE_MEM | SIZE_W | BPF_STX => stx_mem_w;
+    BPF_LD | SIZE_DW | MODE_IMM => ld_imm64;
 
-    MODE_MEM | SIZE_H | BPF_LDX => ldx_mem_h;
-    MODE_MEM | SIZE_H | BPF_STX => stx_mem_h;
+    BPF_LDX | SIZE_W | MODE_MEM => ldx_mem_w;
+    BPF_STX | SIZE_W | MODE_MEM => stx_mem_w;
 
-    MODE_MEM | SIZE_B | BPF_LDX => ldx_mem_b;
-    MODE_MEM | SIZE_B | BPF_STX => stx_mem_b;
+    BPF_LDX | SIZE_H | MODE_MEM => ldx_mem_h;
+    BPF_STX | SIZE_H | MODE_MEM => stx_mem_h;
 
-    MODE_MEM | SIZE_DW | BPF_LDX => ldx_mem_dw;
-    MODE_MEM | SIZE_DW | BPF_STX => stx_mem_dw;
+    BPF_LDX | SIZE_B | MODE_MEM => ldx_mem_b;
+    BPF_STX | SIZE_B | MODE_MEM => stx_mem_b;
+
+    BPF_LDX | SIZE_DW | MODE_MEM => ldx_mem_dw;
+    BPF_STX | SIZE_DW | MODE_MEM => stx_mem_dw;
 }

@@ -4,9 +4,13 @@
 //   | 3 bits | 2 bits |   3 bits          |
 //   |  mode  |  size  | instruction class |
 //   +--------+--------+-------------------+
-//   (MSB)                             (LSB)its
+//   (MSB)                             (LSB)
 //
-// From: <https://www.kernel.org/doc/Documentation/networking/filter.txt>
+// From: <https://github.com/torvalds/linux/blob/master/Documentation/bpf/classic_vs_extended.rst>
+//
+// The RFC itself doesn't specify the width of each section. Go figure.
+// This is the only possible arrangement, though, but I'd expect the RFC to
+// mention bit width of stuff...
 
 /// 64-bit immediate instructions
 pub const MODE_IMM: u8 = 0x0 << 5;
@@ -65,4 +69,24 @@ mem_insns! {
     ldx_mem_h,   stx_mem_h,  u16;
     ldx_mem_b,   stx_mem_b,  u8;
     ldx_mem_dw,  stx_mem_dw, u64;
+}
+
+pub fn ld_imm64(state: &mut crate::State, val: u64, next: Option<u64>) {
+    let src = (val >> 12) as usize & 0xF;
+    let dst = (val >> 8) as usize & 0xF;
+
+    match src {
+        0 => {
+            state.program_counter += 1;
+            let next_imm = next.unwrap() << 32;
+            state.registers[dst] = next_imm | (val >> 32);
+        }
+        // 1 => dst = map_by_fd(imm)                      imm: map fd      dst: map
+        // 2 => dst = map_val(map_by_fd(imm)) + next_imm  imm: map fd      dst: data address
+        // 3 => dst = var_addr(imm)                       imm: variable id dst: data address
+        // 4 => dst = code_addr(imm)                      imm: integer     dst: code address
+        // 5 => dst = map_by_idx(imm)                     imm: map index   dst: map
+        // 6 => dst = map_val(map_by_idx(imm)) + next_imm imm: map index   dst: data address
+        _ => unreachable!("unimplemented src reg for imm64 load: {src}"),
+    }
 }
