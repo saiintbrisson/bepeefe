@@ -45,7 +45,7 @@ macro_rules! mem_insns {
                 let offset = (val >> 16) as i16;
 
                 let ptr = (state.registers[src as usize] as isize + offset as isize) as usize;
-                let val = state.stack[ptr - SIZE..ptr].try_into().unwrap();
+                let val = state.stack[ptr..ptr + SIZE].try_into().unwrap();
                 state.registers[dst as usize] = $size::from_ne_bytes(val) as u64;
             }
 
@@ -58,7 +58,7 @@ macro_rules! mem_insns {
 
                 let val = state.registers[src as usize] as $size;
                 let ptr = (state.registers[dst as usize] as isize + offset as isize) as usize;
-                (&mut state.stack[ptr - SIZE..ptr]).copy_from_slice(&val.to_ne_bytes());
+                (&mut state.stack[ptr..ptr + SIZE]).copy_from_slice(&val.to_ne_bytes());
             }
         )+
     };
@@ -78,7 +78,7 @@ pub fn ld_imm64(state: &mut crate::State, val: u64, next: Option<u64>) {
     match src {
         0 => {
             state.program_counter += 1;
-            let next_imm = next.unwrap() << 32;
+            let next_imm = next.unwrap();
             state.registers[dst] = next_imm | (val >> 32);
         }
         // 1 => dst = map_by_fd(imm)                      imm: map fd      dst: map

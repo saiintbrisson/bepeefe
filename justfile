@@ -1,5 +1,5 @@
-run in="bpf.c": (build in)
-    cargo r -- bpf.o main
+run in="bpf.c" out="bpf.o" program="entry": (build in out)
+    cargo r -- {{out}} {{program}}
 
 build in="bpf.c" out="bpf.o":
     clang-14 -g -o {{out}} -target bpf -c {{in}}

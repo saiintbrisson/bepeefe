@@ -143,10 +143,37 @@ pub fn exit(state: &mut crate::State, _: u64, _: Option<u64>) {
 
 pub fn jmp_call(state: &mut crate::State, val: u64, _: Option<u64>) {
     let src = (val >> 12) & 0xF;
+    let imm = val >> 32;
 
     match src {
         0 => {
-            eprintln!("{state:#?}");
+            match imm {
+                // On kernel 6.8, call 6 is bpf_trace_printk. this could change between versions.
+                // I should implement support for BTF and CO-RE eventually.
+                // static long (* const bpf_trace_printk)(const char *fmt, __u32 fmt_size, ...) = (void *) 6;
+                // R1: addr, R2: size, R3/R4/R5: formatting stufffff
+                // R0: n of written bytes or negative error code
+                6 => {
+                    let addr = state.registers[1] as u32 as usize;
+                    let len = state.registers[2] as u32 as usize;
+
+                    let data = &state.stack[addr..addr + len];
+                    let s = std::ffi::CStr::from_bytes_until_nul(&data);
+                    eprintln!("Print: {s:?}");
+                    state.registers[0] = s
+                        .map(|f| f.to_bytes().len() as u64)
+                        .unwrap_or(-22i64 as u64 /* EINVAL */);
+                }
+                // static __u64 (* const bpf_get_current_pid_tgid)(void) = (void *) 14;
+                // R0: tgid << 32 | pid
+                14 => {
+                    // TODO: should the vm have a configurable execution context?
+                    state.registers[0] = (0xDEAD << 32) | 0xBEEF;
+                }
+                call => {
+                    panic!("unhandled {call}: {state:#?}");
+                }
+            }
         }
         // BPF-local functions
         1 => {
@@ -154,7 +181,7 @@ pub fn jmp_call(state: &mut crate::State, val: u64, _: Option<u64>) {
                 registers: Default::default(),
                 caller: state.program_counter,
                 // the kernel tracks stack usage, i'll get there eventually
-                stack_size: 32,
+                stack_size: 128,
             };
 
             // preserve R6-R9
@@ -166,7 +193,6 @@ pub fn jmp_call(state: &mut crate::State, val: u64, _: Option<u64>) {
                 panic!("{state:#?}");
             }
 
-            let imm = val >> 32;
             state.program_counter += imm as i32;
         }
         // 2 => {}

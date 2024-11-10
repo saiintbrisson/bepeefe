@@ -35,8 +35,8 @@ fn main() {
         exit: false,
     };
 
-    state.registers[10] = 128;
-    state.stack = vec![0; 128];
+    state.registers[10] = 512;
+    state.stack = vec![0; 512];
 
     while !state.exit {
         let pc = state.program_counter as usize;

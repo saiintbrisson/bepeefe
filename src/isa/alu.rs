@@ -61,7 +61,7 @@ alu! {
     add_src_32,    |dst, src, _| (dst as u32).wrapping_add(src as u32);
     add_src_64,    |dst, src, _| dst.wrapping_add(src);
     add_imm_32,    |dst, _, imm| (dst as u32).wrapping_add(imm as u32);
-    add_imm_64,    |dst, _, imm| dst.wrapping_add(imm);
+    add_imm_64,    |dst, _, imm| dst.wrapping_add_signed(imm as i32 as i64);
 
     sub_src_32,    |dst, src, _| (dst as u32).wrapping_sub(src as u32);
     sub_src_64,    |dst, src, _| dst.wrapping_sub(src);
