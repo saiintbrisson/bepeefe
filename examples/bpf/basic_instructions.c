@@ -20,7 +20,6 @@ int entry() {
         acc += square_the_circle(3);
     }
 
-
     while (1) {
         acc -= tringulate_the_squared_the_circle(1);
 

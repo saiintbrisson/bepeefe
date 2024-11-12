@@ -1,16 +1,19 @@
 #![feature(debug_closure_helpers)]
 
+// mod bpf_prog;
 mod isa;
 mod loader;
+mod maps;
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let file = args.next().unwrap();
     let entry = args.next().unwrap();
 
-    let (prog, main) = loader::load_elf(&file, entry.as_bytes());
+    let program = loader::load_elf(&file, entry.as_bytes());
 
-    let code: Vec<_> = prog
+    let code: Vec<_> = program
+        .code
         .chunks_exact(8)
         .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
         .collect();
@@ -29,7 +32,7 @@ fn main() {
     let mut state = State {
         code,
         registers: Default::default(),
-        program_counter: main as i32,
+        program_counter: program.entry as i32,
         stack: Default::default(),
         call_stack: Vec::with_capacity(1),
         exit: false,
