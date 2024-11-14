@@ -9,7 +9,6 @@ pub mod mem;
 const DEFAULT_SIZE: usize = 1024 * 1024; // 1 MiB
 
 pub struct Vm {
-    // bump: &'static Bump,
     pub program: Program,
     pub program_counter: i32,
     pub exit: bool,
