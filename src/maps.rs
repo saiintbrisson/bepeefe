@@ -1,49 +1,105 @@
-pub struct BpfMap {}
+use crate::program::btf::{Btf, BtfMap};
+
+mod array;
 
 #[repr(u32)]
 #[derive(Debug)]
 pub enum MapType {
-    Unspec = 0,
-    Hash = 1,
-    Array = 2,
-    ProgArray = 3,
-    PerfEventArray = 4,
-    PercpuHash = 5,
-    PercpuArray = 6,
-    StackTrace = 7,
-    CgroupArray = 8,
-    LruHash = 9,
-    LruPercpuHash = 10,
-    LpmTrie = 11,
-    ArrayOfMaps = 12,
-    HashOfMaps = 13,
-    Devmap = 14,
-    Sockmap = 15,
-    Cpumap = 16,
-    Xskmap = 17,
-    Sockhash = 18,
-    CgroupStorage = 19,
-    ReuseportSockarray = 20,
-    PercpuCgroupStorage = 21,
-    Queue = 22,
-    Stack = 23,
-    SkStorage = 24,
-    DevmapHash = 25,
-    StructOps = 26,
-    Ringbuf = 27,
-    InodeStorage = 28,
-    TaskStorage = 29,
-    BloomFilter = 30,
-    UserRingbuf = 31,
-    CgrpStorage = 32,
+    Unspec,
+    Hash,
+    Array(array::Array),
+    ProgArray,
+    PerfEventArray,
+    PercpuHash,
+    PercpuArray,
+    StackTrace,
+    CgroupArray,
+    LruHash,
+    LruPercpuHash,
+    LpmTrie,
+    ArrayOfMaps,
+    HashOfMaps,
+    Devmap,
+    Sockmap,
+    Cpumap,
+    Xskmap,
+    Sockhash,
+    CgroupStorage,
+    ReuseportSockarray,
+    PercpuCgroupStorage,
+    Queue,
+    Stack,
+    SkStorage,
+    DevmapHash,
+    StructOps,
+    Ringbuf,
+    InodeStorage,
+    TaskStorage,
+    BloomFilter,
+    UserRingbuf,
+    CgrpStorage,
+}
+
+macro_rules! delegate_map_impl {
+    ($($name:ident,)+) => {
+        #[allow(dead_code)]
+        pub fn map_layout(&self) -> std::alloc::Layout {
+            match self {
+                $(Self::$name(map) => map.map_layout(),)+
+                _ => todo!(),
+            }
+        }
+
+        #[allow(dead_code)]
+        pub fn element_layout(&self) -> std::alloc::Layout {
+            match self {
+                $(Self::$name(map) => map.element_layout(),)+
+                _ => todo!(),
+            }
+        }
+
+        pub fn key_size(&self) -> usize {
+            match self {
+                $(Self::$name(map) => map.key_size(),)+
+                _ => todo!(),
+            }
+        }
+
+        pub fn init(&mut self, mem: &mut crate::vm::mem::VmMem) {
+            match self {
+                $(Self::$name(map) => map.init(mem),)+
+                _ => todo!(),
+            }
+        }
+
+        pub fn lookup_elem(&self, key: &[u8]) -> Option<*const u8> {
+            match self {
+                $(Self::$name(map) => map.lookup_elem(key),)+
+                _ => todo!(),
+            }
+        }
+
+        #[allow(dead_code)]
+        pub fn update_elem(&mut self, key: &[u8], value: *const u8) -> std::io::Result<()> {
+            match self {
+                $(Self::$name(map) => map.update_elem(key, value),)+
+                _ => todo!(),
+            }
+        }
+    };
 }
 
 impl MapType {
-    pub fn from_u32(n: u32) -> Option<Self> {
-        Some(match n {
+    pub fn create_from_btf(btf: &Btf, map: BtfMap<'_>) -> Option<Self> {
+        Some(match map.r#type? {
             0 => Self::Unspec,
             1 => Self::Hash,
-            2 => Self::Array,
+            2 => Self::Array(array::Array::new(
+                map.max_entries?,
+                map.value_size
+                    .or_else(|| map.value?.kind.size(btf))
+                    .expect("map missing value size"),
+            )),
             3 => Self::ProgArray,
             4 => Self::PerfEventArray,
             5 => Self::PercpuHash,
@@ -77,12 +133,8 @@ impl MapType {
             _ => return None,
         })
     }
+
+    delegate_map_impl! {
+        Array,
+    }
 }
-
-// trait Map<K> {
-//     fn lookup_elem(&self, key: K);
-// }
-
-// struct Foo {
-//     maps: HashMap<usize, Box<dyn Map>>,
-// }

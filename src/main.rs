@@ -1,18 +1,23 @@
-#![feature(debug_closure_helpers)]
+#![feature(alloc_layout_extra)]
 
 // mod bpf_prog;
 mod isa;
-mod loader;
 mod maps;
+mod program;
+mod vm;
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let file = args.next().unwrap();
     let entry = args.next().unwrap();
 
-    let program = loader::load_elf(&file, entry.as_bytes());
+    let file = std::fs::read(file).unwrap();
+    let program = program::load_object(file, &entry);
 
-    let code: Vec<_> = program
+    let mut vm = vm::Vm::new(program);
+
+    let code: Vec<_> = vm
+        .program
         .code
         .chunks_exact(8)
         .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
@@ -29,27 +34,15 @@ fn main() {
         eprintln!("{idx:>2}: {name:<14} ({op:02X?}), src: {src:>2}, dst: {dst:>2}, offset: {offset:>5}, imm: {imm:08X?} ({imm:>5}) ({insn:016X?})");
     }
 
-    let mut state = State {
-        code,
-        registers: Default::default(),
-        program_counter: program.entry as i32,
-        stack: Default::default(),
-        call_stack: Vec::with_capacity(1),
-        exit: false,
-    };
+    while !vm.exit {
+        let pc = vm.program_counter as usize;
 
-    state.registers[10] = 512;
-    state.stack = vec![0; 512];
-
-    while !state.exit {
-        let pc = state.program_counter as usize;
-
-        let Some(&instruction) = state.code.get(pc) else {
-            eprintln!("no PC at {}", state.program_counter);
+        let Some(&instruction) = code.get(pc) else {
+            eprintln!("no PC at {}", vm.program_counter);
             break;
         };
 
-        state.program_counter += 1;
+        vm.program_counter += 1;
 
         let op = instruction & 0xFF;
 
@@ -58,64 +51,11 @@ fn main() {
         let src = (instruction >> 12) & 0xF;
         let imm = (instruction >> 32) as i32;
         let offset = (instruction >> 16) as i16;
-        eprintln!("insn @ {:>2}: {name:<14} ({op:02X?}), src: {src:>2}, dst: {dst:>2}, offset: {offset:>5}, imm: {imm:08X?} ({imm:>5}) ({instruction:016X?})", state.program_counter - 1);
+        eprintln!("insn @ {:>2}: {name:<14} ({op:02X?}), src: {src:>2}, dst: {dst:>2}, offset: {offset:>5}, imm: {imm:08X?} ({imm:>5}) ({instruction:016X?})", vm.program_counter - 1);
 
-        let next = state.code.get(pc + 1).copied();
-        isa::INSTRUCTION_TABLE[op as usize](&mut state, instruction, next);
+        let next = code.get(pc + 1).copied();
+        isa::INSTRUCTION_TABLE[op as usize](&mut vm, instruction, next);
     }
 
-    dbg!(&state);
-    eprintln!("result = {}", state.registers[0] as i32);
-}
-
-pub struct State {
-    code: Vec<u64>,
-    program_counter: i32,
-
-    registers: [u64; 11],
-    stack: Vec<u8>,
-
-    call_stack: Vec<CallStackEntry>,
-
-    exit: bool,
-}
-
-#[derive(Debug)]
-pub struct CallStackEntry {
-    /// Registers preserved between calls, R6 to R9.
-    registers: [u64; 4],
-    caller: i32,
-    stack_size: usize,
-}
-
-impl std::fmt::Debug for State {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let registers = |f: &mut std::fmt::Formatter<'_>| {
-            let mut registers = f.debug_struct("Registers");
-            for (idx, val) in self.registers.iter().enumerate() {
-                registers.field(&format!("r{idx:<2}"), &format_args!("{val:016?}"));
-            }
-            registers.finish()
-        };
-
-        let stack = |f: &mut std::fmt::Formatter<'_>| {
-            let mut list = f.debug_list();
-            for chunk in self.stack.chunks(16) {
-                list.entry_with(|f| {
-                    Ok(for b in chunk {
-                        f.write_fmt(format_args!("{b:02X?} "))?;
-                    })
-                });
-            }
-            list.finish()
-        };
-
-        f.debug_struct("State")
-            .field_with("registers", registers)
-            .field("program_counter", &self.program_counter)
-            .field("call_stack", &self.call_stack)
-            .field_with("stack", stack)
-            .field("exit", &self.exit)
-            .finish()
-    }
+    eprintln!("result = {}", vm.registers[0] as i32);
 }

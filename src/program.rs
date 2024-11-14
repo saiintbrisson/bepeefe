@@ -1,34 +1,44 @@
-use std::{collections::HashMap, path::Path, rc::Rc};
+use std::{collections::HashMap, rc::Rc};
 
 use btf::Btf;
 use object::{File, Object, ObjectSymbol, SectionIndex};
 
-mod btf;
-mod elf;
+use crate::maps::MapType;
+
+pub mod btf;
+pub mod elf;
 
 pub struct Program {
     pub code: Vec<u8>,
     pub entry: usize,
+    #[allow(dead_code)]
     pub btf: Option<Btf>,
+    pub maps: Vec<ProgramMap>,
 }
 
-pub fn load_elf(path: &impl AsRef<Path>, entry_fn: &[u8]) -> Program {
-    let data = std::fs::read(path).unwrap();
-    let mut loader = Loader::new(&data);
+pub struct ProgramMap {
+    #[allow(dead_code)]
+    pub name: String,
+    pub inner: MapType,
+}
+
+pub fn load_object(object: Vec<u8>, entry_fn: &str) -> Program {
+    let mut loader = Loader::new(&object);
 
     let file = loader.file.clone();
-    let entry_sym = file.symbol_by_name_bytes(entry_fn).unwrap();
+    let entry_sym = file.symbol_by_name(entry_fn).unwrap();
     loader.load_func(&entry_sym);
 
+    let mut maps = Vec::new();
     if let Some(btf) = loader.load_btf() {
-        dbg!(&btf);
-        // let maps = btf.load_maps();
-        // maps.iter().map(|(name, map)| {
-        //     let ty = map.r#type.expect("map missing type");
-        // });
+        let btf_maps = btf.load_maps();
+        for (name, map) in btf_maps {
+            let map = crate::maps::MapType::create_from_btf(btf, map).expect("invalid map type");
+            maps.push((name.to_owned(), map));
+        }
     }
 
-    loader.relocate_symbols();
+    loader.relocate_symbols(&maps[..]);
 
     let cursor = loader
         .loaded_sections
@@ -36,10 +46,19 @@ pub fn load_elf(path: &impl AsRef<Path>, entry_fn: &[u8]) -> Program {
         .unwrap();
     let entry = (cursor + entry_sym.address() as usize) / 8;
 
+    let maps = maps
+        .into_iter()
+        .map(|(name, map)| ProgramMap {
+            name: name.to_str().unwrap().to_owned(),
+            inner: map,
+        })
+        .collect();
+
     Program {
         code: loader.code,
         entry,
         btf: loader.btf,
+        maps,
     }
 }
 

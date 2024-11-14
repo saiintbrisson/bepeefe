@@ -2,6 +2,7 @@
 //! This was based on the newly released ISA V4, RFC 9669.
 //!
 //! Reference: <https://datatracker.ietf.org/doc/rfc9669/>
+#![allow(dead_code)]
 
 /// non-standard load operations
 pub const BPF_LD: u8 = 0x00;
@@ -28,12 +29,12 @@ use alu::*;
 use jmp::*;
 use load::*;
 
-fn noop(_: &mut crate::State, _: u64, _: Option<u64>) {}
+fn noop(_: &mut crate::vm::Vm, _: u64, _: Option<u64>) {}
 
 macro_rules! instruction_table {
     ($($opcode:expr => $name:ident;)+) => {
-        pub const INSTRUCTION_TABLE: [fn(&mut crate::State, u64, Option<u64>); u8::MAX as usize] = {
-            let mut table: [fn(&mut crate::State, u64, Option<u64>); u8::MAX as usize] = [noop; u8::MAX as usize];
+        pub const INSTRUCTION_TABLE: [fn(&mut crate::vm::Vm, u64, Option<u64>); u8::MAX as usize] = {
+            let mut table: [fn(&mut crate::vm::Vm, u64, Option<u64>); u8::MAX as usize] = [noop; u8::MAX as usize];
             $(table[$opcode as usize] = $name;)+
             table
         };
@@ -188,4 +189,6 @@ instruction_table! {
 
     BPF_LDX | SIZE_DW | MODE_MEM => ldx_mem_dw;
     BPF_STX | SIZE_DW | MODE_MEM => stx_mem_dw;
+
+    BPF_STX | SIZE_DW | MODE_ATOMIC => stx_atomic_dw;
 }

@@ -46,7 +46,7 @@ macro_rules! alu {
     ($($name:ident, |$dst:tt, $src:tt, $imm:tt| $func:expr;)+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::State, val: u64, _: Option<u64>) {
+            pub fn $name(state: &mut crate::vm::Vm, val: u64, _: Option<u64>) {
                 let $src = state.registers[(val >> 12) as usize & 0xF];
                 let $dst = state.registers[(val >> 8) as usize & 0xF];
                 let $imm = (val >> 32) as u64;
@@ -118,7 +118,7 @@ macro_rules! signed_alu {
     ($($name:ident { $($offset:pat => |$dst:tt, $src:tt, $imm:tt| $func:expr;)+ })+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::State, val: u64, _: Option<u64>) {
+            pub fn $name(state: &mut crate::vm::Vm, val: u64, _: Option<u64>) {
                 let offset = (val >> 16) & 1;
                 state.registers[(val >> 8) as usize & 0xF] = match offset {
                     $($offset => {
@@ -170,7 +170,7 @@ macro_rules! mov_src {
     ($($name:ident, $uref:ty, $sref:ty, $mask:expr;)+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::State, val: u64, _: Option<u64>) {
+            pub fn $name(state: &mut crate::vm::Vm, val: u64, _: Option<u64>) {
                 /// Offset can be either 0 for mov or 8/16/32 for movsx
                 const MOVSX_OFFSET_MASK: u64 = $mask;
 

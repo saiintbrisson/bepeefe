@@ -2,6 +2,8 @@
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
+use super::Btf;
+
 pub type BtfStrOffset = u32;
 pub type BtfTypeIndex = u32;
 
@@ -227,6 +229,43 @@ impl BtfKind {
         };
 
         Ok(kind)
+    }
+
+    pub fn size(&self, btf: &Btf) -> Option<u32> {
+        match self {
+            BtfKind::Int { size, .. }
+            | BtfKind::Struct { size, .. }
+            | BtfKind::Union { size, .. }
+            | BtfKind::Enum { size, .. }
+            | BtfKind::Float { size }
+            | BtfKind::Datasec { size, .. } => Some(*size),
+
+            BtfKind::Ptr(_ty) => todo!(),
+
+            BtfKind::Array(btf_array) => {
+                let elem_ty = btf
+                    .types
+                    .get(&btf_array.r#type)
+                    .expect("missing array type");
+                let elem_size = elem_ty.kind.size(btf)?;
+                Some(elem_size * btf_array.no_elems)
+            }
+
+            BtfKind::Typedef(ty)
+            | BtfKind::Volatile(ty)
+            | BtfKind::Const(ty)
+            | BtfKind::Restrict(ty)
+            | BtfKind::Var { ty, .. } => {
+                let elem_ty = btf.types.get(ty).expect("missing array type");
+                elem_ty.kind.size(btf)
+            }
+
+            BtfKind::Fwd { .. } | BtfKind::Func { .. } | BtfKind::FuncProto { .. } => None,
+
+            BtfKind::DeclTag => todo!(),
+            BtfKind::TypeTag => todo!(),
+            BtfKind::Enum64 => todo!(),
+        }
     }
 
     /// Returns the number of elements in the array, if the kind represents an

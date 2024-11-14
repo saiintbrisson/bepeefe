@@ -1,8 +1,14 @@
+#![allow(dead_code)]
+
+use std::ffi::CString;
+
 use object::{
     elf::{SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, STT_FUNC},
     Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionFlags,
     SectionIndex, Symbol, SymbolFlags,
 };
+
+use crate::maps::MapType;
 
 use super::Loader;
 
@@ -70,7 +76,7 @@ impl<'data> Loader<'data> {
         self.load_section(section);
     }
 
-    pub fn relocate_symbols(&mut self) {
+    pub fn relocate_symbols(&mut self, maps: &[(CString, MapType)]) {
         for (section, cursor) in &self.loaded_sections {
             let section = self.file.section_by_index(*section).unwrap();
 
@@ -79,13 +85,14 @@ impl<'data> Loader<'data> {
                     panic!("unknown flags {:?}", rel.flags());
                 };
 
-                let relo_target_offset = match rel.target() {
+                let (relo_target_name, relo_target_offset) = match rel.target() {
                     RelocationTarget::Symbol(target) => {
                         let target = self.file.symbol_by_index(target).expect("invalid symbol");
                         let target_section = target.section_index().unwrap();
                         let target_section_offset =
                             self.loaded_sections.get(&target_section).unwrap();
-                        *target_section_offset + target.address() as usize
+                        let target_offset = *target_section_offset + target.address() as usize;
+                        (target.name(), target_offset)
                     }
                     target => todo!("target not supported {target:?}"),
                 };
@@ -96,10 +103,22 @@ impl<'data> Loader<'data> {
 
                 let relocated_offset = match r_type {
                     R_BPF_64_32 => {
-                        (relo_target_offset / 8) as i32 - ((offset - 4) / 8) as i32
+                        (relo_target_offset / 8) as i32 - ((relo_ref_offset - 4) / 8) as i32
                             + relo_addend_offset
                     }
-                    R_BPF_64_64 => (relo_target_offset / 8) as i32 + relo_addend_offset,
+                    R_BPF_64_64 => {
+                        let map = relo_target_name.ok().and_then(|relo_target_name| {
+                            maps.iter()
+                                .enumerate()
+                                .find(|(_, (name, _))| name.to_string_lossy() == relo_target_name)
+                        });
+
+                        if let Some((map_idx, _)) = map {
+                            map_idx as i32
+                        } else {
+                            (relo_target_offset / 8) as i32 + relo_addend_offset
+                        }
+                    }
                     _ => todo!("relocation type not supported {r_type}"),
                 };
 

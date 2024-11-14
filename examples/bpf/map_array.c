@@ -13,7 +13,6 @@ struct {
 SEC("cgroup/skb")
 int entry(struct __sk_buff *ctx) {
     __u32 port = ctx->local_port;
-    BPF_MAP_LOOKUP_ELEM
     long *kbs = bpf_map_lookup_elem(&port_map, &port);
 
     if (kbs) {

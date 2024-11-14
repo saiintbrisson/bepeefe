@@ -9,8 +9,8 @@ use types::{BtfKind, BtfStrOffset, BtfType, BtfTypeIndex, BtfVariable, BtfVariab
 
 use super::Loader;
 
-mod ext;
-mod types;
+pub mod ext;
+pub mod types;
 
 #[derive(Debug)]
 pub struct Btf {
@@ -90,8 +90,6 @@ impl<'data> Loader<'data> {
         }
 
         let btf = Btf { strings, types };
-
-        dbg!(&self.load_btf_ext());
 
         self.btf = Some(btf);
         self.btf.as_ref()

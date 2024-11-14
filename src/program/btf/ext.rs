@@ -5,7 +5,7 @@ use std::io::Read;
 use byteorder::{LittleEndian, ReadBytesExt};
 use object::{Object, ObjectSection};
 
-use crate::loader::{btf::BTF_MAGIC, Loader};
+use crate::program::{btf::BTF_MAGIC, Loader};
 
 #[derive(Debug)]
 struct BtfExtHeader {
