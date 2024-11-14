@@ -38,7 +38,7 @@ impl Vm {
         }
 
         let mut registers: [u64; 11] = Default::default();
-        registers[10] = stack.guest_end_addr().0 as u64;
+        registers[10] = stack.guest_end_addr().0 as u64 - 1;
 
         Self {
             stack,

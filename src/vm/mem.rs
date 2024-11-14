@@ -36,25 +36,27 @@ impl VmMem {
         self.tail_ptr = new_tail;
 
         Some(VmMemRegion {
-            base_ptr: current_tail,
+            base_ptr: self.base_ptr,
             start_ptr: current_tail,
             end_ptr: new_tail,
         })
     }
 
-    pub fn read_as<T>(&self, GuestAddr(addr): GuestAddr) -> Option<T> {
-        let ptr = (self.base_ptr as usize).checked_add(addr)?;
-        if ptr + size_of::<T>() <= self.end_ptr as usize {
-            Some(unsafe { (ptr as *const T).read() })
-        } else {
-            None
-        }
+    pub fn read_as<T>(&self, addr: GuestAddr) -> Option<T> {
+        self.read_ptr(addr, size_of::<T>())
+            .map(|ptr| unsafe { (ptr as *const T).read() })
     }
 
-    pub fn read(&self, GuestAddr(addr): GuestAddr, len: usize) -> Option<&[u8]> {
+    pub fn read(&self, addr: GuestAddr, len: usize) -> Option<&[u8]> {
+        self.read_ptr(addr, len)
+            .map(|ptr| unsafe { std::slice::from_raw_parts(ptr as *const u8, len) })
+    }
+
+    #[inline(always)]
+    fn read_ptr(&self, GuestAddr(addr): GuestAddr, len: usize) -> Option<*const u8> {
         let ptr = (self.base_ptr as usize).checked_add(addr)?;
-        if ptr + len <= self.end_ptr as usize {
-            Some(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) })
+        if ptr + len < self.end_ptr as usize {
+            Some(ptr as *const u8)
         } else {
             None
         }
@@ -86,7 +88,7 @@ impl VmMem {
     }
 
     pub fn into_guest_addr(&self, ptr: *const u8) -> Option<GuestAddr> {
-        if ptr <= self.end_ptr {
+        if ptr < self.end_ptr {
             (ptr as usize)
                 .checked_sub(self.base_ptr as usize)
                 .map(GuestAddr)
@@ -155,6 +157,18 @@ mod tests {
                 .wrapping_byte_add(size_of::<AllocType>())
         );
 
-        vm.alloc_layout(Layout::new::<[u8; 64]>());
+        let second_region = vm
+            .alloc_layout(Layout::new::<[u8; 64]>())
+            .expect("failed to create region");
+        assert_eq!(second_region.base_ptr, vm.base_ptr);
+        assert_eq!(second_region.start_ptr, first_region.end_ptr as *mut u8);
+        assert_eq!(second_region.end_ptr, vm.tail_ptr);
+
+        assert_eq!(
+            second_region.end_ptr,
+            second_region
+                .start_ptr
+                .wrapping_byte_add(size_of::<AllocType>())
+        );
     }
 }
