@@ -2,27 +2,29 @@ use std::alloc::Layout;
 
 use mem::{GuestAddr, VmMem, VmMemRegion};
 
-use crate::program::Program;
+use crate::program::{Program, ProgramMap};
 
 pub mod mem;
 
 const DEFAULT_SIZE: usize = 1024 * 1024; // 1 MiB
 
 pub struct Vm {
-    pub program: Program,
-    pub program_counter: i32,
+    maps: Vec<ProgramMap>,
+
+    pub code: VmCode,
     pub exit: bool,
 
     pub registers: [u64; 11],
 
     pub mem: VmMem,
-    #[allow(dead_code)]
     stack: VmMemRegion,
 }
 
 impl Vm {
     pub fn new(mut program: Program) -> Self {
         let mut mem = VmMem::new(DEFAULT_SIZE);
+
+        let code = VmCode::new(program.code, &mut mem, program.entry);
 
         let stack = mem
             .alloc_layout(
@@ -40,18 +42,18 @@ impl Vm {
         registers[10] = stack.guest_end_addr().0 as u64 - 1;
 
         Self {
-            stack,
-            program_counter: program.entry as i32,
-            program,
+            maps: program.maps,
+            code,
             exit: false,
             registers,
             mem,
+            stack,
         }
     }
 
     pub fn call(&mut self, offset: i32) {
         let mut frame = StackFrame {
-            ret_addr: Some(self.program_counter),
+            ret_addr: Some(self.code.pc),
             registers: Default::default(),
             base_ptr: self.registers[10],
         };
@@ -69,7 +71,7 @@ impl Vm {
             .unwrap();
 
         self.registers[10] -= STACK_FRAME_SIZE as u64;
-        self.program_counter = self.program_counter + offset;
+        self.code.add_offset(offset as isize);
     }
 
     pub fn pop_stack_frame(&mut self) {
@@ -85,7 +87,7 @@ impl Vm {
             .unwrap();
 
         if let Some(addr) = frame.ret_addr {
-            self.program_counter = addr;
+            self.code.pc = addr;
         } else {
             self.exit = true;
         }
@@ -99,7 +101,7 @@ impl Vm {
     }
 
     pub fn map_lookup_elem(&self, map: usize, key_addr: GuestAddr) -> GuestAddr {
-        let map = &self.program.maps[map as usize];
+        let map = &self.maps[map as usize];
         let key = self
             .mem
             .read(key_addr, map.inner.key_size())
@@ -108,6 +110,47 @@ impl Vm {
             .lookup_elem(key)
             .and_then(|key| self.mem.into_guest_addr(key))
             .unwrap_or_default()
+    }
+}
+
+pub struct VmCode {
+    mem: VmMemRegion,
+    len: usize,
+    pc: usize,
+}
+
+impl VmCode {
+    pub fn new(code: Vec<u8>, mem: &mut VmMem, pc: usize) -> Self {
+        let code_layout = Layout::from_size_align(code.len(), 8).expect("code len is too big");
+        let mem = mem.alloc_layout(code_layout).expect("vm mem oom");
+
+        unsafe {
+            code.as_ptr().copy_to(mem.as_ptr().as_ptr(), code.len());
+        }
+
+        Self {
+            mem,
+            len: code.len() / (u64::BITS / 8) as usize,
+            pc,
+        }
+    }
+
+    pub fn code(&self) -> &[u64] {
+        let ptr = self.mem.as_ptr().cast::<u64>().as_ptr();
+        unsafe { std::slice::from_raw_parts(ptr, self.len) }
+    }
+
+    pub fn next(&mut self) -> Option<u64> {
+        self.pc += 1;
+        self.mem.read_at_offset((self.pc - 1) * 8)
+    }
+
+    pub fn add_offset(&mut self, offset: isize) {
+        self.pc = (self.pc as isize + offset) as usize;
+    }
+
+    pub fn pc(&self) -> usize {
+        self.pc
     }
 }
 
@@ -121,7 +164,7 @@ const STACK_FRAME_SIZE: usize = size_of::<StackFrame>();
 #[derive(Debug)]
 pub struct StackFrame {
     /// Return address of the caller.
-    pub ret_addr: Option<i32>,
+    pub ret_addr: Option<usize>,
     /// Registers preserved between calls, R6 to R9.
     pub registers: [u64; 4],
     /// The base stack pointer of this frame.

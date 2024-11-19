@@ -1,12 +1,13 @@
 use crate::program::btf::{Btf, BtfMap};
 
 mod array;
+mod hash_table;
 
 #[repr(u32)]
 #[derive(Debug)]
 pub enum MapType {
     Unspec,
-    Hash,
+    Hash(hash_table::HashTable),
     Array(array::Array),
     ProgArray,
     PerfEventArray,
@@ -42,22 +43,6 @@ pub enum MapType {
 
 macro_rules! delegate_map_impl {
     ($($name:ident,)+) => {
-        #[allow(dead_code)]
-        pub fn map_layout(&self) -> std::alloc::Layout {
-            match self {
-                $(Self::$name(map) => map.map_layout(),)+
-                _ => todo!(),
-            }
-        }
-
-        #[allow(dead_code)]
-        pub fn element_layout(&self) -> std::alloc::Layout {
-            match self {
-                $(Self::$name(map) => map.element_layout(),)+
-                _ => todo!(),
-            }
-        }
-
         pub fn key_size(&self) -> usize {
             match self {
                 $(Self::$name(map) => map.key_size(),)+
@@ -93,7 +78,15 @@ impl MapType {
     pub fn create_from_btf(btf: &Btf, map: BtfMap<'_>) -> Option<Self> {
         Some(match map.r#type? {
             0 => Self::Unspec,
-            1 => Self::Hash,
+            1 => Self::Hash(hash_table::HashTable::new(
+                map.key_size
+                    .or_else(|| map.key?.kind.size(btf))
+                    .expect("map missing key size"),
+                map.value_size
+                    .or_else(|| map.value?.kind.size(btf))
+                    .expect("map missing value size"),
+                map.max_entries?,
+            )),
             2 => Self::Array(array::Array::new(
                 map.max_entries?,
                 map.value_size
@@ -135,6 +128,6 @@ impl MapType {
     }
 
     delegate_map_impl! {
-        Array,
+        Array, Hash,
     }
 }

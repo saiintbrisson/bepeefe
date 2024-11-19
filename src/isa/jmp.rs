@@ -36,7 +36,7 @@ macro_rules! jmp_src_cond {
     ($($name:ident, |$dst:tt, $src:tt| $cond:expr;)+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::vm::Vm, val: u64, _: Option<u64>) {
+            pub fn $name(state: &mut crate::vm::Vm, val: u64) {
                 let dst = (val >> 8) & 0xF;
                 let src = (val >> 12) & 0xF;
 
@@ -44,7 +44,7 @@ macro_rules! jmp_src_cond {
                 let $dst = state.registers[dst as usize];
 
                 if $cond {
-                    state.program_counter += (val >> 16) as i16 as i32;
+                    state.code.add_offset((val >> 16) as i16 as isize);
                 }
             }
         )+
@@ -80,14 +80,14 @@ macro_rules! jmp_imm_cond {
     ($($name:ident, |$dst:tt, $imm:tt| $cond:expr;)+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::vm::Vm, val: u64, _: Option<u64>) {
+            pub fn $name(state: &mut crate::vm::Vm, val: u64) {
                 let dst = (val >> 8) & 0xF;
 
                 let $imm = (val >> 32);
                 let $dst = state.registers[dst as usize];
 
                 if $cond {
-                    state.program_counter += (val >> 16) as i16 as i32;
+                    state.code.add_offset((val >> 16) as i16 as isize);
                 }
             }
         )+
@@ -119,21 +119,20 @@ jmp_imm_cond! {
     jsle_imm_64, |dst, imm| (dst as i64) <= (imm as i64);
 }
 
-pub fn ja_32(state: &mut crate::vm::Vm, val: u64, _: Option<u64>) {
+pub fn ja_32(state: &mut crate::vm::Vm, val: u64) {
     let imm = val >> 32;
-    state.program_counter += imm as i32;
+    state.code.add_offset(imm as i32 as isize);
 }
 
-pub fn ja_64(state: &mut crate::vm::Vm, val: u64, _: Option<u64>) {
-    let offset = (val >> 16) as i16;
-    state.program_counter += offset as i32;
+pub fn ja_64(state: &mut crate::vm::Vm, val: u64) {
+    state.code.add_offset((val >> 16) as i16 as isize);
 }
 
-pub fn exit(state: &mut crate::vm::Vm, _: u64, _: Option<u64>) {
+pub fn exit(state: &mut crate::vm::Vm, _: u64) {
     state.pop_stack_frame();
 }
 
-pub fn jmp_call(state: &mut crate::vm::Vm, val: u64, _: Option<u64>) {
+pub fn jmp_call(state: &mut crate::vm::Vm, val: u64) {
     let src = (val >> 12) & 0xF;
     let imm = val >> 32;
 

@@ -1,80 +1,150 @@
 use std::{
     alloc::Layout,
     hash::{Hash, Hasher},
+    io::{ErrorKind, Result},
+    ptr::NonNull,
 };
 
+#[repr(u8)]
+enum Flag {
+    Vacant,
+    Deleted,
+    Occupied,
+}
+
+enum Search {
+    Match,
+    Free,
+    MatchOrFree,
+}
+
+#[derive(Debug)]
 pub struct HashTable {
-    data: Box<[u8]>,
-    table: hashbrown::HashTable<usize>,
-    key_size: usize,
-    value_size: usize,
-    entry_capacity: usize,
+    flags_ptr: Option<NonNull<Flag>>,
+    data_ptr: Option<NonNull<u8>>,
+
+    max_entries: usize,
+
+    key_layout: Layout,
+    value_layout: Layout,
     entry_layout: Layout,
-    key_offset: usize,
+
     value_offset: usize,
 }
 
 impl HashTable {
-    pub fn new(key_size: usize, value_size: usize, entry_capacity: usize) -> Self {
-        let flag_layout = Layout::new::<u8>();
-        let key_layout = Layout::from_size_align(key_size, 4).unwrap();
-        let value_layout = Layout::from_size_align(value_size, 8).unwrap();
-
-        let (entry_layout, key_offset) = flag_layout.extend(key_layout).unwrap();
-        let (entry_layout, value_offset) = entry_layout.extend(value_layout).unwrap();
-        let entry_layout = entry_layout.pad_to_align();
-
-
+    pub fn new(key_size: u32, value_size: u32, max_entries: u32) -> Self {
+        let key_layout = Layout::from_size_align(key_size as usize, 8).unwrap();
+        let value_layout = Layout::from_size_align(value_size as usize, 8).unwrap();
+        let (entry_layout, value_offset) = key_layout.extend(value_layout).unwrap();
 
         Self {
-            data: vec![0; entry_layout.size()].into_boxed_slice(),
-            table: Default::default(),
-            
-            key_size,
-            key_offset,
-            
-            value_size,
+            flags_ptr: None,
+            data_ptr: None,
+
+            max_entries: max_entries as usize,
+
+            key_layout,
+
+            entry_layout: entry_layout.pad_to_align(),
+
+            value_layout,
             value_offset,
-
-            entry_capacity,
-            entry_layout,
         }
     }
 
-    pub fn insert(&mut self, key: &[u8], value: &[u8]) -> &mut [u8] {
-        assert_eq!(key.len(), self.key_size);
+    pub fn key_size(&self) -> usize {
+        self.key_layout.size()
+    }
 
-        let mut hasher = std::hash::DefaultHasher::new();
-        key.hash(&mut hasher);
-        let hash = hasher.finish();
+    pub fn init(&mut self, mem: &mut crate::vm::mem::VmMem) {
+        let flag_layout = Layout::new::<Flag>()
+            .repeat_packed(self.max_entries)
+            .expect("map capacity is over limit");
 
-        self.table.insert_unique(hash, value, hasher)
+        let (entries_layout, _) = self
+            .entry_layout
+            .repeat(self.max_entries)
+            .expect("invalid map config");
 
-        let mut idx = hash as usize;
+        let (map_layout, entries_offset) = flag_layout.extend(entries_layout).unwrap();
+
+        let alloc_ptr = mem.alloc_layout(map_layout).expect("vm mem oom").as_ptr();
+        self.flags_ptr = Some(alloc_ptr.cast());
+        self.data_ptr = Some(alloc_ptr.map_addr(|ptr| ptr.saturating_add(entries_offset)));
+    }
+
+    fn find(&self, key: &[u8], search: Search) -> Option<NonNull<u8>> {
+        let flags_ptr = self.flags_ptr.expect("map not initialized");
+        let data_ptr = self.data_ptr.expect("map not initialized");
+
+        let hash = hash(key);
+        let mut idx = (hash % self.max_entries as u64) as usize;
+
+        let mut last_free = None;
+
         loop {
-            idx = msi_lookup(hash, exp, idx);
+            let flag_ptr = flags_ptr.map_addr(|ptr| ptr.checked_add(idx).unwrap());
+            let entry_ptr =
+                data_ptr.map_addr(|ptr| ptr.checked_add(idx * self.entry_layout.size()).unwrap());
 
-            if (!t->ht[i]) {
-                // empty, insert here
-                if ((uint32_t)t->len+1 == (uint32_t)1<<EXP) {
-                    return 0;  // out of memory
+            match (unsafe { flag_ptr.read() }, &search) {
+                (Flag::Vacant | Flag::Deleted, Search::Free) => return Some(entry_ptr),
+                (Flag::Vacant, Search::Match) => return None,
+                (Flag::Deleted, Search::Match) | (Flag::Occupied, Search::Free) => {}
+
+                (Flag::Occupied, Search::Match | Search::MatchOrFree) => {
+                    let entry_key: &[u8] = unsafe {
+                        std::slice::from_raw_parts(entry_ptr.as_ptr(), self.key_layout.size())
+                    };
+
+                    if entry_key == key {
+                        return Some(entry_ptr);
+                    }
                 }
-                t->len++;
-                t->ht[i] = key;
-                return key;
-            } else if (!strcmp(t->ht[i], key)) {
-                // found, return canonical instance
-                return t->ht[i];
+                (Flag::Deleted, Search::MatchOrFree) => {
+                    last_free = Some(entry_ptr);
+                }
+                (Flag::Vacant, Search::MatchOrFree) => break,
             }
+
+            idx += 1;
         }
+
+        last_free
+    }
+
+    pub fn lookup_elem(&self, key: &[u8]) -> Option<*const u8> {
+        self.find(key, Search::Match)
+            .map(|ptr| ptr.as_ptr() as *const u8)
+    }
+
+    pub fn update_elem(&mut self, key: &[u8], value: *const u8) -> Result<()> {
+        let ptr = self
+            .find(key, Search::MatchOrFree)
+            .map(|ptr| ptr.as_ptr() as *const u8)
+            .ok_or(ErrorKind::OutOfMemory)?;
+        let ptr = ptr.map_addr(|addr| addr + self.value_offset) as *mut u8;
+
+        unsafe {
+            ptr.copy_from(value, self.value_layout.size());
+        }
+
+        Ok(())
     }
 }
 
-fn msi_lookup(hash: u64, exp: u32, idx: usize) -> usize {
-    let mask = (1 << exp) - 1;
-    let step = (hash as usize >> (64 - exp)) | 1;
-    return (idx + step) & mask;
+fn hash(key: &[u8]) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
 }
+
+// fn msi_lookup(hash: u64, exp: u32, idx: usize) -> usize {
+//     let mask = (1 << exp) - 1;
+//     let step = (hash as usize >> (64 - exp)) | 1;
+//     return (idx + step) & mask;
+// }
 
 // // Compute the next candidate index. Initialize idx to the hash.
 // int32_t ht_lookup(uint64_t hash, int exp, int32_t idx)

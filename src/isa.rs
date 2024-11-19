@@ -29,12 +29,12 @@ use alu::*;
 use jmp::*;
 use load::*;
 
-fn noop(_: &mut crate::vm::Vm, _: u64, _: Option<u64>) {}
+fn noop(_: &mut crate::vm::Vm, _: u64) {}
 
 macro_rules! instruction_table {
     ($($opcode:expr => $name:ident;)+) => {
-        pub const INSTRUCTION_TABLE: [fn(&mut crate::vm::Vm, u64, Option<u64>); u8::MAX as usize] = {
-            let mut table: [fn(&mut crate::vm::Vm, u64, Option<u64>); u8::MAX as usize] = [noop; u8::MAX as usize];
+        pub const INSTRUCTION_TABLE: [fn(&mut crate::vm::Vm, u64); u8::MAX as usize] = {
+            let mut table: [fn(&mut crate::vm::Vm, u64); u8::MAX as usize] = [noop; u8::MAX as usize];
             $(table[$opcode as usize] = $name;)+
             table
         };

@@ -4,6 +4,16 @@ use std::{
     ptr::NonNull,
 };
 
+macro_rules! check_bounds {
+    ($ty:ty, $ptr:expr, $start:expr, $end:expr) => {
+        ($ptr as usize) >= ($start as usize)
+            && ($ptr as usize + size_of::<$ty>()) <= ($end as usize)
+    };
+}
+
+/// This is a very simple memory arena. The goal is to pass virtual memory
+/// addresses to the VM and allow it to read everything it is allowed to, such
+/// as the stack or map values.
 pub struct VmMem {
     base_ptr: *const u8,
     tail_ptr: *mut u8,
@@ -11,6 +21,11 @@ pub struct VmMem {
 }
 
 impl VmMem {
+    /// Creates and allocated a new memory arena.
+    ///
+    /// # Panics
+    ///
+    /// If the capacity is not a multiple of two.
     pub fn new(capacity: usize) -> Self {
         assert!(capacity.is_power_of_two());
 
@@ -24,9 +39,14 @@ impl VmMem {
         }
     }
 
+    /// Allocates a new memory region with the size and alignment of the given
+    /// layout. The returned region contains a well-aligned pointer to the
+    /// allocated region.
     pub fn alloc_layout(&mut self, layout: Layout) -> Option<VmMemRegion> {
-        let size = layout.pad_to_align().size();
         let current_tail = self.tail_ptr;
+
+        let align_offset = current_tail.align_offset(layout.align());
+        let size = layout.pad_to_align().size() + align_offset;
         let new_tail = (current_tail as usize).checked_add(size)? as *mut u8;
 
         if new_tail as *const u8 > self.end_ptr {
@@ -37,7 +57,7 @@ impl VmMem {
 
         Some(VmMemRegion {
             base_ptr: self.base_ptr,
-            start_ptr: current_tail,
+            start_ptr: current_tail.map_addr(|tail| tail + align_offset),
             end_ptr: new_tail,
         })
     }
@@ -88,7 +108,7 @@ impl VmMem {
     }
 
     pub fn into_guest_addr(&self, ptr: *const u8) -> Option<GuestAddr> {
-        if ptr < self.end_ptr {
+        if check_bounds!((), ptr, self.base_ptr, self.end_ptr) {
             (ptr as usize)
                 .checked_sub(self.base_ptr as usize)
                 .map(GuestAddr)
@@ -105,8 +125,18 @@ pub struct VmMemRegion {
 }
 
 impl VmMemRegion {
-    pub fn into_ptr(self) -> NonNull<u8> {
+    pub fn as_ptr(&self) -> NonNull<u8> {
         NonNull::new(self.start_ptr).expect("invalid region")
+    }
+
+    pub fn read_at_offset<T>(&self, offset: usize) -> Option<T> {
+        let start = self.start_ptr as usize;
+        let ptr = start.checked_add(offset)?;
+        if check_bounds!(T, ptr, self.start_ptr, self.end_ptr) {
+            Some(unsafe { (ptr as *const T).read() })
+        } else {
+            None
+        }
     }
 
     #[allow(dead_code)]
@@ -170,5 +200,28 @@ mod tests {
                 .start_ptr
                 .wrapping_byte_add(size_of::<AllocType>())
         );
+    }
+
+    #[test]
+    fn alloc_respects_layout_alignment() {
+        let mut vm = VmMem::new(128);
+        assert_eq!(vm.base_ptr, vm.tail_ptr);
+
+        let first_region = vm
+            .alloc_layout(Layout::from_size_align(4, 4).unwrap())
+            .expect("failed to create region");
+        assert_eq!(first_region.start_ptr.align_offset(4), 0);
+        assert_eq!(first_region.start_ptr, vm.tail_ptr.wrapping_sub(4));
+        assert_eq!(first_region.end_ptr, vm.tail_ptr);
+
+        let second_region = vm
+            .alloc_layout(Layout::from_size_align(4, 8).unwrap())
+            .expect("failed to create region");
+        assert_eq!(second_region.start_ptr.align_offset(8), 0);
+        assert_eq!(
+            second_region.start_ptr as *const u8,
+            first_region.end_ptr.wrapping_add(4)
+        );
+        assert_eq!(second_region.end_ptr, vm.tail_ptr);
     }
 }

@@ -40,7 +40,7 @@ pub const SIZE_DW: u8 = 3 << 3;
 macro_rules! mem_insns {
     ($($ld:ident, $st:ident, $size:ident;)+) => {
         $(
-            pub fn $ld(state: &mut crate::vm::Vm, val: u64, _: Option<u64>) {
+            pub fn $ld(state: &mut crate::vm::Vm, val: u64) {
                 const SIZE: usize = ($size::BITS / 8) as usize;
 
                 let dst = (val >> 8) & 0xF;
@@ -56,7 +56,7 @@ macro_rules! mem_insns {
                 state.registers[dst as usize] = $size::from_ne_bytes(val) as u64;
             }
 
-            pub fn $st(state: &mut crate::vm::Vm, val: u64, _: Option<u64>) {
+            pub fn $st(state: &mut crate::vm::Vm, val: u64) {
                 let dst = (val >> 8) & 0xF;
                 let src = (val >> 12) & 0xF;
                 let offset = (val >> 16) as i16;
@@ -80,14 +80,13 @@ mem_insns! {
     ldx_mem_dw,  stx_mem_dw, u64;
 }
 
-pub fn ld_imm64(state: &mut crate::vm::Vm, val: u64, next: Option<u64>) {
+pub fn ld_imm64(state: &mut crate::vm::Vm, val: u64) {
     let src = (val >> 12) as usize & 0xF;
     let dst = (val >> 8) as usize & 0xF;
 
     match src {
         0 => {
-            state.program_counter += 1;
-            let next_imm = next.unwrap();
+            let next_imm = state.code.next().unwrap();
             state.registers[dst] = next_imm | (val >> 32);
         }
         // 1 => dst = map_by_fd(imm)                      imm: map fd      dst: map
@@ -116,23 +115,17 @@ pub const ATOMIC_XCHG: u64 = 0xe0 | ATOMIC_FETCH;
 /// atomic compare and exchange
 pub const ATOMIC_CMPXCHG: u64 = 0xf0 | ATOMIC_FETCH;
 
-pub fn stx_atomic_dw(state: &mut crate::vm::Vm, val: u64, _: Option<u64>) {
+pub fn stx_atomic_dw(state: &mut crate::vm::Vm, val: u64) {
     let src = (val >> 12) as usize & 0xF;
     let dst = (val >> 8) as usize & 0xF;
     let offset = (val >> 16) as i16;
     let imm = val >> 32;
 
+    let ptr = (state.registers[dst as usize] as isize + offset as isize) as usize;
+
     match imm {
         ATOMIC_ADD | ATOMIC_FETCH => {
-            let ptr = (state.registers[dst as usize] as isize + offset as isize) as usize;
-            let val = state
-                .mem
-                .read(crate::vm::mem::GuestAddr(ptr), 8)
-                .unwrap()
-                .try_into()
-                .unwrap();
-
-            let val = u64::from_ne_bytes(val);
+            let val: u64 = state.mem.read_as(GuestAddr(ptr)).expect("failed to read");
             let new_val = val + state.registers[src as usize];
             state
                 .mem
