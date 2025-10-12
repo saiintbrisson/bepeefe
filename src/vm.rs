@@ -25,14 +25,8 @@ impl Vm {
         let mut mem = VmMem::new(DEFAULT_SIZE);
 
         let code = VmCode::new(program.code, &mut mem, program.entry);
-
-        let stack = mem
-            .alloc_layout(
-                Layout::new::<u8>()
-                    .repeat_packed(10 * 1024)
-                    .expect("valid stack layout"),
-            )
-            .expect("stack is valid");
+        let stack_layout = Layout::from_size_align(10 * 1024, 8).unwrap();
+        let stack = mem.alloc_layout(stack_layout).expect("stack is valid");
 
         for map in &mut program.maps {
             map.inner.init(&mut mem);

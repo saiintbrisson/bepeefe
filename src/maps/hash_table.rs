@@ -34,6 +34,8 @@ pub struct HashTable {
 
 impl HashTable {
     pub fn new(key_size: u32, value_size: u32, max_entries: u32) -> Self {
+        // The kernel aligns key and value to 8 bytes
+        // https://github.com/torvalds/linux/blob/8765f467912ff0d4832eeaf26ae573792da877e7/kernel/bpf/hashtab.c#L516-L521
         let key_layout = Layout::from_size_align(key_size as usize, 8).unwrap();
         let value_layout = Layout::from_size_align(value_size as usize, 8).unwrap();
         let (entry_layout, value_offset) = key_layout.extend(value_layout).unwrap();
@@ -58,14 +60,14 @@ impl HashTable {
     }
 
     pub fn init(&mut self, mem: &mut crate::vm::mem::VmMem) {
-        let flag_layout = Layout::new::<Flag>()
-            .repeat_packed(self.max_entries)
-            .expect("map capacity is over limit");
+        let flag_layout =
+            Layout::array::<Flag>(self.max_entries).expect("map capacity is over limit");
 
-        let (entries_layout, _) = self
-            .entry_layout
-            .repeat(self.max_entries)
-            .expect("invalid map config");
+        let entries_layout = Layout::from_size_align(
+            self.entry_layout.size() * self.max_entries,
+            self.entry_layout.align(),
+        )
+        .expect("invalid map config");
 
         let (map_layout, entries_offset) = flag_layout.extend(entries_layout).unwrap();
 

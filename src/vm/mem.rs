@@ -29,7 +29,7 @@ impl VmMem {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity.is_power_of_two());
 
-        let mem_layout = Layout::new::<u8>().repeat_packed(capacity).unwrap();
+        let mem_layout = Layout::from_size_align(capacity, size_of::<usize>()).unwrap();
         let data = unsafe { std::alloc::alloc_zeroed(mem_layout) };
 
         Self {
