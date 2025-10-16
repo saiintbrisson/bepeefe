@@ -66,7 +66,7 @@ pub enum BtfKind {
     },
     /// Section
     Datasec {
-        secinfos: Vec<BtfVarSecinfo>,
+        secinfos: Vec<BtfVarSecInfo>,
         size: u32,
     },
     Float {
@@ -209,7 +209,7 @@ impl BtfKind {
             BTF_KIND_DATASEC => {
                 let mut secinfos = Vec::with_capacity(vlen as usize);
                 for _ in 0..vlen {
-                    secinfos.push(BtfVarSecinfo {
+                    secinfos.push(BtfVarSecInfo {
                         r#type: data.read_u32::<LittleEndian>()?,
                         offset: data.read_u32::<LittleEndian>()?,
                         size: data.read_u32::<LittleEndian>()?,
@@ -309,8 +309,8 @@ pub struct BtfParam {
     pub r#type: BtfTypeIndex,
 }
 
-#[derive(Debug)]
-pub struct BtfVarSecinfo {
+#[derive(Copy, Clone, Debug)]
+pub struct BtfVarSecInfo {
     pub r#type: BtfTypeIndex,
     pub offset: u32,
     pub size: u32,

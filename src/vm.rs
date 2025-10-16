@@ -2,14 +2,14 @@ use std::alloc::Layout;
 
 use mem::{GuestAddr, VmMem, VmMemRegion};
 
-use crate::program::{Program, ProgramMap};
+use crate::{maps::BpfMap, program::Program};
 
 pub mod mem;
 
 const DEFAULT_SIZE: usize = 1024 * 1024; // 1 MiB
 
 pub struct Vm {
-    maps: Vec<ProgramMap>,
+    maps: Vec<BpfMap>,
 
     pub code: VmCode,
     pub exit: bool,
@@ -29,7 +29,7 @@ impl Vm {
         let stack = mem.alloc_layout(stack_layout).expect("stack is valid");
 
         for map in &mut program.maps {
-            map.inner.init(&mut mem);
+            map.repr.init(&mut mem);
         }
 
         let mut registers: [u64; 11] = Default::default();
@@ -98,9 +98,9 @@ impl Vm {
         let map = &self.maps[map as usize];
         let key = self
             .mem
-            .read(key_addr, map.inner.key_size())
+            .read(key_addr, map.repr.key_size())
             .expect("tried reading of memory bounds");
-        map.inner
+        map.repr
             .lookup_elem(key)
             .and_then(|key| self.mem.into_guest_addr(key))
             .unwrap_or_default()

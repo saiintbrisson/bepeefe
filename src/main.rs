@@ -24,7 +24,9 @@ fn main() {
         let src = (insn >> 12) & 0xF;
         let imm = (insn >> 32) as i32;
         let offset = (insn >> 16) as i16;
-        eprintln!("{idx:>2}: {name:<14} ({op:02X?}), src: {src:>2}, dst: {dst:>2}, offset: {offset:>5}, imm: {imm:08X?} ({imm:>5}) ({insn:016X?})");
+        eprintln!(
+            "{idx:>2}: {name:<14} ({op:02X?}), src: {src:>2}, dst: {dst:>2}, offset: {offset:>5}, imm: {imm:08X?} ({imm:>5}) ({insn:016X?})"
+        );
     }
 
     while !vm.exit {
@@ -39,7 +41,10 @@ fn main() {
         let src = (instruction >> 12) & 0xF;
         let imm = (instruction >> 32) as i32;
         let offset = (instruction >> 16) as i16;
-        eprintln!("insn @ {:>2}: {name:<14} ({op:02X?}), src: {src:>2}, dst: {dst:>2}, offset: {offset:>5}, imm: {imm:08X?} ({imm:>5}) ({instruction:016X?})", vm.code.pc());
+        eprintln!(
+            "insn @ {:>2}: {name:<14} ({op:02X?}), src: {src:>2}, dst: {dst:>2}, offset: {offset:>5}, imm: {imm:08X?} ({imm:>5}) ({instruction:016X?})",
+            vm.code.pc()
+        );
 
         isa::INSTRUCTION_TABLE[op as usize](&mut vm, instruction);
     }

@@ -80,15 +80,40 @@ mem_insns! {
     ldx_mem_dw,  stx_mem_dw, u64;
 }
 
+/// The non-conventional load with IMM mode uses the
+/// wide instruction encoding to construct 64-bit
+/// immediates. This is the only 16 byte instruction
+/// in the ISA.
+///
+/// The src_reg field describes the operation, not all of
+/// them use 64-bit immediates, though. It's important to
+/// point out that the verifier replaces the custom
+/// operations, like map_by_fd, by the actual map address
+/// when loading the program. The same is done for var
+/// accesses.
+///
+/// From the kernel documentation:
+///
+/// > eBPF has one 16-byte instruction: BPF_LD | BPF_DW | BPF_IMM which consists
+/// > of two consecutive 'struct bpf_insn' 8-byte blocks and interpreted as single
+/// > instruction that loads 64-bit immediate value into a dst_reg.
+/// > Classic BPF has similar instruction: BPF_LD | BPF_W | BPF_IMM which loads
+/// > 32-bit immediate value into a register.
+///
+/// Ref: <https://www.kernel.org/doc/Documentation/networking/filter.txt>
+/// Ref: <https://www.rfc-editor.org/rfc/rfc9669.html#name-64-bit-immediate-instructio>
+/// Ref: <https://github.com/torvalds/linux/blob/7ea30958b3054f5e488fa0b33c352723f7ab3a2a/kernel/bpf/verifier.c#L20519>
+/// Ref: <https://mechpen.github.io/posts/2019-08-03-bpf-map/>
 pub fn ld_imm64(state: &mut crate::vm::Vm, val: u64) {
     let src = (val >> 12) as usize & 0xF;
     let dst = (val >> 8) as usize & 0xF;
 
     match src {
         0 => {
-            let next_imm = state.code.next().unwrap();
+            let next_imm = state.code.next().unwrap() & (u64::MAX << 32);
             state.registers[dst] = next_imm | (val >> 32);
         }
+        //
         // 1 => dst = map_by_fd(imm)                      imm: map fd      dst: map
         // 2 => dst = map_val(map_by_fd(imm)) + next_imm  imm: map fd      dst: data address
         // 3 => dst = var_addr(imm)                       imm: variable id dst: data address

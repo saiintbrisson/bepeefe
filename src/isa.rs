@@ -29,6 +29,41 @@ use alu::*;
 use jmp::*;
 use load::*;
 
+#[repr(transparent)]
+pub struct Insn(pub u64);
+impl Insn {
+    #[inline(always)]
+    pub fn opcode(&self) -> u8 {
+        (self.0 & 0xFF) as u8
+    }
+    #[inline(always)]
+    pub fn dst_reg(&self) -> u8 {
+        (self.0 >> 8) as u8 & 0xF
+    }
+    #[inline(always)]
+    pub fn src_reg(&self) -> u8 {
+        (self.0 >> 12) as u8 & 0xF
+    }
+    #[inline(always)]
+    pub fn imm(&self) -> i32 {
+        (self.0 >> 32) as i32
+    }
+    #[inline(always)]
+    pub fn offset(&self) -> i16 {
+        (self.0 >> 16) as i16
+    }
+
+    #[inline(always)]
+    pub fn with_src_reg(&mut self, src_reg: u8) {
+        self.0 = (self.0 & !(0xF << 12)) | ((src_reg as u64 & 0xF) << 12);
+    }
+
+    #[inline(always)]
+    pub fn with_imm(&mut self, imm: i32) {
+        self.0 = (self.0 << 32 >> 32) | ((imm as u64) << 32);
+    }
+}
+
 fn noop(_: &mut crate::vm::Vm, _: u64) {}
 
 macro_rules! instruction_table {

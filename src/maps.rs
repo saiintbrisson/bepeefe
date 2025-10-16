@@ -1,11 +1,18 @@
-use crate::program::btf::{Btf, BtfMap};
+use crate::program::btf::{BpfMapDeclaration, Btf};
 
 mod array;
 mod hash_table;
 
+pub struct BpfMap {
+    pub fd: i32,
+    #[allow(dead_code)]
+    pub name: String,
+    pub repr: MapRepr,
+}
+
 #[repr(u32)]
 #[derive(Debug)]
-pub enum MapType {
+pub enum MapRepr {
     Unspec,
     Hash(hash_table::HashTable),
     Array(array::Array),
@@ -74,8 +81,8 @@ macro_rules! delegate_map_impl {
     };
 }
 
-impl MapType {
-    pub fn create_from_btf(btf: &Btf, map: BtfMap<'_>) -> Option<Self> {
+impl MapRepr {
+    pub fn create_from_btf(btf: &Btf, map: &BpfMapDeclaration<'_>) -> Option<Self> {
         Some(match map.r#type? {
             0 => Self::Unspec,
             1 => Self::Hash(hash_table::HashTable::new(
