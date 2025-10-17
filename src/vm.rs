@@ -6,7 +6,7 @@ use crate::{maps::BpfMap, program::Program};
 
 pub mod mem;
 
-const DEFAULT_SIZE: usize = 1024 * 1024; // 1 MiB
+const DEFAULT_SIZE: usize = 1024 * 1024 * 2; // 1 MiB
 
 pub struct Vm {
     maps: Vec<BpfMap>,
@@ -115,6 +115,8 @@ pub struct VmCode {
 
 impl VmCode {
     pub fn new(code: Vec<u8>, mem: &mut VmMem, pc: usize) -> Self {
+        assert!(pc.is_multiple_of(8), "code must be 8 byte aligned");
+
         let code_layout = Layout::from_size_align(code.len(), 8).expect("code len is too big");
         let mem = mem.alloc_layout(code_layout).expect("vm mem oom");
 

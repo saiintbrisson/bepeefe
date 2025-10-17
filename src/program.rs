@@ -58,6 +58,7 @@ pub fn load_object(object: Vec<u8>, entry_fn: &str) -> Program {
         .get(&entry_sym.section_index().unwrap())
         .unwrap();
     let entry = (entry_sec + entry_sym.address() as usize) / 8;
+    dbg!(&entry);
 
     let maps = maps.into_iter().map(|(map, _)| map).collect();
 

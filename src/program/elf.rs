@@ -45,6 +45,8 @@ const WRITABLE_SECTION_FLAGS: u64 = (SHF_ALLOC | SHF_WRITE) as u64;
 const BPF_PSEUDO_MAP_FD: u8 = 1;
 
 impl<'data> Loader<'data> {
+    /// Iterates through all sections and loads
+    ///
     pub fn load_sections(&mut self) {
         for sec in self.file.sections() {
             let name = sec.name().unwrap();
@@ -63,6 +65,14 @@ impl<'data> Loader<'data> {
             }
 
             let cursor = self.loaded_prog.len();
+            if self.loaded_prog.len() % Insn::WIDTH != 0 {
+                // VM assumes all instructions are 8 byte aligned,
+                // so we add necessary padding
+                let padding = (Insn::WIDTH - cursor) % Insn::WIDTH;
+                self.loaded_prog.extend((0..padding).map(|_| 0));
+            }
+            let cursor = self.loaded_prog.len();
+
             let data = sec.data().unwrap();
             self.loaded_prog.extend_from_slice(data);
 
@@ -173,6 +183,7 @@ impl<'data> Loader<'data> {
                 };
 
                 let rel_addr = *section_base + rel_offset as usize;
+                dbg!(rel_addr / 8);
                 let mut insn = Insn(u64::from_ne_bytes(
                     self.loaded_prog[rel_addr..rel_addr + 8].try_into().unwrap(),
                 ));

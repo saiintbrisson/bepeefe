@@ -31,7 +31,10 @@ use load::*;
 
 #[repr(transparent)]
 pub struct Insn(pub u64);
+
 impl Insn {
+    pub const WIDTH: usize = size_of::<Self>();
+
     #[inline(always)]
     pub fn opcode(&self) -> u8 {
         (self.0 & 0xFF) as u8
@@ -68,14 +71,14 @@ fn noop(_: &mut crate::vm::Vm, _: u64) {}
 
 macro_rules! instruction_table {
     ($($opcode:expr => $name:ident;)+) => {
-        pub const INSTRUCTION_TABLE: [fn(&mut crate::vm::Vm, u64); u8::MAX as usize] = {
-            let mut table: [fn(&mut crate::vm::Vm, u64); u8::MAX as usize] = [noop; u8::MAX as usize];
+        pub const INSTRUCTION_TABLE: [fn(&mut crate::vm::Vm, u64); const {u8::MAX as usize + 1}] = {
+            let mut table: [fn(&mut crate::vm::Vm, u64); const {u8::MAX as usize + 1}] = [noop; const {u8::MAX as usize + 1}];
             $(table[$opcode as usize] = $name;)+
             table
         };
 
-        pub const INSTRUCTION_NAME_TABLE: [&str; u8::MAX as usize] = {
-            let mut table: [&str; u8::MAX as usize] = ["unknown"; u8::MAX as usize];
+        pub const INSTRUCTION_NAME_TABLE: [&str; const {u8::MAX as usize + 1}] = {
+            let mut table: [&str; const {u8::MAX as usize + 1}] = ["unknown";  const {u8::MAX as usize + 1}];
             $(table[$opcode as usize] = stringify!($name);)+
             table
         };
