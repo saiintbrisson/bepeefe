@@ -68,7 +68,7 @@ impl<'data> Loader<'data> {
             if self.loaded_prog.len() % Insn::WIDTH != 0 {
                 // VM assumes all instructions are 8 byte aligned,
                 // so we add necessary padding
-                let padding = (Insn::WIDTH - cursor) % Insn::WIDTH;
+                let padding = Insn::WIDTH - (cursor % Insn::WIDTH);
                 self.loaded_prog.extend((0..padding).map(|_| 0));
             }
             let cursor = self.loaded_prog.len();

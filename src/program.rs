@@ -57,14 +57,14 @@ pub fn load_object(object: Vec<u8>, entry_fn: &str) -> Program {
         .loaded_sections
         .get(&entry_sym.section_index().unwrap())
         .unwrap();
-    let entry = (entry_sec + entry_sym.address() as usize) / 8;
-    dbg!(&entry);
+    let entry = entry_sec + entry_sym.address() as usize;
+    assert!(entry.is_multiple_of(8), "code must be 8 byte aligned");
 
     let maps = maps.into_iter().map(|(map, _)| map).collect();
 
     Program {
         code: loader.loaded_prog,
-        entry,
+        entry: entry / 8,
         btf: loader.btf,
         maps,
     }

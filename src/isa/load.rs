@@ -13,7 +13,7 @@
 //! mention bit width of stuff...
 #![allow(dead_code)]
 
-use crate::vm::mem::GuestAddr;
+use crate::{isa::Insn, vm::mem::GuestAddr};
 
 /// 64-bit immediate instructions
 pub const MODE_IMM: u8 = 0x0 << 5;
@@ -105,16 +105,19 @@ mem_insns! {
 /// Ref: <https://github.com/torvalds/linux/blob/7ea30958b3054f5e488fa0b33c352723f7ab3a2a/kernel/bpf/verifier.c#L20519>
 /// Ref: <https://mechpen.github.io/posts/2019-08-03-bpf-map/>
 pub fn ld_imm64(state: &mut crate::vm::Vm, val: u64) {
+    let insn = Insn(val);
     let src = (val >> 12) as usize & 0xF;
     let dst = (val >> 8) as usize & 0xF;
 
+    let next_imm = state.code.next().unwrap() & (u64::MAX << 32);
+
     match src {
-        0 => {
-            let next_imm = state.code.next().unwrap() & (u64::MAX << 32);
-            state.registers[dst] = next_imm | (val >> 32);
-        }
+        0 => state.registers[dst] = next_imm | (val >> 32),
         //
-        // 1 => dst = map_by_fd(imm)                      imm: map fd      dst: map
+        1 => {
+            assert!(state.map_by_fd_exists(insn.imm()));
+            state.registers[dst] = insn.imm() as u64;
+        }
         // 2 => dst = map_val(map_by_fd(imm)) + next_imm  imm: map fd      dst: data address
         // 3 => dst = var_addr(imm)                       imm: variable id dst: data address
         // 4 => dst = code_addr(imm)                      imm: integer     dst: code address

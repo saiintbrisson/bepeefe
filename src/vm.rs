@@ -94,6 +94,10 @@ impl Vm {
         (&mut self.registers[6..=9]).copy_from_slice(&frame.registers);
     }
 
+    pub fn map_by_fd_exists(&self, fd: i32) -> bool {
+        (fd as usize) < self.maps.len()
+    }
+
     pub fn map_lookup_elem(&self, map: usize, key_addr: GuestAddr) -> GuestAddr {
         let map = &self.maps[map as usize];
         let key = self
@@ -115,8 +119,6 @@ pub struct VmCode {
 
 impl VmCode {
     pub fn new(code: Vec<u8>, mem: &mut VmMem, pc: usize) -> Self {
-        assert!(pc.is_multiple_of(8), "code must be 8 byte aligned");
-
         let code_layout = Layout::from_size_align(code.len(), 8).expect("code len is too big");
         let mem = mem.alloc_layout(code_layout).expect("vm mem oom");
 
