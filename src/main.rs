@@ -17,36 +17,36 @@ fn main() {
     let mut vm = vm::Vm::new(program);
 
     for (idx, insn) in vm.code.code().iter().enumerate() {
-        let op = insn & 0xFF;
-
-        let name = isa::INSTRUCTION_NAME_TABLE[op as usize];
-        let dst = (insn >> 8) & 0xF;
-        let src = (insn >> 12) & 0xF;
-        let imm = (insn >> 32) as i32;
-        let offset = (insn >> 16) as i16;
         eprintln!(
-            "{idx:>2}: {name:<14} ({op:02X?}), src: {src:>2}, dst: {dst:>2}, offset: {offset:>5}, imm: {imm:08X?} ({imm:>5}) ({insn:016X?})"
+            "{idx:>2}: {name:<14} ({op:02X?}), src: {src:>2}, dst: {dst:>2}, offset: {offset:>5}, imm: {imm:08X?} ({imm:>5}) ({insn:016X?})",
+            name = isa::INSTRUCTION_NAME_TABLE[insn.opcode() as usize],
+            op = insn.opcode(),
+            dst = insn.dst_reg(),
+            src = insn.src_reg(),
+            imm = insn.imm(),
+            offset = insn.offset(),
+            insn = insn.0
         );
     }
 
     while !vm.exit {
-        let Some(instruction) = vm.code.next() else {
+        let Some(insn) = vm.code.next() else {
             panic!();
         };
 
-        let op = instruction & 0xFF;
-
-        let name = isa::INSTRUCTION_NAME_TABLE[op as usize];
-        let dst = (instruction >> 8) & 0xF;
-        let src = (instruction >> 12) & 0xF;
-        let imm = (instruction >> 32) as i32;
-        let offset = (instruction >> 16) as i16;
         eprintln!(
-            "insn @ {:>2}: {name:<14} ({op:02X?}), src: {src:>2}, dst: {dst:>2}, offset: {offset:>5}, imm: {imm:08X?} ({imm:>5}) ({instruction:016X?})",
-            vm.code.pc()
+            "insn @ {pc:>2}: {name:<14} ({op:02X?}), src: {src:>2}, dst: {dst:>2}, offset: {offset:>5}, imm: {imm:08X?} ({imm:>5}) ({insn:016X?})",
+            pc = vm.code.pc(),
+            name = isa::INSTRUCTION_NAME_TABLE[insn.opcode() as usize],
+            op = insn.opcode(),
+            dst = insn.dst_reg(),
+            src = insn.src_reg(),
+            imm = insn.imm(),
+            offset = insn.offset(),
+            insn = insn.0
         );
 
-        isa::INSTRUCTION_TABLE[op as usize](&mut vm, instruction);
+        isa::INSTRUCTION_TABLE[insn.opcode() as usize](&mut vm, insn);
     }
 
     eprintln!("result = {}", vm.registers[0] as i32);

@@ -2,7 +2,7 @@ use std::alloc::Layout;
 
 use mem::{GuestAddr, VmMem, VmMemRegion};
 
-use crate::{maps::BpfMap, program::Program};
+use crate::{isa::Insn, maps::BpfMap, program::Program};
 
 pub mod mem;
 
@@ -133,12 +133,12 @@ impl VmCode {
         }
     }
 
-    pub fn code(&self) -> &[u64] {
-        let ptr = self.mem.as_ptr().cast::<u64>().as_ptr();
+    pub fn code(&self) -> &[Insn] {
+        let ptr = self.mem.as_ptr().cast::<Insn>().as_ptr();
         unsafe { std::slice::from_raw_parts(ptr, self.len) }
     }
 
-    pub fn next(&mut self) -> Option<u64> {
+    pub fn next(&mut self) -> Option<Insn> {
         self.pc += 1;
         self.mem.read_at_offset((self.pc - 1) * 8)
     }

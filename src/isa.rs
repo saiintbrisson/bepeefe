@@ -67,12 +67,12 @@ impl Insn {
     }
 }
 
-fn noop(_: &mut crate::vm::Vm, _: u64) {}
+fn noop(_: &mut crate::vm::Vm, _: Insn) {}
 
 macro_rules! instruction_table {
     ($($opcode:expr => $name:ident;)+) => {
-        pub const INSTRUCTION_TABLE: [fn(&mut crate::vm::Vm, u64); const {u8::MAX as usize + 1}] = {
-            let mut table: [fn(&mut crate::vm::Vm, u64); const {u8::MAX as usize + 1}] = [noop; const {u8::MAX as usize + 1}];
+        pub const INSTRUCTION_TABLE: [fn(&mut crate::vm::Vm, Insn); const {u8::MAX as usize + 1}] = {
+            let mut table: [fn(&mut crate::vm::Vm, Insn); const {u8::MAX as usize + 1}] = [noop; const {u8::MAX as usize + 1}];
             $(table[$opcode as usize] = $name;)+
             table
         };

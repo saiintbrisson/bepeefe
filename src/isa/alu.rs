@@ -1,3 +1,5 @@
+use super::Insn;
+
 /// dst += src
 pub const BPF_ADD: u8 = 0x00;
 /// dst -= src
@@ -46,12 +48,12 @@ macro_rules! alu {
     ($($name:ident, |$dst:tt, $src:tt, $imm:tt| $func:expr;)+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::vm::Vm, val: u64) {
-                let $src = state.registers[(val >> 12) as usize & 0xF];
-                let $dst = state.registers[(val >> 8) as usize & 0xF];
-                let $imm = (val >> 32) as u64;
+            pub fn $name(state: &mut crate::vm::Vm, insn: Insn) {
+                let $src = state.registers[insn.src_reg() as usize];
+                let $dst = state.registers[insn.dst_reg() as usize];
+                let $imm = insn.imm() as u64;
 
-                state.registers[(val >> 8) as usize & 0xF] = $func as u64;
+                state.registers[insn.dst_reg() as usize] = $func as u64;
             }
         )+
     };
@@ -118,13 +120,13 @@ macro_rules! signed_alu {
     ($($name:ident { $($offset:pat => |$dst:tt, $src:tt, $imm:tt| $func:expr;)+ })+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::vm::Vm, val: u64) {
-                let offset = (val >> 16) & 1;
-                state.registers[(val >> 8) as usize & 0xF] = match offset {
+            pub fn $name(state: &mut crate::vm::Vm, insn: Insn) {
+                let offset = insn.offset() & 1;
+                state.registers[insn.dst_reg() as usize] = match offset {
                     $($offset => {
-                        let $src = state.registers[(val >> 12) as usize & 0xF];
-                        let $dst = state.registers[(val >> 8) as usize & 0xF];
-                        let $imm = (val >> 32) as u64;
+                        let $src = state.registers[insn.src_reg() as usize];
+                        let $dst = state.registers[insn.dst_reg() as usize];
+                        let $imm = insn.imm() as u64;
                         $func as u64
                     })+
                     _ => unreachable!(),
@@ -170,13 +172,13 @@ macro_rules! mov_src {
     ($($name:ident, $uref:ty, $sref:ty, $mask:expr;)+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::vm::Vm, val: u64) {
+            pub fn $name(state: &mut crate::vm::Vm, insn: Insn) {
                 /// Offset can be either 0 for mov or 8/16/32 for movsx
                 const MOVSX_OFFSET_MASK: u64 = $mask;
 
-                let src = state.registers[(val >> 12) as usize & 0xF];
-                let dst = &mut state.registers[(val >> 8) as usize & 0xF];
-                let offset = (val >> 16) & MOVSX_OFFSET_MASK;
+                let src = state.registers[insn.src_reg() as usize];
+                let dst = &mut state.registers[insn.dst_reg() as usize];
+                let offset = insn.offset() as u64 & MOVSX_OFFSET_MASK;
 
                 // I could probably do the signed src cast in a way that this branch could be taken away
                 if offset != 0 {

@@ -183,7 +183,6 @@ impl<'data> Loader<'data> {
                 };
 
                 let rel_addr = *section_base + rel_offset as usize;
-                dbg!(rel_addr / 8);
                 let mut insn = Insn(u64::from_ne_bytes(
                     self.loaded_prog[rel_addr..rel_addr + 8].try_into().unwrap(),
                 ));

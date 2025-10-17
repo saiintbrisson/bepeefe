@@ -40,12 +40,12 @@ pub const SIZE_DW: u8 = 3 << 3;
 macro_rules! mem_insns {
     ($($ld:ident, $st:ident, $size:ident;)+) => {
         $(
-            pub fn $ld(state: &mut crate::vm::Vm, val: u64) {
+            pub fn $ld(state: &mut crate::vm::Vm, insn: Insn) {
                 const SIZE: usize = ($size::BITS / 8) as usize;
 
-                let dst = (val >> 8) & 0xF;
-                let src = (val >> 12) & 0xF;
-                let offset = (val >> 16) as i16;
+                let src = insn.src_reg() as usize;
+                let dst = insn.dst_reg() as usize;
+                let offset = insn.offset();
 
                 let ptr = (state.registers[src as usize] as isize + offset as isize) as usize;
                 let val = state.mem.read(
@@ -56,10 +56,10 @@ macro_rules! mem_insns {
                 state.registers[dst as usize] = $size::from_ne_bytes(val) as u64;
             }
 
-            pub fn $st(state: &mut crate::vm::Vm, val: u64) {
-                let dst = (val >> 8) & 0xF;
-                let src = (val >> 12) & 0xF;
-                let offset = (val >> 16) as i16;
+            pub fn $st(state: &mut crate::vm::Vm, insn: Insn) {
+                let src = insn.src_reg() as usize;
+                let dst = insn.dst_reg() as usize;
+                let offset = insn.offset();
 
                 let val = state.registers[src as usize] as $size;
                 let ptr = (state.registers[dst as usize] as isize + offset as isize) as usize;
@@ -104,19 +104,19 @@ mem_insns! {
 /// Ref: <https://www.rfc-editor.org/rfc/rfc9669.html#name-64-bit-immediate-instructio>
 /// Ref: <https://github.com/torvalds/linux/blob/7ea30958b3054f5e488fa0b33c352723f7ab3a2a/kernel/bpf/verifier.c#L20519>
 /// Ref: <https://mechpen.github.io/posts/2019-08-03-bpf-map/>
-pub fn ld_imm64(state: &mut crate::vm::Vm, val: u64) {
-    let insn = Insn(val);
-    let src = (val >> 12) as usize & 0xF;
-    let dst = (val >> 8) as usize & 0xF;
+pub fn ld_imm64(state: &mut crate::vm::Vm, insn: Insn) {
+    let src = insn.src_reg() as usize;
+    let dst = insn.dst_reg() as usize;
+    let imm = insn.imm();
 
-    let next_imm = state.code.next().unwrap() & (u64::MAX << 32);
+    let next_imm = (state.code.next().unwrap().imm() as u64) << 32;
 
     match src {
-        0 => state.registers[dst] = next_imm | (val >> 32),
+        0 => state.registers[dst] = next_imm | imm as u64,
         //
         1 => {
             assert!(state.map_by_fd_exists(insn.imm()));
-            state.registers[dst] = insn.imm() as u64;
+            state.registers[dst] = imm as u64;
         }
         // 2 => dst = map_val(map_by_fd(imm)) + next_imm  imm: map fd      dst: data address
         // 3 => dst = var_addr(imm)                       imm: variable id dst: data address
@@ -143,15 +143,15 @@ pub const ATOMIC_XCHG: u64 = 0xe0 | ATOMIC_FETCH;
 /// atomic compare and exchange
 pub const ATOMIC_CMPXCHG: u64 = 0xf0 | ATOMIC_FETCH;
 
-pub fn stx_atomic_dw(state: &mut crate::vm::Vm, val: u64) {
-    let src = (val >> 12) as usize & 0xF;
-    let dst = (val >> 8) as usize & 0xF;
-    let offset = (val >> 16) as i16;
-    let imm = val >> 32;
+pub fn stx_atomic_dw(state: &mut crate::vm::Vm, insn: Insn) {
+    let src = insn.src_reg() as usize;
+    let dst = insn.dst_reg() as usize;
+    let imm = insn.imm();
+    let offset = insn.offset();
 
     let ptr = (state.registers[dst as usize] as isize + offset as isize) as usize;
 
-    match imm {
+    match imm as u64 {
         ATOMIC_ADD | ATOMIC_FETCH => {
             let val: u64 = state.mem.read_as(GuestAddr(ptr)).expect("failed to read");
             let new_val = val + state.registers[src as usize];
