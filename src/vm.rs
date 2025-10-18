@@ -109,6 +109,10 @@ impl Vm {
             .and_then(|key| self.mem.into_guest_addr(key))
             .unwrap_or_default()
     }
+
+    pub fn map_by_name(&mut self, name: &str) -> Option<&mut BpfMap> {
+        self.maps.iter_mut().find(|map| map.name == name)
+    }
 }
 
 pub struct VmCode {

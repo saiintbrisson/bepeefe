@@ -1,5 +1,6 @@
 use std::{
     alloc::Layout,
+    ffi::CStr,
     io::{ErrorKind, Result},
     ptr::NonNull,
 };
@@ -65,6 +66,13 @@ impl VmMem {
     pub fn read_as<T>(&self, addr: GuestAddr) -> Option<T> {
         self.read_ptr(addr, size_of::<T>())
             .map(|ptr| unsafe { (ptr as *const T).read() })
+    }
+
+    pub fn read_str(&self, addr: GuestAddr) -> Option<&CStr> {
+        let len = (self.tail_ptr as usize)
+            .saturating_sub(self.base_ptr as usize)
+            .saturating_sub(addr.0 as usize);
+        CStr::from_bytes_until_nul(self.read(addr, len)?).ok()
     }
 
     pub fn read(&self, addr: GuestAddr, len: usize) -> Option<&[u8]> {

@@ -1,3 +1,5 @@
+use std::ffi::CStr;
+
 use super::Insn;
 use crate::vm::mem::GuestAddr;
 
@@ -132,20 +134,33 @@ pub fn exit(state: &mut crate::vm::Vm, _: Insn) {
     state.pop_stack_frame();
 }
 
+const BPF_FUNC_MAP_LOOKUP_ELEM: i32 = 1;
+const BPF_FUNC_TRACE_PRINTK: i32 = 6;
+const BPF_FUNC_GET_CURRENT_PID_TGID: i32 = 14;
+
+/// Performs a call jump.
+///
+/// The src_reg defines the type of jump. If 0, the
+/// calls are platform-defined functions identified
+/// by the immediate instruction value. Kernel functions
+/// are defined in the `bpf_func_id` enum. If 1, imm is
+/// used as PC-rel offset, and a stack frame is pushed.
+///
+/// Ref: <https://github.com/torvalds/linux/blob/98ac9cc4b4452ed7e714eddc8c90ac4ae5da1a09/include/uapi/linux/bpf.h#L5870>
 pub fn jmp_call(state: &mut crate::vm::Vm, insn: Insn) {
     let src = insn.src_reg();
-    let imm = insn.imm();
 
     match src {
+        // BPF-local functions
+        1 => state.call(insn.imm()),
         0 => {
-            // These values are based on kernel version 6.8, but are subject to change. The
-            // correct way to do this is with BTF and CO-RE support.
-            match imm {
+            // The correct way to do this is with BTF and CO-RE support.
+            match insn.imm() {
                 // static void *(* const bpf_map_lookup_elem)(void *map, const void *key) = (void *)
                 // 1;
                 // R1: map pointer, R2: key pointer
                 // R0: pointer to value
-                1 => {
+                BPF_FUNC_MAP_LOOKUP_ELEM => {
                     let map_idx = state.registers[1] as u32 as usize;
                     let key = GuestAddr(state.registers[2] as u32 as usize);
                     let elem = state.map_lookup_elem(map_idx, key);
@@ -153,9 +168,9 @@ pub fn jmp_call(state: &mut crate::vm::Vm, insn: Insn) {
                 }
                 // static long (* const bpf_trace_printk)(const char *fmt, __u32 fmt_size, ...) =
                 // (void *) 6;
-                // R1: addr, R2: size, R3/R4/R5: formatting stufffff
+                // R1: addr, R2: size, R3/R4/R5: formatting params
                 // R0: n of written bytes or negative error code
-                6 => {
+                BPF_FUNC_TRACE_PRINTK => {
                     let addr = state.registers[1] as u32 as usize;
                     let len = state.registers[2] as u32 as usize;
 
@@ -163,15 +178,21 @@ pub fn jmp_call(state: &mut crate::vm::Vm, insn: Insn) {
                         .mem
                         .read(GuestAddr(addr), len)
                         .expect("addr is invalid");
-                    let s = std::ffi::CStr::from_bytes_until_nul(&data);
+                    let Ok(s) = CStr::from_bytes_until_nul(&data) else {
+                        state.registers[0] = -22i64 as u64 /* EINVAL */;
+                        return;
+                    };
+                    let Ok(s) = s.to_str() else {
+                        panic!("string is not utf8");
+                    };
+
+                    let s = prepare_bpf_trace_printk(state, s.to_string());
+                    state.registers[0] = s.as_bytes().len() as u64;
                     eprintln!("Print: {s:?}");
-                    state.registers[0] = s
-                        .map(|f| f.to_bytes().len() as u64)
-                        .unwrap_or(-22i64 as u64 /* EINVAL */);
                 }
                 // static __u64 (* const bpf_get_current_pid_tgid)(void) = (void *) 14;
                 // R0: tgid << 32 | pid
-                14 => {
+                BPF_FUNC_GET_CURRENT_PID_TGID => {
                     // TODO: should the vm have a configurable execution context?
                     state.registers[0] = (0xDEAD << 32) | 0xBEEF;
                 }
@@ -180,12 +201,71 @@ pub fn jmp_call(state: &mut crate::vm::Vm, insn: Insn) {
                 }
             }
         }
-        // BPF-local functions
-        1 => state.call(imm as i32),
-        // 2 => {}
+        2 => todo!(""),
         _ => {
-            dbg!(src);
-            todo!()
+            panic!()
         }
+    }
+}
+
+/// Prepares the formatting string for `printk()` calls.
+///
+/// This is a very small reproduction of the Kernel's `printk`
+/// functionality, currently only supporting two specifiers,
+/// `d` and `s`.
+///
+/// From the kernel:
+/// > The conversion specifiers supported by *fmt* are similar, but
+/// > more limited than for printk(). They are **%d**, **%i**,
+/// > **%u**, **%x**, **%ld**, **%li**, **%lu**, **%lx**, **%lld**,
+/// > **%lli**, **%llu**, **%llx**, **%p**, **%s**. No modifier (size
+/// > of field, padding with zeroes, etc.) is available, and the
+/// > helper will return **-EINVAL** (but print nothing) if it
+/// > encounters an unknown specifier.
+///
+/// Ref: <https://github.com/torvalds/linux/blob/f406055cb18c6e299c4a783fc1effeb16be41803/include/uapi/linux/bpf.h#L1961>
+fn prepare_bpf_trace_printk(state: &mut crate::vm::Vm, s: String) -> String {
+    let mut arg_count = 0;
+
+    let mut buf: Option<Vec<_>> = None;
+    let mut formatting = false;
+    for (idx, c) in s.char_indices() {
+        if formatting {
+            arg_count += 1;
+            if arg_count >= 4 {
+                panic!()
+            }
+
+            let param = state.registers[2 + arg_count];
+            let buf = buf.as_mut().unwrap();
+            match c {
+                'd' => {
+                    buf.extend(param.to_string().as_bytes());
+                }
+                's' => {
+                    let addr = GuestAddr(param as _);
+                    let s = state.mem.read_str(addr).unwrap();
+                    buf.extend(s.to_bytes());
+                }
+                _ => todo!(),
+            }
+            formatting = false;
+        } else if c == '%' {
+            if buf.is_none() {
+                let mut items = Vec::with_capacity(s.len());
+                items.extend_from_slice(&s.as_bytes()[..idx]);
+                buf = Some(items)
+            }
+            formatting = true;
+        } else if let Some(buf) = &mut buf {
+            buf.push(s.as_bytes()[idx]);
+        }
+    }
+
+    if let Some(buf) = buf {
+        let s = String::from_utf8(buf).unwrap();
+        s
+    } else {
+        s
     }
 }

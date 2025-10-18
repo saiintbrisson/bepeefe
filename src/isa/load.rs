@@ -128,20 +128,20 @@ pub fn ld_imm64(state: &mut crate::vm::Vm, insn: Insn) {
 }
 
 // atomic add
-pub const ATOMIC_ADD: u64 = 0x00;
+pub const ATOMIC_ADD: u8 = 0x00;
 // atomic or
-pub const ATOMIC_OR: u64 = 0x40;
+pub const ATOMIC_OR: u8 = 0x40;
 // atomic and
-pub const ATOMIC_AND: u64 = 0x50;
+pub const ATOMIC_AND: u8 = 0x50;
 // atomic xor
-pub const ATOMIC_XOR: u64 = 0xa0;
+pub const ATOMIC_XOR: u8 = 0xa0;
 
 /// modifier: return old value
-pub const ATOMIC_FETCH: u64 = 0x01;
+pub const ATOMIC_FETCH: u8 = 0x01;
 /// atomic exchange
-pub const ATOMIC_XCHG: u64 = 0xe0 | ATOMIC_FETCH;
+pub const ATOMIC_XCHG: u8 = 0xE0 | ATOMIC_FETCH;
 /// atomic compare and exchange
-pub const ATOMIC_CMPXCHG: u64 = 0xf0 | ATOMIC_FETCH;
+pub const ATOMIC_CMPXCHG: u8 = 0xF0 | ATOMIC_FETCH;
 
 pub fn stx_atomic_dw(state: &mut crate::vm::Vm, insn: Insn) {
     let src = insn.src_reg() as usize;
@@ -151,15 +151,17 @@ pub fn stx_atomic_dw(state: &mut crate::vm::Vm, insn: Insn) {
 
     let ptr = (state.registers[dst as usize] as isize + offset as isize) as usize;
 
-    match imm as u64 {
-        ATOMIC_ADD | ATOMIC_FETCH => {
+    match imm as u8 & 0xF0 {
+        ATOMIC_ADD => {
             let val: u64 = state.mem.read_as(GuestAddr(ptr)).expect("failed to read");
             let new_val = val + state.registers[src as usize];
             state
                 .mem
                 .write(GuestAddr(ptr), &new_val.to_ne_bytes())
                 .expect("failed to write");
-            state.registers[src as usize] = val;
+            if imm as u8 & ATOMIC_FETCH != 0 {
+                state.registers[src as usize] = val;
+            }
         }
         _ => todo!(),
     }
