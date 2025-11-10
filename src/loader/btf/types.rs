@@ -9,6 +9,7 @@ pub type BtfTypeIndex = u32;
 
 #[derive(Debug)]
 pub struct BtfType {
+    pub btf_id: BtfTypeIndex,
     pub name_off: BtfStrOffset,
     pub kind: BtfKind,
 }
@@ -73,7 +74,7 @@ pub enum BtfKind {
         size: u32,
     },
     DeclTag,
-    TypeTag,
+    TypeTag(BtfTypeIndex),
     /// Enumeration up to 64-bit values
     Enum64,
 }
@@ -108,9 +109,9 @@ impl BtfKind {
                 let data = data.read_u32::<LittleEndian>()?;
 
                 Self::Int {
-                    encoding: (data >> 24) as u8,
-                    offset: (data >> 16) as u8,
-                    bits: data as u8,
+                    encoding: ((data >> 24) & 0x0F) as u8,
+                    offset: ((data >> 16) & 0xFF) as u8,
+                    bits: (data & 0xFF) as u8,
                     size: size_or_type,
                 }
             }
@@ -223,7 +224,7 @@ impl BtfKind {
             }
             BTF_KIND_FLOAT => Self::Float { size: size_or_type },
             BTF_KIND_DECL_TAG => todo!(),
-            BTF_KIND_TYPE_TAG => todo!(),
+            BTF_KIND_TYPE_TAG => Self::TypeTag(size_or_type),
             BTF_KIND_ENUM64 => todo!(),
             _ => unreachable!(),
         };
@@ -240,8 +241,6 @@ impl BtfKind {
             | BtfKind::Float { size }
             | BtfKind::Datasec { size, .. } => Some(*size),
 
-            BtfKind::Ptr(_ty) => todo!(),
-
             BtfKind::Array(btf_array) => {
                 let elem_ty = btf
                     .types
@@ -251,11 +250,13 @@ impl BtfKind {
                 Some(elem_size * btf_array.no_elems)
             }
 
-            BtfKind::Typedef(ty)
+            BtfKind::Ptr(ty)
+            | BtfKind::Typedef(ty)
             | BtfKind::Volatile(ty)
             | BtfKind::Const(ty)
             | BtfKind::Restrict(ty)
-            | BtfKind::Var { ty, .. } => {
+            | BtfKind::Var { ty, .. }
+            | BtfKind::TypeTag(ty) => {
                 let elem_ty = btf.types.get(ty).expect("missing array type");
                 elem_ty.kind.size(btf)
             }
@@ -263,7 +264,6 @@ impl BtfKind {
             BtfKind::Fwd { .. } | BtfKind::Func { .. } | BtfKind::FuncProto { .. } => None,
 
             BtfKind::DeclTag => todo!(),
-            BtfKind::TypeTag => todo!(),
             BtfKind::Enum64 => todo!(),
         }
     }

@@ -1,4 +1,4 @@
-use crate::program::btf::{BpfMapDeclaration, Btf};
+use crate::loader::btf::{BpfMapDeclaration, Btf};
 
 mod array;
 mod hash_table;

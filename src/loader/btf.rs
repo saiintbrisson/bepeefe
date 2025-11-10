@@ -23,8 +23,26 @@ pub struct Btf {
 }
 
 impl Btf {
-    fn get_type(&self, idx: BtfTypeIndex) -> Option<&BtfType> {
+    pub fn get_type(&self, idx: BtfTypeIndex) -> Option<&BtfType> {
         self.resolve_indirections(self.types.get(&idx)?)
+    }
+
+    /// Ignore modifier and type definition indirections.
+    ///
+    /// Ref: <https://github.com/libbpf/libbpf/blob/09b9e83102eb8ab9e540d36b4559c55f3bcdb95d/src/libbpf.c#L2360>
+    fn resolve_indirections<'a>(&'a self, mut btf_ty: &'a BtfType) -> Option<&'a BtfType> {
+        loop {
+            let btf_id = match btf_ty.kind {
+                BtfKind::Typedef(btf_id)
+                | BtfKind::Volatile(btf_id)
+                | BtfKind::Const(btf_id)
+                | BtfKind::Restrict(btf_id)
+                | BtfKind::TypeTag(btf_id) => btf_id,
+                _ => return Some(btf_ty),
+            };
+
+            btf_ty = self.types.get(&btf_id)?;
+        }
     }
 }
 
@@ -83,7 +101,15 @@ pub fn load_btf(section: &Section<'_, '_>) -> Result<Btf, ()> {
         let data = type_data.read_u32::<LittleEndian>().unwrap();
 
         let kind = BtfKind::from_ty(info, data, type_data).unwrap();
-        types.insert(types.len() as u32 + 1, BtfType { name_off, kind });
+        let btf_id = types.len() as u32 + 1;
+        types.insert(
+            btf_id,
+            BtfType {
+                btf_id,
+                name_off,
+                kind,
+            },
+        );
     }
 
     Ok(Btf { strings, types })
@@ -194,24 +220,6 @@ pub fn load_maps(btf: &Btf, maps_sec: SectionIndex) -> Vec<BpfMapDeclaration<'_>
     }
 
     maps
-}
-
-impl Btf {
-    /// Ignore modifier and type definition indirections.
-    fn resolve_indirections<'a>(&'a self, mut btf_ty: &'a BtfType) -> Option<&'a BtfType> {
-        loop {
-            let btf_id = match btf_ty.kind {
-                BtfKind::Typedef(btf_id)
-                | BtfKind::Volatile(btf_id)
-                | BtfKind::Const(btf_id)
-                | BtfKind::Restrict(btf_id) => btf_id,
-                BtfKind::TypeTag => todo!(),
-                _ => return Some(btf_ty),
-            };
-
-            btf_ty = self.types.get(&btf_id)?;
-        }
-    }
 }
 
 #[derive(Debug)]

@@ -2,7 +2,11 @@ use std::alloc::Layout;
 
 use mem::{GuestAddr, VmMem, VmMemRegion};
 
-use crate::{isa::Insn, maps::BpfMap, program::Program};
+use crate::{
+    isa::Insn,
+    loader::{Entrypoint, Program},
+    maps::BpfMap,
+};
 
 pub mod mem;
 
@@ -21,10 +25,14 @@ pub struct Vm {
 }
 
 impl Vm {
-    pub fn new(mut program: Program) -> Self {
+    /// Instantiates a new virtual machine with the given
+    /// program loaded. A 1MiB memory region is alocated
+    /// and zeroed. Maps are loaded and initiated. Code
+    /// is loaded to the memory and PC is set to `entry`.
+    pub fn new(mut program: Program, entry: usize) -> Self {
         let mut mem = VmMem::new(DEFAULT_SIZE);
 
-        let code = VmCode::new(program.code, &mut mem, program.entry);
+        let code = VmCode::new(program.code, &mut mem, entry);
         let stack_layout = Layout::from_size_align(10 * 1024, 8).unwrap();
         let stack = mem.alloc_layout(stack_layout).expect("stack is valid");
 
@@ -43,6 +51,35 @@ impl Vm {
             mem,
             stack,
         }
+    }
+
+    /// Instantiates a new virtual machine with the given
+    /// program load. A 1MiB memory region is alocated
+    /// and zeroed. Maps are loaded and initiated. Code
+    /// is loaded to the memory.
+    ///
+    /// PC is set to the function in `entrypoint`. If the
+    /// entrypoint contains a context buffer, this function
+    /// will allocate it and point R1 to the context address.
+    pub fn new_with_entrypoint(program: Program, entrypoint: Entrypoint) -> Self {
+        let mut vm = Self::new(program, entrypoint.offset);
+
+        if let Some(ctx) = entrypoint.ctx {
+            let ctx_layout =
+                Layout::from_size_align(ctx.len(), 8).expect("invalid context buffer size");
+            let ctx_mem = vm
+                .mem
+                .alloc_layout(ctx_layout)
+                .expect("failed to allocate context memory");
+
+            vm.mem
+                .write(ctx_mem.guest_addr(), &ctx)
+                .expect("failed to write context buffer");
+
+            vm.registers[1] = ctx_mem.guest_addr().0 as u64;
+        }
+
+        vm
     }
 
     pub fn call(&mut self, offset: i32) {

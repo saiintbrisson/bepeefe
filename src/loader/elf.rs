@@ -7,11 +7,11 @@ use object::{
 
 use crate::{
     isa::Insn,
-    maps::BpfMap,
-    program::{
+    loader::{
         MapDecl,
         btf::types::{BtfKind, BtfType},
     },
+    maps::BpfMap,
 };
 
 use super::Loader;
@@ -51,9 +51,14 @@ impl<'data> Loader<'data> {
         for sec in self.file.sections() {
             let name = sec.name().unwrap();
             match name {
-                "maps" => panic!("legacy maps section is not supported, use .maps"),
+                "maps" => panic!("legacy 'maps' section is not supported, use .maps"),
                 ".BTF" => {
                     self.btf = Some(super::btf::load_btf(&sec).expect("malformed BTF section"));
+                    continue;
+                }
+                ".BTF.ext" => {
+                    self.btf_ext =
+                        Some(super::btf::ext::load_btf_ext(&sec).expect("malformed BTF section"));
                     continue;
                 }
                 ".maps" => {
@@ -85,7 +90,7 @@ impl<'data> Loader<'data> {
     /// Calculates and updates the offsets and sizes for
     /// BTF datasec entries.
     ///
-    /// Datasecs describe an ELF section and its contents,
+    /// `Datasec`s describe an ELF section and its contents,
     /// generally used to inform the Kernel of special structs
     /// defined by the program. Each datasec entry contains a
     /// BTF type ID, a size, and the offset at which the entry is
@@ -141,6 +146,7 @@ impl<'data> Loader<'data> {
                 secinfos.sort_unstable_by_key(|ty| ty.offset);
 
                 let btf_type = BtfType {
+                    btf_id: idx,
                     name_off: ty.name_off,
                     kind: BtfKind::Datasec {
                         secinfos,
