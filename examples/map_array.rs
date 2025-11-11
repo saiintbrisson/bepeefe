@@ -13,7 +13,7 @@ fn main() {
     let entrypoint = program
         .build_entrypoint(
             "entry",
-            &[("local_port", Val::Number(3000)), ("len", Val::Number(3))],
+            &[("local_port", Val::Number(3000)), ("len", Val::Number(3))].into(),
         )
         .expect("failed to build entrypoint");
     let mut vm = Vm::new_with_entrypoint(program, entrypoint);

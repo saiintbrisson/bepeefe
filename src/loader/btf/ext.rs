@@ -58,8 +58,6 @@ pub fn load_btf_ext(section: &Section<'_, '_>) -> Option<BtfExt> {
     let mut line_info_data = &data[line_info_off..line_info_off + header.line_info_len as usize];
     btf_ext.line_info = read_sec_info(&mut line_info_data);
 
-    dbg!("core");
-
     let core_relo_off = (header.hdr_len + header.core_relo_off) as usize;
     let mut core_relo_data = &data[core_relo_off..core_relo_off + header.core_relo_len as usize];
     btf_ext.core_relo = read_sec_info(&mut core_relo_data);

@@ -25,12 +25,24 @@ pub struct Program {
 
 pub struct Entrypoint {
     pub offset: usize,
-    pub ctx: Option<Vec<u8>>,
+    pub ctx: Option<Context>,
     pub secname: String,
+}
+
+pub enum Context {
+    Buffer(Vec<u8>),
+    Value(u64),
 }
 
 pub enum Val {
     Number(i64),
+    Map(HashMap<String, Val>),
+}
+
+impl<const N: usize> From<[(&str, Val); N]> for Val {
+    fn from(value: [(&str, Val); N]) -> Self {
+        Self::Map(value.map(|(key, val)| (key.to_owned(), val)).into())
+    }
 }
 
 impl Program {
@@ -106,11 +118,7 @@ impl Program {
     /// The resulting `Entrypoint::ctx` will be a zeroed buffer of
     /// the size of the `__sk_buff` struct as described by the BTF
     /// type, populated with the `local_port` and `len` fields.
-    pub fn build_entrypoint(
-        &self,
-        funcname: &str,
-        ctx_params: &[(&str, Val)],
-    ) -> Option<Entrypoint> {
+    pub fn build_entrypoint(&self, funcname: &str, ctx_params: &Val) -> Option<Entrypoint> {
         let offset = *self.symbols.get(funcname)?;
 
         let btf = self.btf.as_ref()?;
@@ -125,7 +133,7 @@ impl Program {
             Some((sec_name.to_string_lossy().to_string(), func))
         })?;
 
-        let ctx = build_ctx_buffer(btf, &func, ctx_params);
+        let ctx = build_context(btf, &func, ctx_params);
 
         Some(Entrypoint {
             offset,
@@ -241,37 +249,52 @@ fn parse_func_list(btf: &Btf, func_info: &[BpfFuncInfo]) -> Vec<Func> {
         .collect()
 }
 
-fn build_ctx_buffer(btf: &Btf, func: &Func, fields: &[(&str, Val)]) -> Option<Vec<u8>> {
+fn build_context(btf: &Btf, func: &Func, ctx_val: &Val) -> Option<Context> {
     let ctx = func.params.first()?;
     let ty = btf.get_type(ctx.type_id).unwrap();
     match &ty.kind {
         BtfKind::Struct { members, size } => {
             let mut vec: Vec<_> = Vec::with_capacity(*size as usize);
+            let Val::Map(ctx_map) = ctx_val else {
+                panic!();
+            };
 
             for ele in members {
                 let ty = btf.get_type(ele.r#type).unwrap();
                 let name = btf.strings.get(&ele.name_off).unwrap();
 
-                let Some(field) = fields.iter().find(|f| name.to_str().unwrap() == f.0) else {
+                let Some(field) = ctx_map.get(name.to_str().unwrap()) else {
                     let size = ty.kind.size(btf).expect("missing size") as usize;
                     vec.extend(from_fn(|| Some(0)).take(size));
                     continue;
                 };
 
                 match ty.kind {
-                    BtfKind::Int { size, bits, .. } => match field.1 {
+                    BtfKind::Int { size, bits, .. } => match field {
                         Val::Number(n) if (n >> bits > 0) => {
                             panic!("number {n} is larger than field size");
                         }
                         Val::Number(n) => {
                             vec.extend_from_slice(&n.to_le_bytes()[..size as usize]);
                         }
+                        _ => todo!("unsupported type"),
                     },
                     _ => {}
                 }
             }
 
-            Some(vec)
+            Some(Context::Buffer(vec))
+        }
+        BtfKind::Int { bits, .. } => {
+            let Val::Number(num) = ctx_val else {
+                panic!("expected Number value for integer parameter");
+            };
+
+            if *num >> bits > 0 {
+                panic!("number {num} is larger than parameter size");
+            }
+
+            Some(Context::Value(*num as u64))
         }
         _ => {
             todo!()

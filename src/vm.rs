@@ -4,7 +4,7 @@ use mem::{GuestAddr, VmMem, VmMemRegion};
 
 use crate::{
     isa::Insn,
-    loader::{Entrypoint, Program},
+    loader::{Context, Entrypoint, Program},
     maps::BpfMap,
 };
 
@@ -59,24 +59,32 @@ impl Vm {
     /// is loaded to the memory.
     ///
     /// PC is set to the function in `entrypoint`. If the
-    /// entrypoint contains a context buffer, this function
-    /// will allocate it and point R1 to the context address.
+    /// entrypoint contains a context, this function will:
+    /// - For `Context::Buffer`: allocate it and point R1 to the buffer address
+    /// - For `Context::Value`: set R1 directly to the value
     pub fn new_with_entrypoint(program: Program, entrypoint: Entrypoint) -> Self {
         let mut vm = Self::new(program, entrypoint.offset);
 
         if let Some(ctx) = entrypoint.ctx {
-            let ctx_layout =
-                Layout::from_size_align(ctx.len(), 8).expect("invalid context buffer size");
-            let ctx_mem = vm
-                .mem
-                .alloc_layout(ctx_layout)
-                .expect("failed to allocate context memory");
+            match ctx {
+                Context::Buffer(buf) => {
+                    let ctx_layout =
+                        Layout::from_size_align(buf.len(), 8).expect("invalid context buffer size");
+                    let ctx_mem = vm
+                        .mem
+                        .alloc_layout(ctx_layout)
+                        .expect("failed to allocate context memory");
 
-            vm.mem
-                .write(ctx_mem.guest_addr(), &ctx)
-                .expect("failed to write context buffer");
+                    vm.mem
+                        .write(ctx_mem.guest_addr(), &buf)
+                        .expect("failed to write context buffer");
 
-            vm.registers[1] = ctx_mem.guest_addr().0 as u64;
+                    vm.registers[1] = ctx_mem.guest_addr().0 as u64;
+                }
+                Context::Value(val) => {
+                    vm.registers[1] = val;
+                }
+            }
         }
 
         vm

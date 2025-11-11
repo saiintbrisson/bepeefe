@@ -197,7 +197,7 @@ impl<'data> Loader<'data> {
                     R_BPF_64_32 => {
                         let target_idx = (target_addr / 8) as i32;
                         let pc = ((rel_addr - 4) / 8) as i32;
-                        insn.with_imm(target_idx - pc + insn.imm());
+                        insn.with_imm(target_idx - pc + insn.imm() - 1);
                     }
                     R_BPF_64_64 => {
                         let map = maps.iter().find(|(_, decl)| {
