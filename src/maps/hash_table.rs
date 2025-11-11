@@ -6,12 +6,14 @@ use std::{
 };
 
 #[repr(u8)]
+#[derive(Debug)]
 enum Flag {
     Vacant,
     Deleted,
     Occupied,
 }
 
+#[derive(Debug)]
 enum Search {
     Match,
     Free,
@@ -59,6 +61,10 @@ impl HashTable {
         self.key_layout.size()
     }
 
+    pub fn value_size(&self) -> usize {
+        self.value_layout.size()
+    }
+
     pub fn init(&mut self, mem: &mut crate::vm::mem::VmMem) {
         let flag_layout =
             Layout::array::<Flag>(self.max_entries).expect("map capacity is over limit");
@@ -76,7 +82,7 @@ impl HashTable {
         self.data_ptr = Some(alloc_ptr.map_addr(|ptr| ptr.saturating_add(entries_offset)));
     }
 
-    fn find(&self, key: &[u8], search: Search) -> Option<NonNull<u8>> {
+    fn find(&self, key: &[u8], search: Search) -> Option<(NonNull<Flag>, NonNull<u8>)> {
         let flags_ptr = self.flags_ptr.expect("map not initialized");
         let data_ptr = self.data_ptr.expect("map not initialized");
 
@@ -91,7 +97,7 @@ impl HashTable {
                 data_ptr.map_addr(|ptr| ptr.checked_add(idx * self.entry_layout.size()).unwrap());
 
             match (unsafe { flag_ptr.read() }, &search) {
-                (Flag::Vacant | Flag::Deleted, Search::Free) => return Some(entry_ptr),
+                (Flag::Vacant | Flag::Deleted, Search::Free) => return Some((flag_ptr, entry_ptr)),
                 (Flag::Vacant, Search::Match) => return None,
                 (Flag::Deleted, Search::Match) | (Flag::Occupied, Search::Free) => {}
 
@@ -101,13 +107,17 @@ impl HashTable {
                     };
 
                     if entry_key == key {
-                        return Some(entry_ptr);
+                        return Some((flag_ptr, entry_ptr));
                     }
                 }
+                // TODO: Figure this out
                 (Flag::Deleted, Search::MatchOrFree) => {
-                    last_free = Some(entry_ptr);
+                    last_free = Some((flag_ptr, entry_ptr));
                 }
-                (Flag::Vacant, Search::MatchOrFree) => break,
+                (Flag::Vacant, Search::MatchOrFree) => {
+                    last_free = Some((flag_ptr, entry_ptr));
+                    break;
+                }
             }
 
             idx += 1;
@@ -118,18 +128,21 @@ impl HashTable {
 
     pub fn lookup_elem(&self, key: &[u8]) -> Option<*const u8> {
         self.find(key, Search::Match)
-            .map(|ptr| ptr.as_ptr() as *const u8)
+            .map(|(_, ptr)| ptr.as_ptr().map_addr(|addr| addr + self.value_offset) as *const u8)
     }
 
     pub fn update_elem(&mut self, key: &[u8], value: *const u8) -> Result<()> {
-        let ptr = self
+        let (flag, ptr) = self
             .find(key, Search::MatchOrFree)
-            .map(|ptr| ptr.as_ptr() as *const u8)
+            .map(|(flag_ptr, ptr)| (flag_ptr, ptr.as_ptr() as *const u8))
             .ok_or(ErrorKind::OutOfMemory)?;
-        let ptr = ptr.map_addr(|addr| addr + self.value_offset) as *mut u8;
+        let key_ptr = ptr as *mut u8;
+        let value_ptr = ptr.map_addr(|addr| addr + self.value_offset) as *mut u8;
 
         unsafe {
-            ptr.copy_from(value, self.value_layout.size());
+            flag.write(Flag::Occupied);
+            key_ptr.copy_from(key.as_ptr(), self.key_layout.size());
+            value_ptr.copy_from(value, self.value_layout.size());
         }
 
         Ok(())

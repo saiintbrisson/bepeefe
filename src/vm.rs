@@ -33,7 +33,7 @@ impl Vm {
         let mut mem = VmMem::new(DEFAULT_SIZE);
 
         let code = VmCode::new(program.code, &mut mem, entry);
-        let stack_layout = Layout::from_size_align(10 * 1024, 8).unwrap();
+        let stack_layout = Layout::from_size_align(100 * 1024, 8).unwrap();
         let stack = mem.alloc_layout(stack_layout).expect("stack is valid");
 
         for map in &mut program.maps {
@@ -141,6 +141,10 @@ impl Vm {
 
     pub fn map_by_fd_exists(&self, fd: i32) -> bool {
         (fd as usize) < self.maps.len()
+    }
+
+    pub fn map_by_id(&mut self, id: usize) -> Option<&mut BpfMap> {
+        self.maps.get_mut(id)
     }
 
     pub fn map_lookup_elem(&self, map: usize, key_addr: GuestAddr) -> GuestAddr {

@@ -64,7 +64,7 @@ impl VmMem {
     }
 
     pub fn read_as<T>(&self, addr: GuestAddr) -> Option<T> {
-        self.read_ptr(addr, size_of::<T>())
+        self.into_ptr(addr, size_of::<T>())
             .map(|ptr| unsafe { (ptr as *const T).read() })
     }
 
@@ -76,12 +76,12 @@ impl VmMem {
     }
 
     pub fn read(&self, addr: GuestAddr, len: usize) -> Option<&[u8]> {
-        self.read_ptr(addr, len)
+        self.into_ptr(addr, len)
             .map(|ptr| unsafe { std::slice::from_raw_parts(ptr as *const u8, len) })
     }
 
     #[inline(always)]
-    fn read_ptr(&self, GuestAddr(addr): GuestAddr, len: usize) -> Option<*const u8> {
+    pub fn into_ptr(&self, GuestAddr(addr): GuestAddr, len: usize) -> Option<*const u8> {
         let ptr = (self.base_ptr as usize).checked_add(addr)?;
         if ptr + len < self.end_ptr as usize {
             Some(ptr as *const u8)

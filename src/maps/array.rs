@@ -41,6 +41,10 @@ impl Array {
         u32::BITS as usize / 8
     }
 
+    pub fn value_size(&self) -> usize {
+        self.element_layout.size()
+    }
+
     pub fn init(&mut self, mem: &mut crate::vm::mem::VmMem) {
         let map_layout = Layout::from_size_align(
             self.stride_layout.size() * self.max_entries,

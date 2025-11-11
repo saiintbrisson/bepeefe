@@ -57,6 +57,13 @@ macro_rules! delegate_map_impl {
             }
         }
 
+        pub fn value_size(&self) -> usize {
+            match self {
+                $(Self::$name(map) => map.value_size(),)+
+                _ => todo!(),
+            }
+        }
+
         pub fn init(&mut self, mem: &mut crate::vm::mem::VmMem) {
             match self {
                 $(Self::$name(map) => map.init(mem),)+

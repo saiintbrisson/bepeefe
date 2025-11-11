@@ -135,6 +135,7 @@ pub fn exit(state: &mut crate::vm::Vm, _: Insn) {
 }
 
 const BPF_FUNC_MAP_LOOKUP_ELEM: i32 = 1;
+const BPF_FUNC_MAP_UPDATE_ELEM: i32 = 2;
 const BPF_FUNC_TRACE_PRINTK: i32 = 6;
 const BPF_FUNC_GET_CURRENT_PID_TGID: i32 = 14;
 
@@ -165,6 +166,30 @@ pub fn jmp_call(state: &mut crate::vm::Vm, insn: Insn) {
                     let key = GuestAddr(state.registers[2] as u32 as usize);
                     let elem = state.map_lookup_elem(map_idx, key);
                     state.registers[0] = elem.0 as u64;
+                }
+                // static void *(* const bpf_map_lookup_elem)(void *map, const void *key) = (void *)
+                // 1;
+                // R1: map pointer, R2: key pointer, R3: value, R4: flags
+                // R0: success or errno
+                BPF_FUNC_MAP_UPDATE_ELEM => {
+                    let map_idx = state.registers[1] as u32 as usize;
+                    let map = state.map_by_id(map_idx).unwrap();
+                    let key_size = map.repr.key_size();
+                    let value_size = map.repr.value_size();
+                    let _ = map;
+
+                    let key_addr = GuestAddr(state.registers[2] as u32 as usize);
+                    let key = state
+                        .mem
+                        .read(key_addr, key_size)
+                        .expect("tried reading of memory bounds")
+                        .to_vec();
+                    let value_addr = GuestAddr(state.registers[3] as u32 as usize);
+                    let value_ptr = state.mem.into_ptr(value_addr, value_size).unwrap();
+
+                    let map = state.map_by_id(map_idx).unwrap();
+                    map.repr.update_elem(&key, value_ptr).unwrap();
+                    state.registers[0] = 0;
                 }
                 // static long (* const bpf_trace_printk)(const char *fmt, __u32 fmt_size, ...) =
                 // (void *) 6;
