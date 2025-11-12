@@ -141,7 +141,7 @@ pub const ATOMIC_FETCH: u8 = 0x01;
 /// atomic exchange
 pub const ATOMIC_XCHG: u8 = 0xE0 | ATOMIC_FETCH;
 /// atomic compare and exchange
-pub const ATOMIC_CMPXCHG: u8 = 0xF0 | ATOMIC_FETCH;
+pub const ATOMIC_CMPXCHG: u8 = 0xF0;
 
 pub fn stx_atomic_dw(state: &mut crate::vm::Vm, insn: Insn) {
     let src = insn.src_reg() as usize;
@@ -162,6 +162,21 @@ pub fn stx_atomic_dw(state: &mut crate::vm::Vm, insn: Insn) {
             if imm as u8 & ATOMIC_FETCH != 0 {
                 state.registers[src as usize] = val;
             }
+        }
+        ATOMIC_CMPXCHG if imm as u8 & ATOMIC_FETCH > 0 => {
+            let expected = state.registers[0];
+            let new_val = state.registers[src as usize];
+
+            let old_val: u64 = state.mem.read_as(GuestAddr(ptr)).expect("failed to read");
+
+            if expected == old_val {
+                state
+                    .mem
+                    .write(GuestAddr(ptr), &new_val.to_ne_bytes())
+                    .expect("failed to write");
+            }
+
+            state.registers[0] = old_val;
         }
         _ => todo!(),
     }

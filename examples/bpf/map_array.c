@@ -18,9 +18,8 @@ int entry(struct __sk_buff *ctx) {
     if (kbs) {
         __u64 acc = __sync_fetch_and_add(kbs, ctx->len) + ctx->len;
         if ((acc % 4096) > 3072) {
-            const char fmt_str[] = "Local port: %d, current buff len: %d, %s\n";
-            const char str_bla[] = "Hello, World!";
-            bpf_trace_printk(fmt_str, sizeof(fmt_str), port, acc, &str_bla);
+            const char fmt_str[] = "Local port: %d, current buff len: %d\n";
+            bpf_trace_printk(fmt_str, sizeof(fmt_str), port, acc);
 
         }
     }

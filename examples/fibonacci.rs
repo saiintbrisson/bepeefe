@@ -9,7 +9,7 @@ fn main() {
     let program = Program::from_object(&file);
 
     let entrypoint = program
-        .build_entrypoint("entry", &Val::Number(64))
+        .build_entrypoint("fibonacci", &Val::Number(72))
         .expect("failed to build entrypoint");
     let mut vm = Vm::new_with_entrypoint(program, entrypoint);
 

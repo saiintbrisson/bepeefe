@@ -170,6 +170,7 @@ fn collect_syms(loader: &Loader<'_>) -> HashMap<String, usize> {
     symbols
 }
 
+#[derive(Debug)]
 struct Func {
     name: CString,
     insn_off: u32,
@@ -177,6 +178,7 @@ struct Func {
     ret: FuncInnerType,
 }
 
+#[derive(Debug)]
 struct FuncInnerType {
     name: Option<CString>,
     type_name: CString,

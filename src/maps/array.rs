@@ -74,9 +74,9 @@ impl Array {
             return Err(ErrorKind::InvalidInput.into());
         }
 
-        let idx = self.stride_layout.size() * key;
+        let offset = self.stride_layout.size() * key;
         let ptr = self.data.expect("map not initialized").as_ptr() as usize;
-        let ptr = ptr.checked_add(idx).ok_or(ErrorKind::InvalidInput)? as *mut u8;
+        let ptr = ptr.checked_add(offset).ok_or(ErrorKind::InvalidInput)? as *mut u8;
 
         unsafe {
             ptr.copy_from(value, self.element_layout.size());
