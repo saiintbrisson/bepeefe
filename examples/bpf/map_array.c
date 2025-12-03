@@ -16,7 +16,7 @@ int entry(struct __sk_buff *ctx) {
     long *kbs = bpf_map_lookup_elem(&port_map, &port);
 
     if (kbs) {
-        __u64 acc = __sync_fetch_and_add(kbs, ctx->len) + ctx->len;
+        __u64 acc = __sync_add_and_fetch(kbs, ctx->len);
         if ((acc % 4096) > 3072) {
             const char fmt_str[] = "Local port: %d, current buff len: %d\n";
             bpf_trace_printk(fmt_str, sizeof(fmt_str), port, acc);

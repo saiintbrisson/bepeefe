@@ -10,7 +10,7 @@
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 64);
+    __uint(max_entries, 8);
     __type(key, int);
     __type(value, long long);
 } fib_cache SEC(".maps");
