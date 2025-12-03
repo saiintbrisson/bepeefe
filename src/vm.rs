@@ -1,16 +1,17 @@
 use std::alloc::Layout;
 
-use mem::{GuestAddr, VmMem, VmMemRegion};
+use mem::{Memory, Region};
 
 use crate::{
-    isa::Insn,
+    isa::{self, Insn},
     loader::{Context, Entrypoint, Program},
     maps::BpfMap,
 };
 
+mod debugger;
 pub mod mem;
 
-const DEFAULT_SIZE: usize = 1024 * 1024 * 2; // 1 MiB
+const DEFAULT_SIZE: usize = 1024 * 1024 * 2; // 2 MiB
 
 pub struct Vm {
     maps: Vec<BpfMap>,
@@ -19,20 +20,21 @@ pub struct Vm {
     pub exit: bool,
 
     pub registers: [u64; 11],
+    call_stack: Vec<StackFrame>,
 
-    pub mem: VmMem,
-    stack: VmMemRegion,
+    pub mem: Memory,
+    stack: Region,
 }
 
 impl Vm {
     /// Instantiates a new virtual machine with the given
-    /// program loaded. A 1MiB memory region is alocated
+    /// program loaded. A 2MiB memory region is allocated
     /// and zeroed. Maps are loaded and initiated. Code
     /// is loaded to the memory and PC is set to `entry`.
-    pub fn new(mut program: Program, entry: usize) -> Self {
-        let mut mem = VmMem::new(DEFAULT_SIZE);
+    pub fn new(mut program: Program) -> Self {
+        let mut mem = Memory::with_capacity(DEFAULT_SIZE);
 
-        let code = VmCode::new(program.code, &mut mem, entry);
+        let code = VmCode::new(program.code);
         let stack_layout = Layout::from_size_align(100 * 1024, 8).unwrap();
         let stack = mem.alloc_layout(stack_layout).expect("stack is valid");
 
@@ -41,104 +43,88 @@ impl Vm {
         }
 
         let mut registers: [u64; 11] = Default::default();
-        registers[10] = stack.guest_end_addr().0 as u64 - 1;
+        registers[10] = (stack.end() - 1) as u64;
 
         Self {
             maps: program.maps,
             code,
             exit: false,
             registers,
+            call_stack: Vec::with_capacity(8),
             mem,
             stack,
         }
     }
 
-    /// Instantiates a new virtual machine with the given
-    /// program load. A 1MiB memory region is alocated
-    /// and zeroed. Maps are loaded and initiated. Code
-    /// is loaded to the memory.
-    ///
-    /// PC is set to the function in `entrypoint`. If the
-    /// entrypoint contains a context, this function will:
-    /// - For `Context::Buffer`: allocate it and point R1 to the buffer address
-    /// - For `Context::Value`: set R1 directly to the value
-    pub fn new_with_entrypoint(program: Program, entrypoint: Entrypoint) -> Self {
-        let mut vm = Self::new(program, entrypoint.offset);
+    pub fn run(&mut self, entrypoint: Entrypoint) {
+        self.registers = Default::default();
+        self.registers[10] = (self.stack.end() - 1) as u64;
 
-        if let Some(ctx) = entrypoint.ctx {
+        self.exit = false;
+        self.code.set_pc(entrypoint.offset);
+
+        let ctx_reg = if let Some(ctx) = entrypoint.ctx {
             match ctx {
                 Context::Buffer(buf) => {
-                    let ctx_layout =
-                        Layout::from_size_align(buf.len(), 8).expect("invalid context buffer size");
-                    let ctx_mem = vm
-                        .mem
-                        .alloc_layout(ctx_layout)
-                        .expect("failed to allocate context memory");
+                    let ctx_reg = self.mem.push_bytes(&buf, None);
+                    self.registers[1] = ctx_reg.start() as u64;
 
-                    vm.mem
-                        .write(ctx_mem.guest_addr(), &buf)
-                        .expect("failed to write context buffer");
-
-                    vm.registers[1] = ctx_mem.guest_addr().0 as u64;
+                    Some(ctx_reg)
                 }
                 Context::Value(val) => {
-                    vm.registers[1] = val;
+                    self.registers[1] = val;
+                    None
                 }
             }
+        } else {
+            None
+        };
+
+        while !self.exit {
+            let Some(insn) = self.code.step() else {
+                panic!();
+            };
+
+            isa::INSTRUCTION_TABLE[insn.opcode() as usize](self, insn);
         }
 
-        vm
+        if let Some(ctx_reg) = ctx_reg {
+            self.mem.reclaim_region(ctx_reg);
+        }
     }
 
     pub fn call(&mut self, offset: i32) {
-        let mut frame = StackFrame {
-            ret_addr: Some(self.code.pc),
-            registers: Default::default(),
-            base_ptr: self.registers[10],
-        };
+        assert!(
+            self.call_stack.len() < 8,
+            "no more than 8 nested calls allowed"
+        );
 
-        frame.registers.copy_from_slice(&self.registers[6..=9]);
+        self.call_stack.push(StackFrame {
+            ret_addr: self.code.pc,
+            registers: self.registers[6..=9].try_into().unwrap(),
+        });
 
         self.registers[10] -= STACK_FUNCTION_SIZE as u64;
-
-        self.mem
-            .copy_from(
-                GuestAddr(self.registers[10] as usize),
-                &raw const frame as *const u8,
-                STACK_FRAME_SIZE,
-            )
-            .unwrap();
-
-        self.registers[10] -= STACK_FRAME_SIZE as u64;
         self.code.add_offset(offset as isize);
     }
 
-    pub fn pop_stack_frame(&mut self) {
-        let stack_ptr = self.registers[10];
-        if stack_ptr >= self.stack.guest_end_addr().0 as u64 {
+    pub fn call_exit(&mut self) {
+        let Some(frame) = self.call_stack.pop() else {
             self.exit = true;
             return;
-        }
+        };
 
-        let frame: StackFrame = self
-            .mem
-            .read_as(GuestAddr(stack_ptr as usize + STACK_FRAME_SIZE))
-            .unwrap();
-
-        if let Some(addr) = frame.ret_addr {
-            self.code.pc = addr;
-        } else {
-            self.exit = true;
-        }
-
-        self.registers[10] = frame.base_ptr;
+        self.code.pc = frame.ret_addr;
+        self.registers[10] += STACK_FUNCTION_SIZE as u64;
 
         // Registers R6-R9 are restored while R1-R5 are reset to unreadable.
         // https://github.com/torvalds/linux/blob/master/Documentation/bpf/classic_vs_extended.rst
-        (&mut self.registers[1..=5]).copy_from_slice(&[0; 5]);
-        (&mut self.registers[6..=9]).copy_from_slice(&frame.registers);
+        self.registers[1..=5].fill(0);
+        self.registers[6..=9].copy_from_slice(&frame.registers);
     }
+}
 
+impl Vm {
     pub fn map_by_fd_exists(&self, fd: i32) -> bool {
         (fd as usize) < self.maps.len()
     }
@@ -147,57 +133,64 @@ impl Vm {
         self.maps.get_mut(id)
     }
 
-    pub fn map_lookup_elem(&self, map: usize, key_addr: GuestAddr) -> GuestAddr {
+    pub fn map_by_name(&mut self, name: &str) -> Option<&mut BpfMap> {
+        self.maps.iter_mut().find(|map| map.name == name)
+    }
+
+    pub(crate) fn map_lookup_from_guest(&self, map: usize, key_addr: usize) -> Option<usize> {
         let map = &self.maps[map as usize];
         let key = self
             .mem
-            .read(key_addr, map.repr.key_size())
-            .expect("tried reading of memory bounds");
-        map.repr
-            .lookup_elem(key)
-            .and_then(|key| self.mem.into_guest_addr(key))
-            .unwrap_or_default()
+            .slice(key_addr, map.repr.key_size())
+            .expect("tried reading out of memory bounds");
+        map.repr.lookup(&self.mem, key)
     }
 
-    pub fn map_by_name(&mut self, name: &str) -> Option<&mut BpfMap> {
-        self.maps.iter_mut().find(|map| map.name == name)
+    pub(crate) fn map_update_from_guest(
+        &mut self,
+        map_idx: usize,
+        key_addr: usize,
+        value_addr: usize,
+    ) -> std::io::Result<()> {
+        let map = self
+            .maps
+            .get_mut(map_idx)
+            .ok_or(std::io::ErrorKind::NotFound)?;
+        map.repr
+            .update_from_guest(&mut self.mem, key_addr, value_addr)
     }
 }
 
 pub struct VmCode {
-    mem: VmMemRegion,
-    len: usize,
+    code: Vec<Insn>,
     pc: usize,
 }
 
 impl VmCode {
-    pub fn new(code: Vec<u8>, mem: &mut VmMem, pc: usize) -> Self {
-        let code_layout = Layout::from_size_align(code.len(), 8).expect("code len is too big");
-        let mem = mem.alloc_layout(code_layout).expect("vm mem oom");
-
-        unsafe {
-            code.as_ptr().copy_to(mem.as_ptr().as_ptr(), code.len());
-        }
+    pub fn new(code: Vec<u8>) -> Self {
+        assert!(code.len().is_multiple_of(8));
 
         Self {
-            mem,
-            len: code.len() / (u64::BITS / 8) as usize,
-            pc,
+            code: unsafe { std::mem::transmute(code) },
+            pc: 0,
         }
     }
 
-    pub fn code(&self) -> &[Insn] {
-        let ptr = self.mem.as_ptr().cast::<Insn>().as_ptr();
-        unsafe { std::slice::from_raw_parts(ptr, self.len) }
+    pub fn step(&mut self) -> Option<Insn> {
+        self.pc += 1;
+        self.code.get(self.pc - 1).copied()
     }
 
-    pub fn next(&mut self) -> Option<Insn> {
-        self.pc += 1;
-        self.mem.read_at_offset((self.pc - 1) * 8)
+    pub fn peek(&self) -> Option<Insn> {
+        self.code.get(self.pc).copied()
     }
 
     pub fn add_offset(&mut self, offset: isize) {
         self.pc = (self.pc as isize + offset) as usize;
+    }
+
+    pub fn set_pc(&mut self, pc: usize) {
+        self.pc = pc;
     }
 
     pub fn pc(&self) -> usize {
@@ -209,15 +202,9 @@ impl VmCode {
 /// usage per function by tracking register states and using a PTR_TO_STACK
 /// state. I won't do this, for now at least.
 const STACK_FUNCTION_SIZE: usize = 512;
-const STACK_FRAME_SIZE: usize = size_of::<StackFrame>();
 
-#[repr(C)]
 #[derive(Debug)]
-pub struct StackFrame {
-    /// Return address of the caller.
-    pub ret_addr: Option<usize>,
-    /// Registers preserved between calls, R6 to R9.
-    pub registers: [u64; 4],
-    /// The base stack pointer of this frame.
-    pub base_ptr: u64,
+struct StackFrame {
+    ret_addr: usize,
+    registers: [u64; 4],
 }

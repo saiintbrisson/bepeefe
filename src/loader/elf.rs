@@ -51,7 +51,6 @@ impl<'data> Loader<'data> {
         for sec in self.file.sections() {
             let name = sec.name().unwrap();
             match name {
-                "maps" => panic!("legacy 'maps' section is not supported, use .maps"),
                 ".BTF" => {
                     self.btf = Some(super::btf::load_btf(&sec).expect("malformed BTF section"));
                     continue;
@@ -61,12 +60,15 @@ impl<'data> Loader<'data> {
                         Some(super::btf::ext::load_btf_ext(&sec).expect("malformed BTF section"));
                     continue;
                 }
+
+                "maps" => panic!("legacy 'maps' section is not supported, use .maps"),
                 ".maps" => {
                     self.btf_maps_sec = Some(sec.index());
                     self.loaded_sections.insert(sec.index(), 0);
                     continue;
                 }
-                _ => {}
+
+                _ => eprintln!("{name}"),
             }
 
             let cursor = self.loaded_prog.len();

@@ -2,11 +2,12 @@ use std::{
     alloc::Layout,
     hash::{Hash, Hasher},
     io::{ErrorKind, Result},
-    ptr::NonNull,
 };
 
+use crate::vm::mem::{Memory, Region};
+
 #[repr(u8)]
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 enum Flag {
     Vacant,
     Deleted,
@@ -22,8 +23,7 @@ enum Search {
 
 #[derive(Debug)]
 pub struct HashTable {
-    flags_ptr: Option<NonNull<Flag>>,
-    data_ptr: Option<NonNull<u8>>,
+    data: Option<(Vec<Flag>, Region)>,
 
     max_entries: usize,
 
@@ -43,8 +43,7 @@ impl HashTable {
         let (entry_layout, value_offset) = key_layout.extend(value_layout).unwrap();
 
         Self {
-            flags_ptr: None,
-            data_ptr: None,
+            data: None,
 
             max_entries: max_entries as usize,
 
@@ -65,85 +64,119 @@ impl HashTable {
         self.value_layout.size()
     }
 
-    pub fn init(&mut self, mem: &mut crate::vm::mem::VmMem) {
-        let flag_layout =
-            Layout::array::<Flag>(self.max_entries).expect("map capacity is over limit");
-
+    pub fn init(&mut self, mem: &mut Memory) {
         let entries_layout = Layout::from_size_align(
             self.entry_layout.size() * self.max_entries,
             self.entry_layout.align(),
         )
         .expect("invalid map config");
 
-        let (map_layout, entries_offset) = flag_layout.extend(entries_layout).unwrap();
-
-        let alloc_ptr = mem.alloc_layout(map_layout).expect("vm mem oom").as_ptr();
-        self.flags_ptr = Some(alloc_ptr.cast());
-        self.data_ptr = Some(alloc_ptr.map_addr(|ptr| ptr.saturating_add(entries_offset)));
+        let entries_region = mem.alloc_layout(entries_layout).expect("vm mem oom");
+        self.data = Some((vec![Flag::Vacant; self.max_entries], entries_region))
     }
 
-    fn find(&self, key: &[u8], search: Search) -> Option<(NonNull<Flag>, NonNull<u8>)> {
-        let flags_ptr = self.flags_ptr.expect("map not initialized");
-        let data_ptr = self.data_ptr.expect("map not initialized");
-
+    fn find_match(&self, mem: &Memory, key: &[u8]) -> Option<usize> {
+        let (flags, data_region) = self.data.as_ref().unwrap();
+        let data_start = data_region.start();
         let hash = hash(key);
         let mut idx = (hash % self.max_entries as u64) as usize;
 
-        let mut last_free = None;
-
         loop {
-            let flag_ptr = flags_ptr.map_addr(|ptr| ptr.checked_add(idx).unwrap());
-            let entry_ptr =
-                data_ptr.map_addr(|ptr| ptr.checked_add(idx * self.entry_layout.size()).unwrap());
+            let flag = flags[idx];
+            let entry_ptr = data_start + idx * self.entry_layout.size();
 
-            match (unsafe { flag_ptr.read() }, &search) {
-                (Flag::Vacant | Flag::Deleted, Search::Free) => return Some((flag_ptr, entry_ptr)),
-                (Flag::Vacant, Search::Match) => return None,
-                (Flag::Deleted, Search::Match) | (Flag::Occupied, Search::Free) => {}
-
-                (Flag::Occupied, Search::Match | Search::MatchOrFree) => {
-                    let entry_key: &[u8] = unsafe {
-                        std::slice::from_raw_parts(entry_ptr.as_ptr(), self.key_layout.size())
-                    };
-
+            match flag {
+                Flag::Vacant => return None,
+                Flag::Deleted => {}
+                Flag::Occupied => {
+                    let entry_key = mem.slice(entry_ptr, self.key_layout.size()).unwrap();
                     if entry_key == key {
-                        return Some((flag_ptr, entry_ptr));
+                        return Some(entry_ptr);
                     }
-                }
-                // TODO: Figure this out
-                (Flag::Deleted, Search::MatchOrFree) => {
-                    last_free = Some((flag_ptr, entry_ptr));
-                }
-                (Flag::Vacant, Search::MatchOrFree) => {
-                    last_free = Some((flag_ptr, entry_ptr));
-                    break;
                 }
             }
 
-            idx += 1;
+            idx = (idx + 1) % self.max_entries;
         }
-
-        last_free
     }
 
-    pub fn lookup_elem(&self, key: &[u8]) -> Option<*const u8> {
-        self.find(key, Search::Match)
-            .map(|(_, ptr)| ptr.as_ptr().map_addr(|addr| addr + self.value_offset) as *const u8)
+    fn find_slot(&mut self, mem: &Memory, key: &[u8]) -> Option<usize> {
+        let (flags, data_region) = self.data.as_mut().unwrap();
+        let data_start = data_region.start();
+        let hash = hash(key);
+        let mut idx = (hash % self.max_entries as u64) as usize;
+        let mut free_idx = None;
+
+        loop {
+            let flag = flags[idx];
+            let entry_ptr = data_start + idx * self.entry_layout.size();
+
+            match flag {
+                Flag::Vacant => {
+                    let slot_idx = free_idx.unwrap_or(idx);
+                    flags[slot_idx] = Flag::Occupied;
+                    return Some(data_start + slot_idx * self.entry_layout.size());
+                }
+                Flag::Deleted => {
+                    if free_idx.is_none() {
+                        free_idx = Some(idx);
+                    }
+                }
+                Flag::Occupied => {
+                    let entry_key = mem.slice(entry_ptr, self.key_layout.size()).unwrap();
+                    if entry_key == key {
+                        return Some(entry_ptr);
+                    }
+                }
+            }
+
+            idx = (idx + 1) % self.max_entries;
+            if idx == (hash % self.max_entries as u64) as usize {
+                return free_idx.map(|i| {
+                    flags[i] = Flag::Occupied;
+                    data_start + i * self.entry_layout.size()
+                });
+            }
+        }
     }
 
-    pub fn update_elem(&mut self, key: &[u8], value: *const u8) -> Result<()> {
-        let (flag, ptr) = self
-            .find(key, Search::MatchOrFree)
-            .map(|(flag_ptr, ptr)| (flag_ptr, ptr.as_ptr() as *const u8))
-            .ok_or(ErrorKind::OutOfMemory)?;
-        let key_ptr = ptr as *mut u8;
-        let value_ptr = ptr.map_addr(|addr| addr + self.value_offset) as *mut u8;
+    pub fn lookup(&self, mem: &Memory, key: &[u8]) -> Option<usize> {
+        self.find_match(mem, key).map(|ptr| ptr + self.value_offset)
+    }
 
-        unsafe {
-            flag.write(Flag::Occupied);
-            key_ptr.copy_from(key.as_ptr(), self.key_layout.size());
-            value_ptr.copy_from(value, self.value_layout.size());
+    pub fn update(&mut self, mem: &mut Memory, key: &[u8], value: &[u8]) -> Result<()> {
+        if key.len() != self.key_layout.size() {
+            return Err(ErrorKind::InvalidInput.into());
         }
+        if value.len() != self.value_layout.size() {
+            return Err(ErrorKind::InvalidInput.into());
+        }
+
+        let key_ptr = self.find_slot(mem, key).ok_or(ErrorKind::OutOfMemory)?;
+        let value_ptr = key_ptr + self.value_offset;
+
+        mem.write_slice(key_ptr, key)?;
+        mem.write_slice(value_ptr, value)?;
+
+        Ok(())
+    }
+
+    pub(crate) fn update_from_guest(
+        &mut self,
+        mem: &mut Memory,
+        key_addr: usize,
+        value_addr: usize,
+    ) -> Result<()> {
+        let key_size = self.key_layout.size();
+        let key = mem
+            .slice(key_addr, key_size)
+            .ok_or(ErrorKind::InvalidInput)?;
+
+        let key_ptr = self.find_slot(mem, key).ok_or(ErrorKind::OutOfMemory)?;
+        let value_ptr = key_ptr + self.value_offset;
+
+        mem.copy_within(key_addr, key_ptr, key_size)?;
+        mem.copy_within(value_addr, value_ptr, self.value_layout.size())?;
 
         Ok(())
     }

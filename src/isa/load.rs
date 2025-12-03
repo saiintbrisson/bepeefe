@@ -13,7 +13,7 @@
 //! mention bit width of stuff...
 #![allow(dead_code)]
 
-use crate::{isa::Insn, vm::mem::GuestAddr};
+use crate::isa::Insn;
 
 /// 64-bit immediate instructions
 pub const MODE_IMM: u8 = 0x0 << 5;
@@ -48,10 +48,7 @@ macro_rules! mem_insns {
                 let offset = insn.offset();
 
                 let ptr = (state.registers[src as usize] as isize + offset as isize) as usize;
-                let val = state.mem.read(
-                    crate::vm::mem::GuestAddr(ptr),
-                    SIZE
-                ).unwrap().try_into().unwrap();
+                let val: [_; SIZE] = state.mem.read_as(ptr).unwrap();
 
                 state.registers[dst as usize] = $size::from_ne_bytes(val) as u64;
             }
@@ -64,10 +61,7 @@ macro_rules! mem_insns {
                 let val = state.registers[src as usize] as $size;
                 let ptr = (state.registers[dst as usize] as isize + offset as isize) as usize;
 
-                state.mem.write(
-                    crate::vm::mem::GuestAddr(ptr),
-                    &val.to_ne_bytes()
-                ).expect("failed to write");
+                state.mem.write_slice(ptr, &val.to_ne_bytes()).expect("failed to write");
             }
         )+
     };
@@ -109,7 +103,7 @@ pub fn ld_imm64(state: &mut crate::vm::Vm, insn: Insn) {
     let dst = insn.dst_reg() as usize;
     let imm = insn.imm();
 
-    let next_imm = (state.code.next().unwrap().imm() as u64) << 32;
+    let next_imm = (state.code.step().unwrap().imm() as u64) << 32;
 
     match src {
         0 => state.registers[dst] = next_imm | imm as u64,
@@ -153,11 +147,11 @@ pub fn stx_atomic_dw(state: &mut crate::vm::Vm, insn: Insn) {
 
     match imm as u8 & 0xF0 {
         ATOMIC_ADD => {
-            let val: u64 = state.mem.read_as(GuestAddr(ptr)).expect("failed to read");
+            let val = u64::from_ne_bytes(state.mem.read_as(ptr).expect("failed to read"));
             let new_val = val + state.registers[src as usize];
             state
                 .mem
-                .write(GuestAddr(ptr), &new_val.to_ne_bytes())
+                .write_slice(ptr, &new_val.to_ne_bytes())
                 .expect("failed to write");
             if imm as u8 & ATOMIC_FETCH != 0 {
                 state.registers[src as usize] = val;
@@ -166,13 +160,12 @@ pub fn stx_atomic_dw(state: &mut crate::vm::Vm, insn: Insn) {
         ATOMIC_CMPXCHG if imm as u8 & ATOMIC_FETCH > 0 => {
             let expected = state.registers[0];
             let new_val = state.registers[src as usize];
-
-            let old_val: u64 = state.mem.read_as(GuestAddr(ptr)).expect("failed to read");
+            let old_val = u64::from_ne_bytes(state.mem.read_as(ptr).expect("failed to read"));
 
             if expected == old_val {
                 state
                     .mem
-                    .write(GuestAddr(ptr), &new_val.to_ne_bytes())
+                    .write_slice(ptr, &new_val.to_ne_bytes())
                     .expect("failed to write");
             }
 

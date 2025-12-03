@@ -39,10 +39,10 @@ pub const BPF_TO_LE: u8 = 0x00;
 /// convert between host byte order and big endian
 pub const BPF_TO_BE: u8 = 0x08;
 
-const SHIFT_MASK_32: u32 = 0x1F;
-const SHIFT_MASK_64: u64 = 0x3F;
+pub const SHIFT_MASK_32: u32 = 0x1F;
+pub const SHIFT_MASK_64: u64 = 0x3F;
 
-const BYTE_SWAP_ALLOWED_IMM: u64 = 16 | 32 | 64;
+pub const BYTE_SWAP_ALLOWED_IMM: u64 = 16 | 32 | 64;
 
 macro_rules! alu {
     ($($name:ident, |$dst:tt, $src:tt, $imm:tt| $func:expr;)+) => {

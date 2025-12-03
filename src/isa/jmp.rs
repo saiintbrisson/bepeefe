@@ -1,7 +1,6 @@
 use std::ffi::CStr;
 
 use super::Insn;
-use crate::vm::mem::GuestAddr;
 
 /// src = 0x0, PC += offset, BPF_JMP only
 pub const BPF_JA: u8 = 0x00;
@@ -131,7 +130,7 @@ pub fn ja_64(state: &mut crate::vm::Vm, insn: Insn) {
 }
 
 pub fn exit(state: &mut crate::vm::Vm, _: Insn) {
-    state.pop_stack_frame();
+    state.call_exit();
 }
 
 const BPF_FUNC_MAP_LOOKUP_ELEM: i32 = 1;
@@ -163,47 +162,34 @@ pub fn jmp_call(state: &mut crate::vm::Vm, insn: Insn) {
                 // R0: pointer to value
                 BPF_FUNC_MAP_LOOKUP_ELEM => {
                     let map_idx = state.registers[1] as u32 as usize;
-                    let key = GuestAddr(state.registers[2] as u32 as usize);
-                    let elem = state.map_lookup_elem(map_idx, key);
-                    state.registers[0] = elem.0 as u64;
+                    let key = state.registers[2] as u32 as usize;
+                    let elem = state
+                        .map_lookup_from_guest(map_idx, key)
+                        .unwrap_or_default();
+                    state.registers[0] = elem as u64;
                 }
-                // static void *(* const bpf_map_lookup_elem)(void *map, const void *key) = (void *)
-                // 1;
+                // static long (* const bpf_map_update_elem)(void *map, const void *key, const void *value, __u64 flags) = (void *) 2;
                 // R1: map pointer, R2: key pointer, R3: value, R4: flags
                 // R0: success or errno
                 BPF_FUNC_MAP_UPDATE_ELEM => {
                     let map_idx = state.registers[1] as u32 as usize;
-                    let map = state.map_by_id(map_idx).unwrap();
-                    let key_size = map.repr.key_size();
-                    let value_size = map.repr.value_size();
-                    let _ = map;
-
-                    let key_addr = GuestAddr(state.registers[2] as u32 as usize);
-                    let key = state
-                        .mem
-                        .read(key_addr, key_size)
-                        .expect("tried reading of memory bounds")
-                        .to_vec();
-                    let value_addr = GuestAddr(state.registers[3] as u32 as usize);
-                    let value_ptr = state.mem.into_ptr(value_addr, value_size).unwrap();
-
-                    let map = state.map_by_id(map_idx).unwrap();
-                    map.repr.update_elem(&key, value_ptr).unwrap();
-                    state.registers[0] = 0;
+                    let key_addr = state.registers[2] as usize;
+                    let value_addr = state.registers[3] as usize;
+                    match state.map_update_from_guest(map_idx, key_addr, value_addr) {
+                        Ok(()) => state.registers[0] = 0,
+                        Err(_) => state.registers[0] = -1i64 as u64,
+                    }
                 }
                 // static long (* const bpf_trace_printk)(const char *fmt, __u32 fmt_size, ...) =
                 // (void *) 6;
                 // R1: addr, R2: size, R3/R4/R5: formatting params
                 // R0: n of written bytes or negative error code
                 BPF_FUNC_TRACE_PRINTK => {
-                    let addr = state.registers[1] as u32 as usize;
-                    let len = state.registers[2] as u32 as usize;
+                    let addr = state.registers[1] as usize;
+                    let len = state.registers[2] as usize;
 
-                    let data = state
-                        .mem
-                        .read(GuestAddr(addr), len)
-                        .expect("addr is invalid");
-                    let Ok(s) = CStr::from_bytes_until_nul(&data) else {
+                    let data = state.mem.slice(addr, len).expect("addr is invalid");
+                    let Ok(s) = CStr::from_bytes_until_nul(data) else {
                         state.registers[0] = -22i64 as u64 /* EINVAL */;
                         return;
                     };
@@ -268,8 +254,10 @@ fn prepare_bpf_trace_printk(state: &mut crate::vm::Vm, s: String) -> String {
                     buf.extend(param.to_string().as_bytes());
                 }
                 's' => {
-                    let addr = GuestAddr(param as _);
-                    let s = state.mem.read_str(addr).unwrap();
+                    let addr = param as usize;
+                    let max_len = 256; // reasonable limit for printk strings
+                    let data = state.mem.slice(addr, max_len).unwrap_or(&[]);
+                    let s = CStr::from_bytes_until_nul(data).unwrap();
                     buf.extend(s.to_bytes());
                 }
                 _ => todo!(),

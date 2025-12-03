@@ -64,24 +64,41 @@ macro_rules! delegate_map_impl {
             }
         }
 
-        pub fn init(&mut self, mem: &mut crate::vm::mem::VmMem) {
+        pub fn init(&mut self, mem: &mut crate::vm::mem::Memory) {
             match self {
                 $(Self::$name(map) => map.init(mem),)+
                 _ => todo!(),
             }
         }
 
-        pub fn lookup_elem(&self, key: &[u8]) -> Option<*const u8> {
+        pub fn lookup(&self, mem: &crate::vm::mem::Memory, key: &[u8]) -> Option<usize> {
             match self {
-                $(Self::$name(map) => map.lookup_elem(key),)+
+                $(Self::$name(map) => map.lookup(mem, key),)+
                 _ => todo!(),
             }
         }
 
         #[allow(dead_code)]
-        pub fn update_elem(&mut self, key: &[u8], value: *const u8) -> std::io::Result<()> {
+        pub fn update(
+            &mut self,
+            mem: &mut crate::vm::mem::Memory,
+            key: &[u8],
+            value: &[u8],
+        ) -> std::io::Result<()> {
             match self {
-                $(Self::$name(map) => map.update_elem(key, value),)+
+                $(Self::$name(map) => map.update(mem, key, value),)+
+                _ => todo!(),
+            }
+        }
+
+        pub(crate) fn update_from_guest(
+            &mut self,
+            mem: &mut crate::vm::mem::Memory,
+            key_addr: usize,
+            value_addr: usize,
+        ) -> std::io::Result<()> {
+            match self {
+                $(Self::$name(map) => map.update_from_guest(mem, key_addr, value_addr),)+
                 _ => todo!(),
             }
         }

@@ -21,14 +21,15 @@ pub const BPF_JMP32: u8 = 0x06;
 /// 64-bit arithmetic operations
 pub const BPF_ALU64: u8 = 0x07;
 
-mod alu;
-mod jmp;
-mod load;
+pub mod alu;
+pub mod jmp;
+pub mod load;
 
 use alu::*;
 use jmp::*;
 use load::*;
 
+#[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct Insn(pub u64);
 

@@ -1,172 +1,109 @@
-use std::{
-    alloc::Layout,
-    ffi::CStr,
-    io::{ErrorKind, Result},
-    ptr::NonNull,
-};
+use std::{alloc::Layout, io::Result};
 
-macro_rules! check_bounds {
-    ($ty:ty, $ptr:expr, $start:expr, $end:expr) => {
-        ($ptr as usize) >= ($start as usize)
-            && ($ptr as usize + size_of::<$ty>()) <= ($end as usize)
-    };
+pub struct Memory {
+    buf: Vec<u8>,
+    tail: usize,
 }
 
-/// This is a very simple memory arena. The goal is to pass virtual memory
-/// addresses to the VM and allow it to read everything it is allowed to, such
-/// as the stack or map values.
-pub struct VmMem {
-    base_ptr: *const u8,
-    tail_ptr: *mut u8,
-    end_ptr: *const u8,
+#[derive(Debug)]
+pub struct Region {
+    start: usize,
+    end: usize,
 }
 
-impl VmMem {
-    /// Creates and allocated a new memory arena.
-    ///
-    /// # Panics
-    ///
-    /// If the capacity is not a multiple of two.
-    pub fn new(capacity: usize) -> Self {
-        assert!(capacity.is_power_of_two());
+impl Region {
+    pub fn start(&self) -> usize {
+        self.start
+    }
 
-        let mem_layout = Layout::from_size_align(capacity, size_of::<usize>()).unwrap();
-        let data = unsafe { std::alloc::alloc_zeroed(mem_layout) };
+    pub fn end(&self) -> usize {
+        self.end
+    }
+}
 
-        Self {
-            base_ptr: data,
-            tail_ptr: data,
-            end_ptr: data.wrapping_byte_add(mem_layout.pad_to_align().size()),
-        }
+impl Memory {
+    pub fn with_capacity(capacity: usize) -> Self {
+        assert!(
+            capacity > 0 && capacity.is_power_of_two(),
+            "memory capacity must be a non-zero power of two"
+        );
+        let buf = vec![0; capacity];
+        Self { buf, tail: 0 }
     }
 
     /// Allocates a new memory region with the size and alignment of the given
     /// layout. The returned region contains a well-aligned pointer to the
     /// allocated region.
-    pub fn alloc_layout(&mut self, layout: Layout) -> Option<VmMemRegion> {
-        let current_tail = self.tail_ptr;
+    pub fn alloc_layout(&mut self, layout: Layout) -> Option<Region> {
+        let tail_ptr = self.buf.as_ptr().wrapping_add(self.tail);
+        let offset = tail_ptr.align_offset(layout.align());
+        let new_tail = self.tail + offset + layout.size();
 
-        let align_offset = current_tail.align_offset(layout.align());
-        let size = layout.pad_to_align().size() + align_offset;
-        let new_tail = (current_tail as usize).checked_add(size)? as *mut u8;
-
-        if new_tail as *const u8 > self.end_ptr {
+        if new_tail > self.buf.len() {
             return None;
         }
 
-        self.tail_ptr = new_tail;
+        let current_tail = self.tail;
+        self.tail = new_tail;
 
-        Some(VmMemRegion {
-            base_ptr: self.base_ptr,
-            start_ptr: current_tail.map_addr(|tail| tail + align_offset),
-            end_ptr: new_tail,
+        Some(Region {
+            start: current_tail + offset,
+            end: new_tail,
         })
     }
 
-    pub fn read_as<T>(&self, addr: GuestAddr) -> Option<T> {
-        self.into_ptr(addr, size_of::<T>())
-            .map(|ptr| unsafe { (ptr as *const T).read() })
-    }
-
-    pub fn read_str(&self, addr: GuestAddr) -> Option<&CStr> {
-        let len = (self.tail_ptr as usize)
-            .saturating_sub(self.base_ptr as usize)
-            .saturating_sub(addr.0 as usize);
-        CStr::from_bytes_until_nul(self.read(addr, len)?).ok()
-    }
-
-    pub fn read(&self, addr: GuestAddr, len: usize) -> Option<&[u8]> {
-        self.into_ptr(addr, len)
-            .map(|ptr| unsafe { std::slice::from_raw_parts(ptr as *const u8, len) })
-    }
-
-    #[inline(always)]
-    pub fn into_ptr(&self, GuestAddr(addr): GuestAddr, len: usize) -> Option<*const u8> {
-        let ptr = (self.base_ptr as usize).checked_add(addr)?;
-        if ptr + len < self.end_ptr as usize {
-            Some(ptr as *const u8)
-        } else {
-            None
+    /// Reclaims the space of the tail region by moving our
+    /// tail to the start of the region.
+    ///
+    /// Returns true if the region is indeed the last one.
+    pub fn reclaim_region(&mut self, region: Region) -> bool {
+        if region.end != self.tail {
+            return false;
         }
+        self.tail = region.start;
+        true
+    }
+}
+
+impl Memory {
+    pub fn push_bytes(&mut self, buf: &[u8], align: Option<usize>) -> Region {
+        let reg = self
+            .alloc_layout(Layout::from_size_align(buf.len(), align.unwrap_or(8)).unwrap())
+            .unwrap();
+        self.buf[reg.start..reg.end].copy_from_slice(buf);
+        reg
     }
 
-    #[inline(always)]
-    pub fn write(&mut self, addr: GuestAddr, val: &[u8]) -> Result<()> {
-        self.copy_from(addr, val.as_ptr(), val.len())
-    }
-
-    pub fn copy_from(
-        &mut self,
-        GuestAddr(addr): GuestAddr,
-        from_ptr: *const u8,
-        len: usize,
-    ) -> Result<()> {
-        let Some(ptr) = (self.base_ptr as usize)
-            .checked_add(addr)
-            .filter(|ptr| ptr + len <= self.end_ptr as usize)
-        else {
-            return Err(ErrorKind::InvalidInput.into());
-        };
-
-        unsafe {
-            (ptr as *mut u8).copy_from(from_ptr, len);
+    pub(crate) fn read_as<const N: usize>(&self, addr: usize) -> Option<[u8; N]> {
+        if addr + N > self.tail {
+            return None;
         }
+        Some(self.buf[addr..addr + N].try_into().unwrap())
+    }
 
+    pub(crate) fn slice(&self, addr: usize, len: usize) -> Option<&[u8]> {
+        if addr + len > self.tail {
+            return None;
+        }
+        Some(&self.buf[addr..addr + len])
+    }
+
+    pub(crate) fn write_slice(&mut self, addr: usize, data: &[u8]) -> Result<()> {
+        if addr + data.len() > self.tail {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        self.buf[addr..addr + data.len()].copy_from_slice(data);
         Ok(())
     }
 
-    pub fn into_guest_addr(&self, ptr: *const u8) -> Option<GuestAddr> {
-        if check_bounds!((), ptr, self.base_ptr, self.end_ptr) {
-            (ptr as usize)
-                .checked_sub(self.base_ptr as usize)
-                .map(GuestAddr)
-        } else {
-            None
+    pub(crate) fn copy_within(&mut self, src: usize, dst: usize, len: usize) -> Result<()> {
+        if src + len > self.tail || dst + len > self.tail {
+            return Err(std::io::ErrorKind::InvalidInput.into());
         }
+        self.buf.copy_within(src..src + len, dst);
+        Ok(())
     }
 }
-
-pub struct VmMemRegion {
-    base_ptr: *const u8,
-    start_ptr: *mut u8,
-    end_ptr: *const u8,
-}
-
-impl VmMemRegion {
-    pub fn as_ptr(&self) -> NonNull<u8> {
-        NonNull::new(self.start_ptr).expect("invalid region")
-    }
-
-    pub fn read_at_offset<T>(&self, offset: usize) -> Option<T> {
-        let start = self.start_ptr as usize;
-        let ptr = start.checked_add(offset)?;
-        if check_bounds!(T, ptr, self.start_ptr, self.end_ptr) {
-            Some(unsafe { (ptr as *const T).read() })
-        } else {
-            None
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn guest_addr(&self) -> GuestAddr {
-        GuestAddr(
-            (self.start_ptr as usize)
-                .checked_sub(self.base_ptr as usize)
-                .unwrap(),
-        )
-    }
-
-    pub fn guest_end_addr(&self) -> GuestAddr {
-        GuestAddr(
-            (self.end_ptr as usize)
-                .checked_sub(self.base_ptr as usize)
-                .unwrap(),
-        )
-    }
-}
-
-#[derive(Default)]
-pub struct GuestAddr(pub usize);
 
 #[cfg(test)]
 mod tests {
@@ -174,62 +111,43 @@ mod tests {
 
     #[test]
     fn allows_allocation_up_to_limit() {
-        type AllocType = [u8; 64];
+        let mut mem = Memory::with_capacity(128);
+        assert_eq!(mem.tail, 0);
 
-        let mut vm = VmMem::new(128);
-        assert_eq!(vm.base_ptr, vm.tail_ptr);
-
-        let first_region = vm
-            .alloc_layout(Layout::new::<AllocType>())
-            .expect("failed to create region");
-        assert_eq!(first_region.base_ptr, vm.base_ptr);
-        assert_eq!(first_region.start_ptr, vm.base_ptr as *mut u8);
-        assert_eq!(first_region.end_ptr, vm.tail_ptr);
-
-        assert_eq!(first_region.base_ptr, first_region.start_ptr);
-
-        assert_eq!(
-            first_region.end_ptr,
-            first_region
-                .start_ptr
-                .wrapping_byte_add(size_of::<AllocType>())
-        );
-
-        let second_region = vm
+        let first = mem
             .alloc_layout(Layout::new::<[u8; 64]>())
             .expect("failed to create region");
-        assert_eq!(second_region.base_ptr, vm.base_ptr);
-        assert_eq!(second_region.start_ptr, first_region.end_ptr as *mut u8);
-        assert_eq!(second_region.end_ptr, vm.tail_ptr);
+        assert_eq!(first.start, 0);
+        assert_eq!(first.end, 64);
+        assert_eq!(mem.tail, 64);
 
-        assert_eq!(
-            second_region.end_ptr,
-            second_region
-                .start_ptr
-                .wrapping_byte_add(size_of::<AllocType>())
-        );
+        let second = mem
+            .alloc_layout(Layout::new::<[u8; 64]>())
+            .expect("failed to create region");
+        assert_eq!(second.start, first.end);
+        assert_eq!(second.end, 128);
+        assert_eq!(mem.tail, 128);
+
+        assert!(mem.alloc_layout(Layout::new::<u8>()).is_none());
     }
 
     #[test]
     fn alloc_respects_layout_alignment() {
-        let mut vm = VmMem::new(128);
-        assert_eq!(vm.base_ptr, vm.tail_ptr);
+        let mut mem = Memory::with_capacity(128);
 
-        let first_region = vm
+        let first = mem
             .alloc_layout(Layout::from_size_align(4, 4).unwrap())
             .expect("failed to create region");
-        assert_eq!(first_region.start_ptr.align_offset(4), 0);
-        assert_eq!(first_region.start_ptr, vm.tail_ptr.wrapping_sub(4));
-        assert_eq!(first_region.end_ptr, vm.tail_ptr);
+        let first_ptr = mem.buf.as_ptr().wrapping_add(first.start);
+        assert_eq!(first_ptr.align_offset(4), 0);
+        assert_eq!(first.end - first.start, 4);
 
-        let second_region = vm
+        let second = mem
             .alloc_layout(Layout::from_size_align(4, 8).unwrap())
             .expect("failed to create region");
-        assert_eq!(second_region.start_ptr.align_offset(8), 0);
-        assert_eq!(
-            second_region.start_ptr as *const u8,
-            first_region.end_ptr.wrapping_add(4)
-        );
-        assert_eq!(second_region.end_ptr, vm.tail_ptr);
+        let second_ptr = mem.buf.as_ptr().wrapping_add(second.start);
+        assert_eq!(second_ptr.align_offset(8), 0);
+        assert_eq!(second.end - second.start, 4);
+        assert_eq!(second.start, 8);
     }
 }
