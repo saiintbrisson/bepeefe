@@ -35,7 +35,7 @@ impl Vm {
         let mut mem = Memory::with_capacity(DEFAULT_SIZE);
 
         let code = VmCode::new(program.code);
-        let stack_layout = Layout::from_size_align(100 * 1024, 8).unwrap();
+        let stack_layout = Layout::from_size_align(STACK_FUNCTION_SIZE * 8, 8).unwrap();
         let stack = mem.alloc_layout(stack_layout).expect("stack is valid");
 
         for map in &mut program.maps {
@@ -63,22 +63,22 @@ impl Vm {
         self.exit = false;
         self.code.set_pc(entrypoint.offset);
 
-        let ctx_reg = if let Some(ctx) = entrypoint.ctx {
-            match ctx {
+        let ctx_regions: Vec<_> = entrypoint
+            .ctx
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, ctx)| match ctx {
                 Context::Buffer(buf) => {
                     let ctx_reg = self.mem.push_bytes(&buf, None);
-                    self.registers[1] = ctx_reg.start() as u64;
-
+                    self.registers[idx] = ctx_reg.start() as u64;
                     Some(ctx_reg)
                 }
-                Context::Value(val) => {
-                    self.registers[1] = val;
+                &Context::Value(val) => {
+                    self.registers[idx] = val;
                     None
                 }
-            }
-        } else {
-            None
-        };
+            })
+            .collect();
 
         while !self.exit {
             let Some(insn) = self.code.step() else {
@@ -88,7 +88,7 @@ impl Vm {
             isa::INSTRUCTION_TABLE[insn.opcode() as usize](self, insn);
         }
 
-        if let Some(ctx_reg) = ctx_reg {
+        for ctx_reg in ctx_regions.into_iter().rev() {
             self.mem.reclaim_region(ctx_reg);
         }
     }

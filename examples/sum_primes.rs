@@ -8,7 +8,7 @@ fn main() {
     let program = Program::from_object(&FILE);
 
     let entrypoint = program
-        .build_entrypoint("entry", &Val::Number(1_000_000))
+        .build_entrypoint("entry", &[Val::Number(1_000_000)])
         .expect("failed to build entrypoint");
     let mut vm = Vm::new(program);
     vm.run(entrypoint);
