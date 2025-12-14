@@ -66,6 +66,18 @@ impl Insn {
     pub fn with_imm(&mut self, imm: i32) {
         self.0 = (self.0 << 32 >> 32) | ((imm as u64) << 32);
     }
+
+    pub fn is_call(&self) -> bool {
+        self.opcode() == BPF_JMP | BPF_CALL | BPF_K
+    }
+
+    pub fn is_subprog_call(&self) -> bool {
+        self.is_call() && self.src_reg() == 1 && self.dst_reg() == 0 && self.offset() == 0
+    }
+
+    pub fn is_ld_imm64(&self) -> bool {
+        self.opcode() == BPF_LD | MODE_IMM | SIZE_DW
+    }
 }
 
 fn noop(_: &mut crate::vm::Vm, _: Insn) {}

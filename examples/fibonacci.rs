@@ -1,17 +1,19 @@
 use bepeefe::{
-    loader::{Program, Val},
-    vm::Vm,
+    object::{EbpfObject, Val},
+    vm::{MapReuseStrategy, Vm},
 };
 
-fn main() {
-    const FILE: &[u8] = include_bytes!("./bpf/fibonacci.o");
-    let program = Program::from_object(&FILE);
+const FILE: &[u8] = include_bytes!("./bpf/fibonacci.o");
 
-    let entrypoint = program
-        .build_entrypoint("fibonacci", &[Val::Number(2)])
-        .expect("failed to build entrypoint");
-    let mut vm = Vm::new(program);
-    vm.run(entrypoint);
+fn main() {
+    let mut vm = Vm::new();
+
+    let obj = EbpfObject::from_elf(&FILE).unwrap();
+    let prog = obj.load_prog("fibonacci").unwrap();
+    let ctx = prog.build_ctx(&[Val::Number(8)]);
+
+    let handle = vm.prepare(prog, MapReuseStrategy::MatchByName);
+    vm.run(&handle, &ctx);
 
     eprintln!("result = {}", vm.registers[0] as i64);
 }

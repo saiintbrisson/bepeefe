@@ -23,7 +23,8 @@ enum Search {
 
 #[derive(Debug)]
 pub struct HashTable {
-    data: Option<(Vec<Flag>, Region)>,
+    flags: Vec<Flag>,
+    region: Region,
 
     max_entries: usize,
 
@@ -35,22 +36,30 @@ pub struct HashTable {
 }
 
 impl HashTable {
-    pub fn new(key_size: u32, value_size: u32, max_entries: u32) -> Self {
+    pub fn new(mem: &mut Memory, key_size: u32, value_size: u32, max_entries: u32) -> Self {
         // The kernel aligns key and value to 8 bytes
         // https://github.com/torvalds/linux/blob/8765f467912ff0d4832eeaf26ae573792da877e7/kernel/bpf/hashtab.c#L516-L521
         let key_layout = Layout::from_size_align(key_size as usize, 8).unwrap();
         let value_layout = Layout::from_size_align(value_size as usize, 8).unwrap();
         let (entry_layout, value_offset) = key_layout.extend(value_layout).unwrap();
+        let entry_layout = entry_layout.pad_to_align();
+
+        let entries_layout = Layout::from_size_align(
+            entry_layout.size() * max_entries as usize,
+            entry_layout.align(),
+        )
+        .expect("invalid map config");
+
+        let region = mem.alloc_layout(entries_layout).expect("vm mem oom");
 
         Self {
-            data: None,
+            flags: vec![Flag::Vacant; max_entries as usize],
+            region,
 
             max_entries: max_entries as usize,
 
             key_layout,
-
-            entry_layout: entry_layout.pad_to_align(),
-
+            entry_layout,
             value_layout,
             value_offset,
         }
@@ -64,25 +73,13 @@ impl HashTable {
         self.value_layout.size()
     }
 
-    pub fn init(&mut self, mem: &mut Memory) {
-        let entries_layout = Layout::from_size_align(
-            self.entry_layout.size() * self.max_entries,
-            self.entry_layout.align(),
-        )
-        .expect("invalid map config");
-
-        let entries_region = mem.alloc_layout(entries_layout).expect("vm mem oom");
-        self.data = Some((vec![Flag::Vacant; self.max_entries], entries_region))
-    }
-
     fn find_match(&self, mem: &Memory, key: &[u8]) -> Option<usize> {
-        let (flags, data_region) = self.data.as_ref().unwrap();
-        let data_start = data_region.start();
+        let data_start = self.region.start();
         let hash = hash(key);
         let mut idx = (hash % self.max_entries as u64) as usize;
 
         loop {
-            let flag = flags[idx];
+            let flag = self.flags[idx];
             let entry_ptr = data_start + idx * self.entry_layout.size();
 
             match flag {
@@ -101,20 +98,19 @@ impl HashTable {
     }
 
     fn find_slot(&mut self, mem: &Memory, key: &[u8]) -> Option<usize> {
-        let (flags, data_region) = self.data.as_mut().unwrap();
-        let data_start = data_region.start();
+        let data_start = self.region.start();
         let hash = hash(key);
         let mut idx = (hash % self.max_entries as u64) as usize;
         let mut free_idx = None;
 
         loop {
-            let flag = flags[idx];
+            let flag = self.flags[idx];
             let entry_ptr = data_start + idx * self.entry_layout.size();
 
             match flag {
                 Flag::Vacant => {
                     let slot_idx = free_idx.unwrap_or(idx);
-                    flags[slot_idx] = Flag::Occupied;
+                    self.flags[slot_idx] = Flag::Occupied;
                     return Some(data_start + slot_idx * self.entry_layout.size());
                 }
                 Flag::Deleted => {
@@ -133,7 +129,7 @@ impl HashTable {
             idx = (idx + 1) % self.max_entries;
             if idx == (hash % self.max_entries as u64) as usize {
                 return free_idx.map(|i| {
-                    flags[i] = Flag::Occupied;
+                    self.flags[i] = Flag::Occupied;
                     data_start + i * self.entry_layout.size()
                 });
             }

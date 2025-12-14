@@ -3,11 +3,11 @@ use std::{
     io::{ErrorKind, Result},
 };
 
-use crate::vm::mem::Region;
+use crate::vm::mem::{Memory, Region};
 
 #[derive(Debug)]
 pub struct Array {
-    region: Option<Region>,
+    region: Region,
 
     max_entries: usize,
 
@@ -18,7 +18,7 @@ pub struct Array {
 }
 
 impl Array {
-    pub fn new(max_entries: u32, value_size: u32) -> Self {
+    pub fn new(mem: &mut Memory, max_entries: u32, value_size: u32) -> Self {
         assert!(max_entries > 0, "max entries must be greater than 0");
         assert!(value_size > 0, "value size must be greater than 0");
 
@@ -30,8 +30,16 @@ impl Array {
         let element_layout = Layout::from_size_align(value_size, 8).expect("invalid value size");
         let stride_layout = element_layout.pad_to_align();
 
+        let map_layout = Layout::from_size_align(
+            stride_layout.size() * max_entries,
+            stride_layout.align(),
+        )
+        .expect("invalid map config");
+
+        let region = mem.alloc_layout(map_layout).expect("vm mem oom");
+
         Self {
-            region: None,
+            region,
             max_entries,
             element_layout,
             stride_layout,
@@ -46,17 +54,7 @@ impl Array {
         self.element_layout.size()
     }
 
-    pub fn init(&mut self, mem: &mut crate::vm::mem::Memory) {
-        let map_layout = Layout::from_size_align(
-            self.stride_layout.size() * self.max_entries,
-            self.stride_layout.align(),
-        )
-        .expect("invalid map config");
-
-        self.region = Some(mem.alloc_layout(map_layout).expect("vm mem oom"));
-    }
-
-    pub fn lookup(&self, _: &crate::vm::mem::Memory, key: &[u8]) -> Option<usize> {
+    pub fn lookup(&self, _: &Memory, key: &[u8]) -> Option<usize> {
         let key: [u8; 4] = key.try_into().ok()?;
         let key = u32::from_ne_bytes(key) as usize;
 
@@ -64,16 +62,10 @@ impl Array {
             return None;
         }
 
-        let start = self.region.as_ref()?.start();
-        Some(start + self.stride_layout.size() * key)
+        Some(self.region.start() + self.stride_layout.size() * key)
     }
 
-    pub fn update(
-        &mut self,
-        mem: &mut crate::vm::mem::Memory,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<()> {
+    pub fn update(&mut self, mem: &mut Memory, key: &[u8], value: &[u8]) -> Result<()> {
         if value.len() != self.element_layout.size() {
             return Err(ErrorKind::InvalidInput.into());
         }
@@ -84,14 +76,13 @@ impl Array {
             return Err(ErrorKind::InvalidInput.into());
         }
 
-        let start = self.region.as_ref().ok_or(ErrorKind::NotFound)?.start();
-        let addr = start + self.stride_layout.size() * key;
+        let addr = self.region.start() + self.stride_layout.size() * key;
         mem.write_slice(addr, value)
     }
 
     pub(crate) fn update_from_guest(
         &mut self,
-        mem: &mut crate::vm::mem::Memory,
+        mem: &mut Memory,
         key_addr: usize,
         value_addr: usize,
     ) -> Result<()> {
@@ -101,8 +92,7 @@ impl Array {
             return Err(ErrorKind::InvalidInput.into());
         }
 
-        let start = self.region.as_ref().ok_or(ErrorKind::NotFound)?.start();
-        let dest = start + key as usize * self.stride_layout.size();
+        let dest = self.region.start() + key as usize * self.stride_layout.size();
         mem.copy_within(value_addr, dest, self.element_layout.size())
     }
 }

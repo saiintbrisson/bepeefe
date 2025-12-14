@@ -1,29 +1,25 @@
 use bepeefe::{
-    loader::{Program, Val},
+    object::{EbpfObject, Val},
     vm::Vm,
 };
 
 fn main() {
     const FILE: &[u8] = include_bytes!("./bpf/map_array.o");
-    let program = Program::from_object(&FILE);
+    let obj = EbpfObject::from_elf(&FILE).unwrap();
+    let prog = obj.load_prog("entry").unwrap();
 
-    let entrypoint = program
-        .build_entrypoint(
-            "entry",
-            &[("local_port", Val::Number(3000)), ("len", Val::Number(15))].into(),
-        )
-        .expect("failed to build entrypoint");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::new();
+    let prog = vm.prepare(prog, bepeefe::vm::MapReuseStrategy::None);
 
-    let init_kbs = 3070u64;
-    let local_port = 3000u32;
+    let init_kbs = Val::Number(3070);
+    let local_port = Val::Number(3000);
 
-    vm.map_by_name("port_map")
-        .unwrap()
-        .repr
-        .update(&local_port.to_ne_bytes(), &init_kbs.to_ne_bytes())
-        .unwrap();
+    let mut map = vm.map("port_map");
+    map.update(&local_port, &init_kbs).unwrap();
 
-    vm.run(entrypoint);
+    let ctx =
+        prog.build_ctx(&[[("local_port", local_port.clone()), ("len", Val::Number(1))].into()]);
+    vm.run(&prog, &ctx);
+
     eprintln!("result = {}", vm.registers[0] as i32);
 }

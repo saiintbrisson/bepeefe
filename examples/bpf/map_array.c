@@ -20,9 +20,9 @@ int entry(struct __sk_buff *ctx) {
         if ((acc % 4096) > 3072) {
             const char fmt_str[] = "Local port: %d, current buff len: %d\n";
             bpf_trace_printk(fmt_str, sizeof(fmt_str), port, acc);
-
+            return 1;
         }
     }
 
-    return 1;
+    return 0;
 }

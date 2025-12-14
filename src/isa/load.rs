@@ -74,6 +74,9 @@ mem_insns! {
     ldx_mem_dw,  stx_mem_dw, u64;
 }
 
+/// LD IMM64 will load the map address with the FD given in IMM.
+pub const BPF_PSEUDO_MAP_FD: u8 = 1;
+
 /// The non-conventional load with IMM mode uses the
 /// wide instruction encoding to construct 64-bit
 /// immediates. This is the only 16 byte instruction
@@ -99,16 +102,14 @@ mem_insns! {
 /// Ref: <https://github.com/torvalds/linux/blob/7ea30958b3054f5e488fa0b33c352723f7ab3a2a/kernel/bpf/verifier.c#L20519>
 /// Ref: <https://mechpen.github.io/posts/2019-08-03-bpf-map/>
 pub fn ld_imm64(state: &mut crate::vm::Vm, insn: Insn) {
-    let src = insn.src_reg() as usize;
     let dst = insn.dst_reg() as usize;
     let imm = insn.imm();
 
     let next_imm = (state.code.step().unwrap().imm() as u64) << 32;
 
-    match src {
+    match insn.src_reg() {
         0 => state.registers[dst] = next_imm | imm as u64,
-        //
-        1 => {
+        BPF_PSEUDO_MAP_FD => {
             assert!(state.map_by_fd_exists(insn.imm()));
             state.registers[dst] = imm as u64;
         }
@@ -117,24 +118,20 @@ pub fn ld_imm64(state: &mut crate::vm::Vm, insn: Insn) {
         // 4 => dst = code_addr(imm)                      imm: integer     dst: code address
         // 5 => dst = map_by_idx(imm)                     imm: map index   dst: map
         // 6 => dst = map_val(map_by_idx(imm)) + next_imm imm: map index   dst: data address
-        _ => unreachable!("unimplemented src reg for imm64 load: {src}"),
+        _ => unreachable!("unimplemented src reg for imm64 load: {}", insn.src_reg()),
     }
 }
 
-// atomic add
 pub const ATOMIC_ADD: u8 = 0x00;
-// atomic or
 pub const ATOMIC_OR: u8 = 0x40;
-// atomic and
 pub const ATOMIC_AND: u8 = 0x50;
-// atomic xor
 pub const ATOMIC_XOR: u8 = 0xa0;
 
-/// modifier: return old value
+/// Modifier: return old value
 pub const ATOMIC_FETCH: u8 = 0x01;
-/// atomic exchange
+/// Atomic exchange
 pub const ATOMIC_XCHG: u8 = 0xE0 | ATOMIC_FETCH;
-/// atomic compare and exchange
+/// Atomic compare and exchange
 pub const ATOMIC_CMPXCHG: u8 = 0xF0;
 
 pub fn stx_atomic_dw(state: &mut crate::vm::Vm, insn: Insn) {

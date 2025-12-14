@@ -1,13 +1,45 @@
-use crate::loader::btf::{BpfMapDeclaration, Btf};
+use std::sync::Arc;
+
+use crate::{
+    btf::{Btf, BtfTypeId},
+    vm::mem::Memory,
+};
 
 mod array;
 mod hash_table;
 
+#[derive(Clone, Debug, Default)]
+pub struct MapSpec {
+    pub name: String,
+    pub r#type: Option<u32>,
+
+    pub sec_idx: usize,
+    pub sec_offset: u32,
+
+    pub max_entries: Option<u32>,
+    pub map_flags: Option<u32>,
+    pub map_extra: Option<u32>,
+    pub numa_node: Option<u32>,
+    pub key_size: Option<u32>,
+    pub value_size: Option<u32>,
+    pub key: Option<BtfTypeId>,
+    pub value: Option<BtfTypeId>,
+    pub values: Option<BtfTypeId>,
+    pub pinning: MapPinning,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum MapPinning {
+    #[default]
+    None,
+    ByName,
+}
+
 pub struct BpfMap {
     pub fd: i32,
-    #[allow(dead_code)]
-    pub name: String,
     pub repr: MapRepr,
+    pub spec: MapSpec,
+    pub btf: Arc<Btf>,
 }
 
 #[repr(u32)]
@@ -64,13 +96,6 @@ macro_rules! delegate_map_impl {
             }
         }
 
-        pub fn init(&mut self, mem: &mut crate::vm::mem::Memory) {
-            match self {
-                $(Self::$name(map) => map.init(mem),)+
-                _ => todo!(),
-            }
-        }
-
         pub fn lookup(&self, mem: &crate::vm::mem::Memory, key: &[u8]) -> Option<usize> {
             match self {
                 $(Self::$name(map) => map.lookup(mem, key),)+
@@ -106,22 +131,24 @@ macro_rules! delegate_map_impl {
 }
 
 impl MapRepr {
-    pub fn create_from_btf(btf: &Btf, map: &BpfMapDeclaration<'_>) -> Option<Self> {
-        Some(match map.r#type? {
+    pub fn create_from_btf(mem: &mut Memory, btf: &Btf, spec: &MapSpec) -> Option<Self> {
+        Some(match spec.r#type? {
             0 => Self::Unspec,
             1 => Self::Hash(hash_table::HashTable::new(
-                map.key_size
-                    .or_else(|| map.key?.kind.size(btf))
+                mem,
+                spec.key_size
+                    .or_else(|| spec.key.and_then(|id| btf.get_type(id))?.kind.size(btf))
                     .expect("map missing key size"),
-                map.value_size
-                    .or_else(|| map.value?.kind.size(btf))
+                spec.value_size
+                    .or_else(|| spec.value.and_then(|id| btf.get_type(id))?.kind.size(btf))
                     .expect("map missing value size"),
-                map.max_entries?,
+                spec.max_entries?,
             )),
             2 => Self::Array(array::Array::new(
-                map.max_entries?,
-                map.value_size
-                    .or_else(|| map.value?.kind.size(btf))
+                mem,
+                spec.max_entries?,
+                spec.value_size
+                    .or_else(|| spec.value.and_then(|id| btf.get_type(id))?.kind.size(btf))
                     .expect("map missing value size"),
             )),
             3 => Self::ProgArray,

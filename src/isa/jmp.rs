@@ -133,6 +133,11 @@ pub fn exit(state: &mut crate::vm::Vm, _: Insn) {
     state.call_exit();
 }
 
+/// Ref: <https://github.com/libbpf/libbpf/blob/d65dbb412d661acae9d67c3786be5b36005b2ac1/include/uapi/linux/bpf.h#L1357-L1364>
+const BPF_PSEUDO_CALL: u8 = 1;
+const BPF_PSEUDO_KFUNC_CALL: u8 = 2;
+const BPF_HELPER_CALL: u8 = 0;
+
 const BPF_FUNC_MAP_LOOKUP_ELEM: i32 = 1;
 const BPF_FUNC_MAP_UPDATE_ELEM: i32 = 2;
 const BPF_FUNC_TRACE_PRINTK: i32 = 6;
@@ -151,9 +156,9 @@ pub fn jmp_call(state: &mut crate::vm::Vm, insn: Insn) {
     let src = insn.src_reg();
 
     match src {
-        // BPF-local functions
-        1 => state.call(insn.imm()),
-        0 => {
+        // BPF-local functions / subprograms
+        BPF_PSEUDO_CALL => state.call(insn.imm()),
+        BPF_HELPER_CALL => {
             // The correct way to do this is with BTF and CO-RE support.
             match insn.imm() {
                 // static void *(* const bpf_map_lookup_elem)(void *map, const void *key) = (void *)
@@ -212,7 +217,7 @@ pub fn jmp_call(state: &mut crate::vm::Vm, insn: Insn) {
                 }
             }
         }
-        2 => todo!(""),
+        BPF_PSEUDO_KFUNC_CALL => todo!(""),
         _ => {
             panic!()
         }

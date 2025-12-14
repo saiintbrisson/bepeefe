@@ -8,6 +8,8 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 
+char _license[] SEC("license") = "Dual BSD/GPL";
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 8);
