@@ -102,7 +102,7 @@ impl BtfBuilder {
         self.insert_type(
             name_off,
             BtfKind::Fwd(Fwd {
-                kind_flag: if is_union { 1 } else { 0 },
+                kind_flag: is_union,
             }),
         )
     }
@@ -142,6 +142,7 @@ impl BtfBuilder {
             .map(|(name, ty, offset)| StructMember {
                 name_off: self.add_string(&name),
                 r#type: ty,
+                bitfield_size: None,
                 offset,
             })
             .collect();
@@ -163,6 +164,7 @@ impl BtfBuilder {
             .map(|(name, ty, offset)| StructMember {
                 name_off: self.add_string(&name),
                 r#type: ty,
+                bitfield_size: None,
                 offset,
             })
             .collect();

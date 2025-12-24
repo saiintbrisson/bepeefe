@@ -60,7 +60,7 @@ struct ProgLoader {
     insns: Vec<Insn>,
     loaded_progs: HashMap<(SectionIndex, usize), usize>,
     relos: Vec<(usize, Relocation)>,
-    map_relos: HashMap<(SectionIndex, usize), usize>,
+    map_relos: HashMap<usize, (SectionIndex, usize)>,
 }
 
 impl<'file> EbpfObject<'file> {
@@ -246,7 +246,7 @@ impl<'file> EbpfObject<'file> {
             if insn.is_ld_imm64() && r_type == R_BPF_64_64 && target_insn_offset.is_none() {
                 loader
                     .map_relos
-                    .insert((sym_sec, sym.address() as usize), *insn_offset);
+                    .insert(*insn_offset, (sym_sec, sym.address() as usize));
                 continue;
             }
 
@@ -433,8 +433,14 @@ fn parse_maps(btf: &Btf, maps_sec: &Section) -> std::result::Result<Vec<MapSpec>
                 "numa_node" => map.numa_node = ty.kind.array_no_elems(),
                 "key_size" => map.key_size = ty.kind.array_no_elems(),
                 "value_size" => map.value_size = ty.kind.array_no_elems(),
-                "key" => map.key = Some(ty.btf_id),
-                "value" => map.value = Some(ty.btf_id),
+                "key" => {
+                    map.key_size = Some(btf.type_size(ty.btf_id).ok_or("invalid type key")?);
+                    map.key = Some(ty.btf_id);
+                }
+                "value" => {
+                    map.value_size = Some(btf.type_size(ty.btf_id).ok_or("invalid type value")?);
+                    map.value = Some(ty.btf_id);
+                }
                 "values" => map.values = Some(ty.btf_id),
                 "pinning" => {
                     if let Some(1) = ty.kind.array_no_elems() {
@@ -568,7 +574,7 @@ pub struct EbpfProgram {
     pub(crate) sig: Arc<FunctionSignature>,
     pub(crate) maps: Vec<MapSpec>,
     pub(crate) btf: Option<Arc<Btf>>,
-    pub(crate) map_relos: HashMap<(SectionIndex, usize), usize>,
+    pub(crate) map_relos: HashMap<usize, (SectionIndex, usize)>,
 }
 
 impl EbpfProgram {

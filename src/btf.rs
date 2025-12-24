@@ -66,6 +66,10 @@ impl Btf {
         self.resolve_indirections(self.types.get(&idx)?)
     }
 
+    pub fn type_size(&self, idx: BtfTypeId) -> Option<u32> {
+        self.get_type(idx)?.kind.size(self)
+    }
+
     /// Ignore modifier and type definition indirections.
     ///
     /// Ref: <https://github.com/libbpf/libbpf/blob/09b9e83102eb8ab9e540d36b4559c55f3bcdb95d/src/libbpf.c#L2360>
@@ -81,6 +85,48 @@ impl Btf {
             };
 
             btf_ty = self.types.get(&btf_id)?;
+        }
+    }
+
+    pub fn is_offset_valid(&self, idx: BtfTypeId, offset: u32, len: u32) -> Option<bool> {
+        let ty_size = self.type_size(idx)?;
+        if offset + len > ty_size {
+            return Some(false);
+        }
+
+        let btf_type = self.get_type(idx)?;
+
+        match &btf_type.kind {
+            BtfKind::Int(_) | BtfKind::Float(_) | BtfKind::Enum(_) | BtfKind::Enum64(_) => {
+                Some(offset == 0 && len == ty_size)
+            }
+            BtfKind::Ptr(idx)
+            | BtfKind::Volatile(idx)
+            | BtfKind::Const(idx)
+            | BtfKind::Restrict(idx) => self.is_offset_valid(*idx, offset, len),
+            BtfKind::Array(array) => {
+                let elem_size = self.type_size(array.r#type)?;
+                let elem_offset = offset % elem_size;
+                self.is_offset_valid(array.r#type, elem_offset, len)
+            }
+            BtfKind::Struct(Struct { members, .. }) | BtfKind::Union(Union { members, .. }) => {
+                members.iter().find_map(|member| {
+                    let offset = offset.checked_sub(member.offset / u8::BITS)?;
+                    if offset + len > self.type_size(member.r#type)? {
+                        return None;
+                    }
+
+                    self.is_offset_valid(member.r#type, offset, len)
+                })
+            }
+            BtfKind::Fwd(fwd) => todo!(),
+            BtfKind::Typedef(btf_type_id) => todo!(),
+            BtfKind::Func(func) => todo!(),
+            BtfKind::FuncProto(func_proto) => todo!(),
+            BtfKind::Var(var) => todo!(),
+            BtfKind::Datasec(datasec) => todo!(),
+            BtfKind::DeclTag => todo!(),
+            BtfKind::TypeTag(btf_type_id) => todo!(),
         }
     }
 }
@@ -207,7 +253,7 @@ pub struct Union {
 /// Forward
 #[derive(Clone, Debug)]
 pub struct Fwd {
-    pub kind_flag: u32,
+    pub kind_flag: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -272,6 +318,8 @@ pub struct Struct {
 pub struct StructMember {
     pub name_off: BtfStrOffset,
     pub r#type: BtfTypeId,
+    pub bitfield_size: Option<u32>,
+    // Member bit offset from struct beginning
     pub offset: u32,
 }
 
@@ -379,17 +427,6 @@ mod parser {
             let str_off = (header.hdr_len + header.str_off) as usize;
             let strings = data[str_off..str_off + header.str_len as usize].to_vec();
 
-            // while str_cursor < str_data.len() {
-            //     let cstr = CStr::from_bytes_until_nul(&str_data[str_cursor..])
-            //         .map_err(|e| Error::new(std::io::ErrorKind::InvalidData, e))?;
-            //     let s = cstr
-            //         .to_str()
-            //         .map_err(|e| Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-            //     strings.insert(str_cursor as u32, s.to_owned());
-            //     str_cursor += cstr.count_bytes() + 1;
-            // }
-
             let type_off = (header.hdr_len + header.type_off) as usize;
             let type_data = &mut &data[type_off..type_off + header.type_len as usize];
             let mut types = BTreeMap::new();
@@ -423,6 +460,8 @@ mod parser {
         pub fn from_ty(info: u32, size_or_type: u32, data: &mut &[u8]) -> Result<Self> {
             let vlen = info & 0xFFFF;
             let kind = (info >> 24) & 0x1F;
+            // TODO: support kind flag for decl_tag and type_tag
+            let kind_flag = info >> 31 == 1;
 
             let kind = match kind {
                 BTF_KIND_INT => {
@@ -444,10 +483,14 @@ mod parser {
                 BTF_KIND_STRUCT => {
                     let mut members = Vec::with_capacity(vlen as usize);
                     for _ in 0..vlen {
+                        let name_off = data.read_u32::<LittleEndian>()?;
+                        let r#type = BtfTypeId(data.read_u32::<LittleEndian>()?);
+                        let offset = data.read_u32::<LittleEndian>()?;
                         members.push(StructMember {
-                            name_off: data.read_u32::<LittleEndian>()?,
-                            r#type: BtfTypeId(data.read_u32::<LittleEndian>()?),
-                            offset: data.read_u32::<LittleEndian>()?,
+                            name_off,
+                            r#type,
+                            bitfield_size: if kind_flag { Some(offset >> 24) } else { None },
+                            offset: if kind_flag { offset & 0xFFFFFF } else { offset },
                         });
                     }
 
@@ -459,10 +502,14 @@ mod parser {
                 BTF_KIND_UNION => {
                     let mut members = Vec::with_capacity(vlen as usize);
                     for _ in 0..vlen {
+                        let name_off = data.read_u32::<LittleEndian>()?;
+                        let r#type = BtfTypeId(data.read_u32::<LittleEndian>()?);
+                        let offset = data.read_u32::<LittleEndian>()?;
                         members.push(StructMember {
-                            name_off: data.read_u32::<LittleEndian>()?,
-                            r#type: BtfTypeId(data.read_u32::<LittleEndian>()?),
-                            offset: data.read_u32::<LittleEndian>()?,
+                            name_off,
+                            r#type,
+                            bitfield_size: if kind_flag { Some(offset >> 24) } else { None },
+                            offset: if kind_flag { offset & 0xFFFFFF } else { offset },
                         });
                     }
 
@@ -481,14 +528,12 @@ mod parser {
                     }
 
                     Self::Enum(Enum {
-                        signed: info >> 31 != 0,
+                        signed: kind_flag,
                         size: size_or_type,
                         values,
                     })
                 }
-                BTF_KIND_FWD => Self::Fwd(Fwd {
-                    kind_flag: info >> 31,
-                }),
+                BTF_KIND_FWD => Self::Fwd(Fwd { kind_flag }),
                 BTF_KIND_TYPEDEF => Self::Typedef(BtfTypeId(size_or_type)),
                 BTF_KIND_VOLATILE => Self::Volatile(BtfTypeId(size_or_type)),
                 BTF_KIND_CONST => Self::Const(BtfTypeId(size_or_type)),
@@ -556,7 +601,7 @@ mod parser {
                     }
 
                     Self::Enum64(Enum64 {
-                        signed: info >> 31 != 0,
+                        signed: kind_flag,
                         size: size_or_type,
                         values,
                     })

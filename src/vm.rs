@@ -8,7 +8,7 @@ use crate::{
     object::{Context, EbpfProgram, Val},
 };
 
-mod debugger;
+pub mod debugger;
 pub mod mem;
 
 const DEFAULT_SIZE: usize = 1024 * 1024 * 2; // 2 MiB
@@ -112,19 +112,24 @@ impl Vm {
         }
 
         // Relocate map calls with their initialized FDs
-        for ((sec, sec_offset), insn_offset) in &prog.map_relos {
+        for (insn_offset, (sec, sec_offset)) in &prog.map_relos {
             let map = maps_fds
                 .iter()
                 .find(|(spec, _)| spec.sec_idx == sec.0 && spec.sec_offset == *sec_offset as u32);
 
             if let Some((_, fd)) = map {
                 let insn = &mut prog.insns[*insn_offset];
+
                 insn.with_src_reg(BPF_PSEUDO_MAP_FD);
                 insn.with_imm(*fd);
             }
         }
 
-        PreparedProgram(Arc::new(prog))
+        let prog = Arc::new(prog);
+
+        crate::verifier::VerifierState::new(&self, prog.clone()).run();
+
+        PreparedProgram(prog)
     }
 
     pub fn run(&mut self, prog: &PreparedProgram, ctx: &[Context]) {
@@ -134,6 +139,14 @@ impl Vm {
         self.exit = false;
         self.code.insns = prog.0.insns.clone();
         self.code.set_pc(0);
+
+        // for (idx, insn) in self.code.insns.iter().enumerate() {
+        //     eprintln!(
+        //         "{idx}: {}: {}",
+        //         crate::isa::INSTRUCTION_NAME_TABLE[insn.opcode() as usize],
+        //         crate::vm::debugger::disasm(*insn, self.code.insns.get(idx + 1).cloned())
+        //     );
+        // }
 
         let ctx_regions: Vec<_> = ctx
             .iter()
@@ -202,7 +215,10 @@ impl Vm {
         (fd as usize) < self.maps.len()
     }
 
-    pub fn map_by_id(&mut self, id: usize) -> Option<&mut BpfMap> {
+    pub fn map_by_fd(&self, fd: i32) -> Option<&BpfMap> {
+        self.maps.get(fd as usize)
+    }
+    pub fn map_by_id_mut(&mut self, id: usize) -> Option<&mut BpfMap> {
         self.maps.get_mut(id)
     }
 

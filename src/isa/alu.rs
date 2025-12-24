@@ -108,8 +108,8 @@ alu! {
     arsh_imm_32,   |dst, _, imm| dst as i32 >> (imm as u32 & SHIFT_MASK_32);
     arsh_imm_64,   |dst, _, imm| dst as i64 >> (imm & SHIFT_MASK_64);
 
-    mov_imm_32,    |_, _, imm|   imm as u32;
-    mov_imm_64,    |_, _, imm|   imm as u64;
+    mov_imm_32,    |_, _, imm|   imm as i32;
+    mov_imm_64,    |_, _, imm|   imm as i32 as i64;
 
     le,            |dst, _, imm| (dst & !(u64::MAX << (imm & BYTE_SWAP_ALLOWED_IMM))).to_le();
     be,            |dst, _, imm| (dst & !(u64::MAX << (imm & BYTE_SWAP_ALLOWED_IMM))).to_be();
@@ -181,11 +181,11 @@ macro_rules! mov_src {
                 let offset = insn.offset() as u64 & MOVSX_OFFSET_MASK;
 
                 // I could probably do the signed src cast in a way that this branch could be taken away
-                if offset != 0 {
+                if offset == 0 {
+                    *dst = src as $uref as u64;
+                } else {
                     let shift = <$sref>::BITS as u64 - offset;
                     *dst = ((src as $sref) << shift >> shift) as $uref as u64;
-                } else {
-                    *dst = src as $uref as u64;
                 }
             }
         )+

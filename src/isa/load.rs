@@ -7,10 +7,6 @@
 //!   (MSB)                             (LSB)
 //!
 //! From: <https://github.com/torvalds/linux/blob/master/Documentation/bpf/classic_vs_extended.rst>
-//!
-//! The RFC itself doesn't specify the width of each section. Go figure.
-//! This is the only possible arrangement, though, but I'd expect the RFC to
-//! mention bit width of stuff...
 #![allow(dead_code)]
 
 use crate::isa::Insn;

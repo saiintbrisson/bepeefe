@@ -16,7 +16,7 @@ pub enum InsnKind {
     JmpSrc(&'static str),
     JmpImm(&'static str),
     Ja32,
-    Ja64,
+    Ja16,
     Call,
     Exit,
     Unknown,
@@ -91,7 +91,7 @@ pub fn describe(opcode: u8) -> InsnKind {
         "jsle_imm_32" | "jsle_imm_64" => InsnKind::JmpImm("s<="),
 
         "ja_32" => InsnKind::Ja32,
-        "ja_64" => InsnKind::Ja64,
+        "ja_16" => InsnKind::Ja16,
         "jmp_call" => InsnKind::Call,
         "exit" => InsnKind::Exit,
 
@@ -167,7 +167,7 @@ pub fn disasm(insn: Insn, next: Option<Insn>) -> String {
             format!("if r{} {} 0x{:X} {}", dst, cmp, imm as u32, fmt_goto(off))
         }
         InsnKind::Ja32 => fmt_goto_imm(imm),
-        InsnKind::Ja64 => fmt_goto(off),
+        InsnKind::Ja16 => fmt_goto(off),
         InsnKind::Call => match src {
             0 => format!("call {}", imm),
             1 if imm >= 0 => format!("call +{}", imm),
@@ -212,7 +212,7 @@ pub fn disasm_brief(insn: Insn, next: Option<Insn>) -> String {
         InsnKind::Atomic => format!("r{} {} += r{}", dst, fmt_offset(off), src),
         InsnKind::JmpSrc(cmp) => format!("r{} {} r{}", dst, cmp, src),
         InsnKind::JmpImm(cmp) => format!("r{} {} 0x{:X}", dst, cmp, imm as u32),
-        InsnKind::Ja32 | InsnKind::Ja64 | InsnKind::Call | InsnKind::Exit => String::new(),
+        InsnKind::Ja32 | InsnKind::Ja16 | InsnKind::Call | InsnKind::Exit => String::new(),
         InsnKind::Unknown => String::new(),
     }
 }
@@ -280,7 +280,7 @@ pub fn debugger(vm: &super::Vm, insn: Insn) -> String {
             )
         }
         InsnKind::Ja32 => fmt_goto_imm(imm),
-        InsnKind::Ja64 => fmt_goto(off),
+        InsnKind::Ja16 => fmt_goto(off),
         InsnKind::Call => disasm(insn, next),
         InsnKind::Exit => "exit".into(),
         InsnKind::Unknown => String::new(),

@@ -18,7 +18,7 @@ fn main() {
     map.update(&local_port, &init_kbs).unwrap();
 
     let ctx =
-        prog.build_ctx(&[[("local_port", local_port.clone()), ("len", Val::Number(1))].into()]);
+        prog.build_ctx(&[[("local_port", local_port.clone()), ("len", Val::Number(3))].into()]);
     vm.run(&prog, &ctx);
 
     eprintln!("result = {}", vm.registers[0] as i32);
