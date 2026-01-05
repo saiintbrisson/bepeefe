@@ -11,6 +11,11 @@
 
 use crate::isa::Insn;
 
+/// Store instructions MODE mask
+pub const LOAD_MODE_MASK: u8 = 0b11100000;
+/// Store instructions SIZE mask
+pub const LOAD_SIZE_MASK: u8 = 0b11000;
+
 /// 64-bit immediate instructions
 pub const MODE_IMM: u8 = 0x0 << 5;
 /// legacy BPF packet access (absolute)

@@ -88,9 +88,9 @@ impl Btf {
         }
     }
 
-    pub fn is_offset_valid(&self, idx: BtfTypeId, offset: u32, len: u32) -> Option<bool> {
+    pub fn is_offset_valid(&self, idx: BtfTypeId, offset: u32, len: Option<u32>) -> Option<bool> {
         let ty_size = self.type_size(idx)?;
-        if offset + len > ty_size {
+        if offset + len.unwrap_or(0) > ty_size {
             return Some(false);
         }
 
@@ -98,7 +98,7 @@ impl Btf {
 
         match &btf_type.kind {
             BtfKind::Int(_) | BtfKind::Float(_) | BtfKind::Enum(_) | BtfKind::Enum64(_) => {
-                Some(offset == 0 && len == ty_size)
+                Some(offset == 0 && len.unwrap_or(ty_size) == ty_size)
             }
             BtfKind::Ptr(idx)
             | BtfKind::Volatile(idx)
@@ -112,21 +112,17 @@ impl Btf {
             BtfKind::Struct(Struct { members, .. }) | BtfKind::Union(Union { members, .. }) => {
                 members.iter().find_map(|member| {
                     let offset = offset.checked_sub(member.offset / u8::BITS)?;
-                    if offset + len > self.type_size(member.r#type)? {
+                    if offset + len.unwrap_or(0) > self.type_size(member.r#type)? {
                         return None;
                     }
 
                     self.is_offset_valid(member.r#type, offset, len)
                 })
             }
-            BtfKind::Fwd(fwd) => todo!(),
-            BtfKind::Typedef(btf_type_id) => todo!(),
-            BtfKind::Func(func) => todo!(),
-            BtfKind::FuncProto(func_proto) => todo!(),
-            BtfKind::Var(var) => todo!(),
-            BtfKind::Datasec(datasec) => todo!(),
+            BtfKind::Typedef(_) => todo!(),
             BtfKind::DeclTag => todo!(),
-            BtfKind::TypeTag(btf_type_id) => todo!(),
+            BtfKind::TypeTag(_) => todo!(),
+            _ => unimplemented!(),
         }
     }
 }

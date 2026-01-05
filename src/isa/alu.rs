@@ -1,5 +1,8 @@
 use super::Insn;
 
+/// ALU instructions operation mask
+pub const ALU_OP_MASK: u8 = 0b11110000;
+
 /// dst += src
 pub const BPF_ADD: u8 = 0x00;
 /// dst -= src
@@ -180,11 +183,12 @@ macro_rules! mov_src {
                 let dst = &mut state.registers[insn.dst_reg() as usize];
                 let offset = insn.offset() as u64 & MOVSX_OFFSET_MASK;
 
-                // I could probably do the signed src cast in a way that this branch could be taken away
+                // TODO: can I remove this branch
                 if offset == 0 {
                     *dst = src as $uref as u64;
                 } else {
                     let shift = <$sref>::BITS as u64 - offset;
+                    // shift to sign extend src value
                     *dst = ((src as $sref) << shift >> shift) as $uref as u64;
                 }
             }

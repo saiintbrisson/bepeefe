@@ -59,15 +59,6 @@ impl Insn {
     pub fn class(&self) -> u8 {
         self.opcode() & 0b111
     }
-    pub fn alu(&self) -> u8 {
-        self.opcode() & 0b11111000
-    }
-    pub fn load_mode(&self) -> u8 {
-        self.opcode() & 0b11100000
-    }
-    pub fn load_size(&self) -> u8 {
-        self.opcode() & 0b11000
-    }
 
     pub fn with_src_reg(&mut self, src_reg: u8) {
         self.0 = (self.0 & !(0xF << 12)) | ((src_reg as u64 & 0xF) << 12);

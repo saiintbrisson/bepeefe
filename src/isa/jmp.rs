@@ -3,6 +3,9 @@ use std::ffi::CStr;
 use super::Insn;
 use crate::verifier::RegisterState;
 
+/// JMP instructions OP mask
+pub const JMP_OP_MASK: u8 = 0b11110000;
+
 /// src = 0x0, PC += offset, BPF_JMP only
 pub const BPF_JA: u8 = 0x00;
 /// src = any, PC += offset if dst == src

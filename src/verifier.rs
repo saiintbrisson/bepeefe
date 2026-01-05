@@ -4,15 +4,16 @@ use crate::{
     isa::{
         BPF_ALU32, BPF_ALU64, BPF_JMP, BPF_JMP32, BPF_LD, BPF_LDX, BPF_ST, BPF_STX, Insn,
         alu::{
-            BPF_ADD, BPF_ARSH, BPF_DIV, BPF_K, BPF_LSH, BPF_MOD, BPF_MOV, BPF_RSH, BPF_SUB, BPF_X,
+            ALU_OP_MASK, BPF_ADD, BPF_ARSH, BPF_DIV, BPF_K, BPF_LSH, BPF_MOD, BPF_MOV, BPF_RSH,
+            BPF_SUB, BPF_X,
         },
         jmp::{
-            BPF_CALL, BPF_EXIT, BPF_HELPER_CALL, BPF_HELPER_TABLE, BPF_JA, BPF_JEQ, BPF_JGT,
-            BPF_JNE, BPF_JSGT, BPF_PSEUDO_CALL,
+            BPF_CALL, BPF_EXIT, BPF_HELPER_CALL, BPF_HELPER_TABLE, BPF_JA, BPF_JEQ, BPF_JNE,
+            BPF_PSEUDO_CALL, JMP_OP_MASK,
         },
         load::{
-            BPF_PSEUDO_MAP_FD, MODE_ATOMIC, MODE_IMM, MODE_MEM, MODE_MEMSX, SIZE_B, SIZE_DW,
-            SIZE_H, SIZE_W,
+            BPF_PSEUDO_MAP_FD, LOAD_MODE_MASK, LOAD_SIZE_MASK, MODE_ATOMIC, MODE_IMM, MODE_MEM,
+            MODE_MEMSX, SIZE_B, SIZE_DW, SIZE_H, SIZE_W,
         },
     },
     object::EbpfProgram,
@@ -24,11 +25,11 @@ pub enum RegisterState {
     Uninit,
     Scalar(Scalar),
     PtrToCtx {
-        offset: isize,
-        size: usize,
+        offset: u32,
+        size: u32,
     },
     PtrToStack {
-        pointer: usize,
+        pointer: u32,
     },
     PtrToMap {
         map_fd: i32,
@@ -36,6 +37,7 @@ pub enum RegisterState {
     /// Pointer to a map value, returned from map_lookup_elem
     PtrToMapValue {
         map_fd: i32,
+        offset: u32,
     },
     /// Null or pointer to map value
     PtrToMapValueOrNull {
@@ -48,6 +50,12 @@ pub enum Scalar {
     U32(u32),
     U64(u64),
     Unknown,
+}
+
+impl Scalar {
+    fn is_known(&self) -> bool {
+        matches!(self, Self::U32(_) | Self::U64(_))
+    }
 }
 
 impl RegisterState {
@@ -86,6 +94,15 @@ impl Default for VerifierConfig {
 }
 
 #[derive(Clone)]
+pub struct Verifier<'a> {
+    vm: &'a Vm,
+    prog: Arc<EbpfProgram>,
+
+    stack_objects: BTreeMap<usize, usize>,
+    stack_range: Range<usize>,
+}
+
+#[derive(Clone)]
 pub struct VerifierState<'a> {
     vm: &'a Vm,
     prog: Arc<EbpfProgram>,
@@ -95,8 +112,8 @@ pub struct VerifierState<'a> {
     skip: usize,
     exit: bool,
 
-    stack_objects: BTreeMap<usize, usize>,
-    stack_range: Range<usize>,
+    stack_objects: BTreeMap<u32, u32>,
+    stack_range: Range<u32>,
 }
 
 impl<'a> VerifierState<'a> {
@@ -112,10 +129,7 @@ impl<'a> VerifierState<'a> {
 
             registers[idx + 1] = match btf_type.kind {
                 crate::btf::BtfKind::Int(_) => RegisterState::Scalar(Scalar::Unknown),
-                crate::btf::BtfKind::Ptr(_) => RegisterState::PtrToCtx {
-                    offset: 0,
-                    size: size as usize,
-                },
+                crate::btf::BtfKind::Ptr(_) => RegisterState::PtrToCtx { offset: 0, size },
                 _ => todo!("not supported"),
             };
         }
@@ -158,9 +172,11 @@ impl<'a> VerifierState<'a> {
     }
 
     fn check_insn(&mut self, insn: &Insn) {
-        if (insn.class() == BPF_ALU32 || insn.class() == BPF_ALU64) && insn.dst_reg() == 10 {
-            todo!("ALU instructions cannot write to SP register")
-        } else if insn.dst_reg() > 10 {
+        if insn.class() != BPF_ST && insn.class() != BPF_STX && insn.dst_reg() == 10 {
+            todo!("only ST, STX instructions can use SP register as dst")
+        }
+
+        if insn.dst_reg() > 10 {
             todo!("instruction contains invalid dst register")
         } else if insn.src_reg() > 10 {
             todo!("instruction contains invalid src register")
@@ -185,17 +201,14 @@ impl<'a> VerifierState<'a> {
         eprintln!("{dump}");
     }
 
-    fn mark_scalar(&mut self, reg: u8) {
+    fn mark_unknown(&mut self, reg: u8) {
         self.registers[reg as usize] = RegisterState::Scalar(Scalar::Unknown);
     }
 
     fn check_alu(&mut self, insn: &Insn) {
-        let alu_src = insn.alu() & 0b1000;
-        let alu_op = insn.alu() & 0b11110000;
-        let alu_size = if insn.class() == BPF_ALU32 { 32 } else { 64 };
-        let dst = insn.dst_reg();
+        let op = insn.opcode() & ALU_OP_MASK;
 
-        let alu_src = if alu_src == BPF_X {
+        let src = if insn.opcode() & BPF_X == BPF_X {
             assert_eq!(
                 insn.imm(),
                 0,
@@ -216,46 +229,18 @@ impl<'a> VerifierState<'a> {
                 0,
                 "ALU instruction uses reserved source register field"
             );
+
             None
         };
 
-        if alu_op == BPF_MOV {
-            match alu_src {
-                Some(src) if src.is_pointer() => {
-                    assert_eq!(insn.class(), BPF_ALU64, "ALU32 MOV partial copy of pointer");
-                    assert_eq!(insn.offset(), 0, "ALU MOV with sign extension on pointer");
+        let size = if insn.class() == BPF_ALU32 { 32 } else { 64 };
+        let dst = insn.dst_reg();
 
-                    self.registers[dst as usize] = src;
-                }
-                Some(src) => {
-                    if insn.class() == BPF_ALU32 {
-                        // TODO: truncate scalar values to 32 bits if BPF_ALU32
-                    }
-                    if insn.offset() != 0 {
-                        match insn.offset() {
-                            8 | 16 => {}
-                            32 if insn.class() == BPF_ALU64 => {}
-                            _ => todo!("ALU MOV uses invalid offset {}", insn.offset()),
-                        }
-                        // TODO: process offset
-                    }
-                    self.registers[dst as usize] = src
-                }
-                None => {
-                    self.registers[dst as usize] = if insn.class() == BPF_ALU32 {
-                        RegisterState::Scalar(Scalar::U32(insn.imm() as u32))
-                    } else {
-                        RegisterState::Scalar(Scalar::U64(insn.imm() as u64))
-                    };
-                }
-            }
+        match (op, src) {
+            (BPF_MOV, _) => return self.check_alu_mov(insn, src),
 
-            return;
-        }
-
-        match (alu_op, alu_src) {
             (BPF_MOD | BPF_DIV, None) if insn.imm() == 0 => todo!("ALU division by IMM=0"),
-            (BPF_LSH | BPF_RSH | BPF_ARSH, None) if insn.imm() < 0 || insn.imm() >= alu_size => {
+            (BPF_LSH | BPF_RSH | BPF_ARSH, None) if insn.imm() < 0 || insn.imm() >= size => {
                 todo!("ALU shift out of bounds {}", insn.imm())
             }
 
@@ -273,7 +258,7 @@ impl<'a> VerifierState<'a> {
         if insn.class() != BPF_ALU64 {
             // TODO: track scalar operations like add, sub, mul, etc
             // 32bit ALU operations produce scalars
-            self.mark_scalar(dst);
+            self.mark_unknown(dst);
             return;
         }
 
@@ -286,42 +271,56 @@ impl<'a> VerifierState<'a> {
 
         if !alu_dst.is_pointer() {
             // TODO: track scalar operations like add, sub, mul, etc
-            self.mark_scalar(dst);
+            self.mark_unknown(dst);
             return;
         }
 
         // TODO: allow scalar += pointer operations
-        let src_val = match alu_src {
-            Some(RegisterState::Scalar(Scalar::U32(val))) => val as i32 as isize,
-            Some(RegisterState::Scalar(Scalar::U64(val))) => val as i64 as isize,
+        let src_val = match src {
+            Some(RegisterState::Scalar(Scalar::U32(val))) => val as i32,
+            Some(RegisterState::Scalar(Scalar::U64(val))) => (val as i64)
+                .try_into()
+                .expect("ALU tried using way too large scalar for pointer arithmetic"),
             Some(RegisterState::Scalar(Scalar::Unknown)) => todo!(
                 "ALU uses register with unknown scalar value r{}",
                 insn.src_reg()
             ),
-            None => insn.imm() as i64 as isize,
+            None => insn.imm(),
             _ => todo!(
                 "ALU instruction cannot operate with pointer src register r{}",
                 insn.src_reg()
             ),
         };
 
-        match alu_op {
+        match op {
             BPF_ADD => {
                 self.registers[dst as usize] = match alu_dst {
                     RegisterState::PtrToCtx { offset, size } => {
-                        todo!();
+                        let offset = offset.checked_add_signed(src_val).unwrap();
+                        assert!(size > offset, "ALU ADD overflowed the context");
+                        RegisterState::PtrToCtx { offset, size }
                     }
                     RegisterState::PtrToStack { pointer } => {
-                        let new = pointer.checked_add_signed(src_val).unwrap();
-                        if new < self.stack_range.start {
-                            todo!("ALU ADD overflowed the stack");
-                        }
-                        RegisterState::PtrToStack { pointer: new }
+                        let pointer = pointer.checked_add_signed(src_val).unwrap();
+                        assert!(
+                            pointer >= self.stack_range.start,
+                            "ALU ADD overflowed the stack"
+                        );
+                        RegisterState::PtrToStack { pointer }
                     }
-                    RegisterState::PtrToMap { map_fd: offset } => {
-                        todo!();
+                    RegisterState::PtrToMapValue { map_fd, offset } => {
+                        let offset = offset.checked_add_signed(src_val).unwrap();
+
+                        let bpf_map = self.vm.map_by_fd(map_fd).unwrap();
+                        let map_val = bpf_map.spec.value.unwrap();
+                        assert!(
+                            bpf_map.btf.is_offset_valid(map_val, offset, None).unwrap(),
+                            "ALU ADD overflowed map value"
+                        );
+
+                        RegisterState::PtrToMapValue { map_fd, offset }
                     }
-                    _ => unreachable!(),
+                    _ => todo!(),
                 };
             }
             BPF_SUB => {
@@ -329,10 +328,10 @@ impl<'a> VerifierState<'a> {
                     RegisterState::PtrToCtx { offset, size } => {
                         todo!();
                     }
-                    RegisterState::PtrToStack { pointer: offset } => {
-                        todo!("ALU SUB does not work on")
+                    RegisterState::PtrToStack { pointer } => {
+                        todo!("ALU SUB does not work on stack pointers")
                     }
-                    RegisterState::PtrToMap { map_fd: offset } => {
+                    RegisterState::PtrToMap { map_fd } => {
                         todo!();
                     }
                     _ => unreachable!(),
@@ -343,12 +342,64 @@ impl<'a> VerifierState<'a> {
         }
     }
 
+    /// Checks a ALU MOV instruction and updates registers.
+    ///
+    /// * Moving a pointer simply copies the pointer to DST,
+    /// only ALU64 can perform pointer moves.
+    /// * When moving known scalars, the value is trimmed
+    /// according to the ALU class. If the insn is a MOVSX (sign-extension),
+    /// the offset is checked and the known value is sign-extended
+    /// accordingly.
+    /// * Moving unknown scalars simply copy the unknown status.
+    /// * Moving IMMs result in known scalars with size according to the class.
+    fn check_alu_mov(&mut self, insn: &Insn, src: Option<RegisterState>) {
+        self.registers[insn.dst_reg() as usize] = match src {
+            Some(src) if src.is_pointer() => {
+                assert_eq!(insn.class(), BPF_ALU64, "ALU32 MOV partial copy of pointer");
+                assert_eq!(insn.offset(), 0, "ALU MOV with sign extension on pointer");
+
+                src
+            }
+            Some(RegisterState::Scalar(scalar)) if scalar.is_known() => {
+                let scalar = match (insn.class(), scalar) {
+                    (BPF_ALU32, Scalar::U64(n)) => Scalar::U32(n as u32),
+                    (BPF_ALU64, Scalar::U32(n)) => Scalar::U64(n as u64),
+                    _ => scalar,
+                };
+
+                let scalar = match (insn.offset() as u32, scalar) {
+                    (0, _) => scalar,
+                    (offset @ (8 | 16), Scalar::U32(n)) => {
+                        let shift = u32::BITS - offset;
+                        Scalar::U32(((n as i32) << shift >> shift) as u32)
+                    }
+                    (offset @ (8 | 16 | 32), Scalar::U64(n)) => {
+                        let shift = u64::BITS - offset;
+                        Scalar::U64(((n as i64) << shift >> shift) as u64)
+                    }
+                    _ => todo!("ALU MOV uses invalid offset {}", insn.offset()),
+                };
+
+                RegisterState::Scalar(scalar)
+            }
+            Some(src @ RegisterState::Scalar(_)) => src,
+            Some(_) => panic!("called with invalid src register"),
+            None => {
+                if insn.class() == BPF_ALU32 {
+                    RegisterState::Scalar(Scalar::U32(insn.imm() as u32))
+                } else {
+                    RegisterState::Scalar(Scalar::U64(insn.imm() as u64))
+                }
+            }
+        };
+    }
+
     fn check_ldx(&mut self, insn: &Insn) {
-        match insn.load_mode() {
+        match insn.opcode() & LOAD_MODE_MASK {
             MODE_MEM => {
                 let src = &self.registers[insn.src_reg() as usize];
 
-                let load_size = match insn.load_size() {
+                let load_size = match insn.opcode() & LOAD_SIZE_MASK {
                     SIZE_DW => 8,
                     SIZE_W => 4,
                     SIZE_H => 2,
@@ -358,55 +409,59 @@ impl<'a> VerifierState<'a> {
 
                 match src {
                     &RegisterState::PtrToCtx { offset, size } => {
-                        let read_offset = offset + insn.offset() as isize;
-                        if read_offset < 0 || read_offset + load_size > size as isize {
+                        let read_offset = offset.checked_add_signed(insn.offset() as i32).unwrap();
+                        if read_offset + load_size > size {
                             todo!("LD tried reading out of ctx bounds");
                         }
                     }
                     &RegisterState::PtrToStack { pointer } => {
-                        let dst = pointer.checked_add_signed(insn.offset() as isize).unwrap();
+                        let dst = pointer.checked_add_signed(insn.offset() as i32).unwrap();
                         assert_eq!(
                             *self.stack_objects.get(&dst).unwrap(),
-                            load_size as usize,
+                            load_size,
                             "LD tried reading outside of stack bounds"
                         );
                     }
                     RegisterState::PtrToMap { map_fd } => todo!(),
-                    RegisterState::PtrToMapValue { map_fd } => {
+                    RegisterState::PtrToMapValue { map_fd, offset } => {
                         let bpf_map = self.vm.map_by_fd(*map_fd).unwrap();
                         let map_val = bpf_map.spec.value.unwrap();
-                        assert!(insn.offset() >= 0);
+                        let offset = offset.checked_add_signed(insn.offset() as i32).unwrap();
                         assert!(
                             bpf_map
                                 .btf
-                                .is_offset_valid(map_val, insn.offset() as u32, load_size as u32)
+                                .is_offset_valid(map_val, offset, Some(load_size))
                                 .unwrap()
                         );
                     }
                     src => todo!("load source refers to invalid memory location: {src:?}"),
                 }
 
-                self.mark_scalar(insn.dst_reg());
+                self.mark_unknown(insn.dst_reg());
             }
-            MODE_MEMSX => todo!("sign-extension loads are still not supported"),
+            MODE_MEMSX => todo!("sign-extension loads are not supported yet"),
             _ => todo!(),
         }
     }
 
+    /// Checks for LD IMM64 instructions. For now,
+    /// only IMM and MAP FD loads are supported. Signals
+    /// for the verifier to skip next instruction.
     fn check_non_conventional_ld(&mut self, insn: &Insn) {
         assert_eq!(
-            insn.load_mode(),
+            insn.opcode() & LOAD_MODE_MASK,
             MODE_IMM,
             "LD class is reserved for ld_imm64"
         );
         assert_eq!(
-            insn.load_size(),
+            insn.opcode() & LOAD_SIZE_MASK,
             SIZE_DW,
             "LD class is reserved for ld_imm64"
         );
 
         match insn.src_reg() {
-            0 => self.mark_scalar(insn.dst_reg()),
+            // TODO: it is a known value, just have to fetch it from next insn slot
+            0 => self.mark_unknown(insn.dst_reg()),
             BPF_PSEUDO_MAP_FD => {
                 let map_fd = insn.imm();
                 assert!(
@@ -422,8 +477,9 @@ impl<'a> VerifierState<'a> {
     }
 
     fn check_st(&mut self, insn: &Insn) {
+        let mode = insn.opcode() & LOAD_MODE_MASK;
         assert!(
-            insn.load_mode() == MODE_MEM || insn.load_mode() == MODE_ATOMIC,
+            mode == MODE_MEM || mode == MODE_ATOMIC,
             "ST and STX only support MEM and ATOMIC mode"
         );
         let dst_reg = self.registers[insn.dst_reg() as usize];
@@ -433,7 +489,7 @@ impl<'a> VerifierState<'a> {
             insn.src_reg()
         );
 
-        let store_size = match insn.load_size() {
+        let store_size = match insn.opcode() & LOAD_SIZE_MASK {
             SIZE_DW => 8,
             SIZE_W => 4,
             SIZE_H => 2,
@@ -444,7 +500,7 @@ impl<'a> VerifierState<'a> {
         match &self.registers[insn.dst_reg() as usize] {
             RegisterState::Uninit => todo!("ST writing to uninit register r{}", insn.dst_reg()),
             RegisterState::PtrToStack { pointer } => {
-                let dst = pointer.checked_add_signed(insn.offset() as isize).unwrap();
+                let dst = pointer.checked_add_signed(insn.offset() as i32).unwrap();
 
                 assert!(
                     dst.is_multiple_of(store_size),
@@ -484,14 +540,14 @@ impl<'a> VerifierState<'a> {
 
                 self.stack_objects.insert(dst, store_size);
             }
-            RegisterState::PtrToMapValue { map_fd } => {
+            RegisterState::PtrToMapValue { map_fd, offset } => {
                 let bpf_map = self.vm.map_by_fd(*map_fd).unwrap();
                 let map_val = bpf_map.spec.value.unwrap();
-                assert!(insn.offset() >= 0);
+                let offset = offset.checked_add_signed(insn.offset() as i32).unwrap();
                 assert!(
                     bpf_map
                         .btf
-                        .is_offset_valid(map_val, insn.offset() as u32, store_size as u32)
+                        .is_offset_valid(map_val, offset, Some(store_size))
                         .unwrap()
                 );
             }
@@ -500,12 +556,14 @@ impl<'a> VerifierState<'a> {
     }
 
     fn check_jmp(&mut self, insn: &Insn) {
-        if insn.opcode() & 0b11110000 == BPF_CALL {
+        let jmp_op = insn.opcode() & JMP_OP_MASK;
+
+        if jmp_op == BPF_CALL {
             self.check_jmp_call(insn);
             return;
         }
 
-        if insn.opcode() & 0b11110000 == BPF_EXIT {
+        if jmp_op == BPF_EXIT {
             assert_eq!(insn.offset(), 0, "JMP EXIT uses reserved offset field");
             assert_eq!(insn.src_reg(), 0, "JMP EXIT uses reserved offset field");
             assert_eq!(
@@ -524,13 +582,13 @@ impl<'a> VerifierState<'a> {
         };
         let target_pc = self.pc + offset as isize;
 
-        if offset == 0 {
+        if offset == -1 {
             todo!("JMP causes infinite halt");
         } else if target_pc < self.starting_pc || target_pc >= self.prog.insns.len() as isize {
             todo!("JMP invalid offset");
         }
 
-        if insn.opcode() & 0b11110000 == BPF_JA {
+        if jmp_op == BPF_JA {
             let mut new = VerifierState {
                 starting_pc: target_pc,
                 pc: target_pc,
@@ -562,7 +620,7 @@ impl<'a> VerifierState<'a> {
             ..self.clone()
         };
 
-        let rhs_val = if insn.opcode() & 0b1000 == BPF_X {
+        let rhs_val = if insn.opcode() & BPF_X == BPF_X {
             match self.registers[insn.src_reg() as usize] {
                 RegisterState::Uninit => todo!("JMP using uninit register r{}", insn.src_reg()),
                 RegisterState::Scalar(Scalar::U32(val)) => val as u64,
@@ -579,15 +637,14 @@ impl<'a> VerifierState<'a> {
             return branch_vm.run();
         };
 
-        // self.mark_scalar(insn.dst_reg());
-
-        match insn.opcode() & 0b11110000 {
+        match jmp_op {
             BPF_JNE if rhs_val == 0 => {
                 branch_vm.registers[insn.dst_reg() as usize] =
-                    RegisterState::PtrToMapValue { map_fd };
+                    RegisterState::PtrToMapValue { map_fd, offset: 0 };
             }
             BPF_JEQ if rhs_val == 0 => {
-                self.registers[insn.dst_reg() as usize] = RegisterState::PtrToMapValue { map_fd };
+                self.registers[insn.dst_reg() as usize] =
+                    RegisterState::PtrToMapValue { map_fd, offset: 0 };
             }
             _ => {}
         }
@@ -603,7 +660,7 @@ impl<'a> VerifierState<'a> {
         );
 
         match insn.src_reg() {
-            BPF_PSEUDO_CALL => todo!(),
+            BPF_PSEUDO_CALL => todo!("sub-program calls are not supported  yet"),
             BPF_HELPER_CALL => {
                 let helper_id = insn.imm() as usize;
                 (BPF_HELPER_TABLE[helper_id].params)(&self.registers, *insn).unwrap();
