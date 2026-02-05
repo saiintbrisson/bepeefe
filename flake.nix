@@ -14,11 +14,12 @@
         pkgs = import nixpkgs {
           inherit system overlays;
         };
-        rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain;
+        rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
       in
       {
         devShells.default = with pkgs; mkShell {
           buildInputs = [
+            rust
             pkg-config
             just
             git
