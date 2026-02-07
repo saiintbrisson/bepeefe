@@ -271,7 +271,7 @@ impl BtfBuilder {
             .collect();
 
         let name_off = self.add_string(name);
-        self.insert_type(name_off, BtfKind::Datasec(Datasec { secinfos, size }))
+        self.insert_type(name_off, BtfKind::Datasec(Datasec { secinfos, size, opaque: false }))
     }
 }
 

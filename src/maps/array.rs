@@ -80,6 +80,12 @@ impl Array {
         mem.write_slice(addr, value)
     }
 
+    pub fn clear(&self, mem: &mut Memory) {
+        let size = self.stride_layout.size() * self.max_entries;
+        mem.write_slice(self.region.start(), &vec![0u8; size])
+            .expect("clear: region out of bounds");
+    }
+
     pub(crate) fn update_from_guest(
         &mut self,
         mem: &mut Memory,

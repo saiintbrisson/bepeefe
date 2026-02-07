@@ -8,7 +8,7 @@ eBPF is a pretty complex tool with a pretty complex ecosystem. What better way t
 
 You can try it out with:
 ```shell
-$ cargo run --example map_array
+$ cargo run --example snake
 ```
 
 [conformance group]: https://github.com/torvalds/linux/blob/master/Documentation/bpf/standardization/instruction-set.rst#114conformance-groups

@@ -3,7 +3,10 @@ use std::{alloc::Layout, ops::Deref, sync::Arc};
 use mem::{Memory, Region};
 
 use crate::{
-    isa::{self, Insn, load::BPF_PSEUDO_MAP_FD},
+    isa::{
+        self, Insn,
+        load::{BPF_PSEUDO_MAP_FD, BPF_PSEUDO_MAP_VALUE},
+    },
     maps::{BpfMap, MapPinning, MapRepr},
     object::{Context, EbpfProgram, Val},
 };
@@ -111,6 +114,16 @@ impl Vm {
             self.maps.push(bpf_map);
         }
 
+        // Fill initial data for data-section maps (.rodata, .data, etc.)
+        for map in &mut self.maps {
+            if let Some(data) = map.spec.initial_data.take() {
+                let key = 0u32.to_ne_bytes();
+                map.repr
+                    .update(&mut self.mem, &key, &data)
+                    .expect("failed to fill initial data");
+            }
+        }
+
         // Relocate map calls with their initialized FDs
         for (insn_offset, (sec, sec_offset)) in &prog.map_relos {
             let map = maps_fds
@@ -123,6 +136,19 @@ impl Vm {
                 insn.with_src_reg(BPF_PSEUDO_MAP_FD);
                 insn.with_imm(*fd);
             }
+        }
+
+        // Resolve data relocations (.rodata, .data, .bss) by encoding
+        // BPF_PSEUDO_MAP_VALUE: imm = map fd, next_imm = offset within value
+        for (insn_offset, (sec, offset_in_sec)) in &prog.data_relos {
+            let (_, fd) = maps_fds
+                .iter()
+                .find(|(spec, _)| spec.sec_idx == sec.0)
+                .expect("data relo targets unknown section");
+
+            prog.insns[*insn_offset].with_src_reg(BPF_PSEUDO_MAP_VALUE);
+            prog.insns[*insn_offset].with_imm(*fd);
+            prog.insns[*insn_offset + 1].with_imm(*offset_in_sec as i32);
         }
 
         let prog = Arc::new(prog);
@@ -139,14 +165,6 @@ impl Vm {
         self.exit = false;
         self.code.insns = prog.0.insns.clone();
         self.code.set_pc(0);
-
-        // for (idx, insn) in self.code.insns.iter().enumerate() {
-        //     eprintln!(
-        //         "{idx}: {}: {}",
-        //         crate::isa::INSTRUCTION_NAME_TABLE[insn.opcode() as usize],
-        //         crate::vm::debugger::disasm(*insn, self.code.insns.get(idx + 1).cloned())
-        //     );
-        // }
 
         let ctx_regions: Vec<_> = ctx
             .iter()
@@ -168,8 +186,6 @@ impl Vm {
             let Some(insn) = self.code.step() else {
                 panic!();
             };
-
-            // eprintln!("{}: {}", self.code.pc - 1, debugger::debugger(&self, insn));
 
             isa::INSTRUCTION_TABLE[insn.opcode() as usize](self, insn);
         }
@@ -249,6 +265,42 @@ impl Vm {
             .update_from_guest(&mut self.mem, key_addr, value_addr)
     }
 
+    pub(crate) fn map_push_from_guest(
+        &mut self,
+        map_idx: usize,
+        value_addr: usize,
+    ) -> std::io::Result<()> {
+        let map = self
+            .maps
+            .get_mut(map_idx)
+            .ok_or(std::io::ErrorKind::NotFound)?;
+        map.repr.push_from_guest(&mut self.mem, value_addr)
+    }
+
+    pub(crate) fn map_pop_from_guest(
+        &mut self,
+        map_idx: usize,
+        value_addr: usize,
+    ) -> std::io::Result<()> {
+        let map = self
+            .maps
+            .get_mut(map_idx)
+            .ok_or(std::io::ErrorKind::NotFound)?;
+        map.repr.pop_from_guest(&mut self.mem, value_addr)
+    }
+
+    pub(crate) fn map_peek_from_guest(
+        &mut self,
+        map_idx: usize,
+        value_addr: usize,
+    ) -> std::io::Result<()> {
+        let map = self
+            .maps
+            .get_mut(map_idx)
+            .ok_or(std::io::ErrorKind::NotFound)?;
+        map.repr.peek_from_guest(&mut self.mem, value_addr)
+    }
+
     pub fn map(&mut self, name: &str) -> MapHandle<'_> {
         let map = self
             .maps
@@ -285,6 +337,51 @@ impl<'a> MapHandle<'a> {
         let val = val.to_bytes(&self.map.btf, val_ty);
 
         self.map.repr.update(&mut self.mem, &key, &val)
+    }
+
+    pub fn push_as_val(&mut self, val: &Val) -> std::io::Result<()> {
+        let val_ty = self
+            .map
+            .btf
+            .get_type(self.map.spec.value.clone().unwrap())
+            .unwrap();
+
+        let val = val.to_bytes(&self.map.btf, val_ty);
+        self.map.repr.push(&mut self.mem, &val)
+    }
+
+    pub fn pop_as_val(&mut self) -> Option<Val> {
+        let val_ty = self.map.btf.get_type(self.map.spec.value.unwrap()).unwrap();
+
+        let addr = self.map.repr.pop(&self.mem)?;
+        let bytes = self.mem.slice(addr, self.map.repr.value_size())?;
+        Some(Val::from_bytes(&self.map.btf, val_ty, bytes))
+    }
+
+    pub fn lookup_as_val(&self, key: &Val) -> Option<Val> {
+        let key_ty = self.map.btf.get_type(self.map.spec.key.unwrap()).unwrap();
+        let val_ty = self.map.btf.get_type(self.map.spec.value.unwrap()).unwrap();
+
+        let key = key.to_bytes(&self.map.btf, key_ty);
+        let addr = self.map.repr.lookup(&self.mem, &key)?;
+        let bytes = self.mem.slice(addr, self.map.repr.value_size())?;
+
+        Some(Val::from_bytes(&self.map.btf, val_ty, bytes))
+    }
+
+    pub fn clear(&mut self) {
+        self.map.repr.clear(self.mem);
+    }
+
+    pub fn btf(&self) -> &crate::btf::Btf {
+        &self.map.btf
+    }
+
+    pub fn btf_val_type(&self) -> &crate::btf::BtfType {
+        self.map
+            .btf
+            .get_type(self.map.spec.value.unwrap())
+            .expect("map missing value BTF type")
     }
 }
 

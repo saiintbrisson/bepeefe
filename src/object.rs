@@ -14,7 +14,7 @@ use object::{
 use crate::{
     btf::{Btf, BtfKind, BtfType, BtfTypeId, ext::BtfExt},
     isa::Insn,
-    maps::{MapPinning, MapSpec},
+    maps::{BPF_MAP_TYPE_ARRAY, MapPinning, MapSpec},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -61,6 +61,7 @@ struct ProgLoader {
     loaded_progs: HashMap<(SectionIndex, usize), usize>,
     relos: Vec<(usize, Relocation)>,
     map_relos: HashMap<usize, (SectionIndex, usize)>,
+    data_relos: HashMap<usize, (SectionIndex, usize)>,
 }
 
 impl<'file> EbpfObject<'file> {
@@ -100,7 +101,7 @@ impl<'file> EbpfObject<'file> {
             .functions
             .iter()
             .find(|f| f.is_global && f.name == name)
-            .unwrap();
+            .unwrap_or_else(|| panic!(r#"program "{name}" not found"#));
 
         let mut program = ProgLoader::default();
         self.load_code(&prog, &mut program);
@@ -112,6 +113,7 @@ impl<'file> EbpfObject<'file> {
             maps: self.maps.clone(),
             btf: self.btf.clone(),
             map_relos: program.map_relos,
+            data_relos: program.data_relos,
         })
     }
 
@@ -244,9 +246,23 @@ impl<'file> EbpfObject<'file> {
             let target_insn_offset = loader.loaded_progs.get(&(sym_sec, sym.address() as usize));
 
             if insn.is_ld_imm64() && r_type == R_BPF_64_64 && target_insn_offset.is_none() {
-                loader
-                    .map_relos
-                    .insert(*insn_offset, (sym_sec, sym.address() as usize));
+                let sec_name = self
+                    .file
+                    .section_by_index(sym_sec)
+                    .ok()
+                    .and_then(|s| s.name().ok().map(|n| n.to_string()));
+                let is_data_sec = sec_name
+                    .as_deref()
+                    .is_some_and(|n| n.starts_with(".rodata") || n == ".data" || n == ".bss");
+
+                if is_data_sec {
+                    let offset = sym.address() as usize + insn.imm() as usize;
+                    loader.data_relos.insert(*insn_offset, (sym_sec, offset));
+                } else {
+                    loader
+                        .map_relos
+                        .insert(*insn_offset, (sym_sec, sym.address() as usize));
+                }
                 continue;
             }
 
@@ -296,12 +312,35 @@ fn parse_btf<'a>(
         return Err(LoaderError::DeprecatedMapsSection);
     }
 
-    let maps = file
+    let mut maps = file
         .section_by_name(".maps")
         .map(|sec| parse_maps(&btf, &sec))
         .transpose()
         .map_err(LoaderError::InvalidMapDeclaration)?
         .unwrap_or_default();
+
+    for sec in file.sections() {
+        let Ok(name) = sec.name() else { continue };
+        if !name.starts_with(".rodata") {
+            continue;
+        }
+
+        let datasec_id = find_or_create_datasec(&mut btf, &sec);
+
+        let data = sec.data().unwrap();
+        maps.push(MapSpec {
+            name: name.to_string(),
+            r#type: Some(BPF_MAP_TYPE_ARRAY),
+            sec_idx: sec.index().0,
+            sec_offset: 0,
+            max_entries: Some(1),
+            key_size: Some(4),
+            value_size: Some(data.len() as u32),
+            value: Some(datasec_id),
+            initial_data: Some(data.to_vec()),
+            ..Default::default()
+        });
+    }
 
     Ok((Some(btf), maps))
 }
@@ -361,6 +400,39 @@ fn fixup_btf_datasecs<'a>(btf: &mut Btf, file: &'a File<'a, &'a [u8]>) {
 
         btf.types.insert(id, ty);
     }
+}
+
+/// Finds or synthesizes a BTF DATASEC for a data section. The
+/// DATASEC just needs the right size so `is_offset_valid` can
+/// do a bounds check.
+fn find_or_create_datasec(btf: &mut Btf, sec: &Section) -> BtfTypeId {
+    let name = sec.name().unwrap();
+
+    if let Some((id, _)) = btf.types.iter().find(|(_, ty)| {
+        matches!(&ty.kind, BtfKind::Datasec(_)) && btf.name(ty.name_off).is_some_and(|n| n == name)
+    }) {
+        return *id;
+    }
+
+    let name_off = btf.strings.len() as u32;
+    btf.strings.extend(name.as_bytes());
+    btf.strings.push(0);
+
+    let btf_id = BtfTypeId(btf.types.len() as u32 + 1);
+    btf.types.insert(
+        btf_id,
+        crate::btf::BtfType {
+            btf_id,
+            name_off,
+            kind: BtfKind::Datasec(crate::btf::Datasec {
+                secinfos: Vec::new(),
+                size: sec.size() as u32,
+                opaque: true,
+            }),
+        },
+    );
+
+    btf_id
 }
 
 /// Finds declared maps by looking for the .maps section and matching it
@@ -547,7 +619,7 @@ fn collect_functions<'file>(
 
             let (params, ret) = match ext_programs.get(&(sec_name.into(), prog_name.into())) {
                 Some((offset, _, _)) if prog_insn_offset != *offset => {
-                    todo!("func information does not match symbol address")
+                    todo!("func information does not match symbol address {sec_name}:{prog_name}")
                 }
                 Some((_, params, ret)) => (params.clone(), Some(ret.clone())),
                 None => Default::default(),
@@ -575,6 +647,7 @@ pub struct EbpfProgram {
     pub(crate) maps: Vec<MapSpec>,
     pub(crate) btf: Option<Arc<Btf>>,
     pub(crate) map_relos: HashMap<usize, (SectionIndex, usize)>,
+    pub(crate) data_relos: HashMap<usize, (SectionIndex, usize)>,
 }
 
 impl EbpfProgram {
@@ -647,14 +720,7 @@ fn build_ctx_val(btf: &Arc<Btf>, param_ty: &crate::btf::BtfType, ctx_val: &Val) 
     match ctx_val {
         Val::Zeroed => Context::Buffer(vec![0; size]),
         Val::Number(num) => {
-            let BtfKind::Int(int) = &param_ty.kind else {
-                todo!("expected param to be int");
-            };
-
-            if *num >> int.bits > 0 {
-                todo!("number {num} is larger than param size");
-            }
-
+            ctx_val.to_bytes(btf, param_ty);
             Context::Value(*num as u64)
         }
         Val::Map(map) => {
@@ -721,17 +787,29 @@ impl Val {
 
         match self {
             Val::Zeroed => vec![0; size],
-            Val::Number(num) => {
-                let BtfKind::Int(int) = &ty.kind else {
-                    todo!("expected param to be int");
-                };
-
-                if num.unbounded_shr(int.bits as _) > 0 {
-                    todo!("number {num} is larger than param size ({} bits)", int.bits);
+            Val::Number(num) => match &ty.kind {
+                BtfKind::Int(int) => {
+                    if num.unbounded_shr(int.bits as _) > 0 {
+                        todo!("number {num} is larger than param size ({} bits)", int.bits);
+                    }
+                    num.to_ne_bytes()[..int.size as usize].to_vec()
                 }
-
-                num.to_ne_bytes()[..int.size as usize].to_vec()
-            }
+                BtfKind::Enum(e) => {
+                    e.values
+                        .iter()
+                        .find(|v| v.val == *num as i32)
+                        .expect("incorrect enum value");
+                    num.to_ne_bytes()[..e.size as usize].to_vec()
+                }
+                BtfKind::Enum64(e) => {
+                    e.values
+                        .iter()
+                        .find(|v| ((v.val_hi32 as i64) << 32 | v.val_lo32 as i64) == *num)
+                        .expect("incorrect enum64 value");
+                    num.to_ne_bytes()[..e.size as usize].to_vec()
+                }
+                _ => todo!("expected numeric type"),
+            },
             Val::Map(map) => {
                 if let BtfKind::Ptr(p) = &ty.kind {
                     ty = btf
@@ -770,6 +848,48 @@ impl Val {
 
                 buf
             }
+        }
+    }
+}
+
+impl Val {
+    pub fn from_bytes(btf: &Btf, ty: &BtfType, bytes: &[u8]) -> Val {
+        match &ty.kind {
+            BtfKind::Int(int) => {
+                let size = int.size as usize;
+                let mut buf = [0u8; 8];
+                buf[..size].copy_from_slice(&bytes[..size]);
+                Val::Number(i64::from_ne_bytes(buf))
+            }
+            BtfKind::Enum(e) => {
+                let size = e.size as usize;
+                let mut buf = [0u8; 8];
+                buf[..size].copy_from_slice(&bytes[..size]);
+                Val::Number(i64::from_ne_bytes(buf))
+            }
+            BtfKind::Enum64(e) => {
+                let size = e.size as usize;
+                let mut buf = [0u8; 8];
+                buf[..size].copy_from_slice(&bytes[..size]);
+                Val::Number(i64::from_ne_bytes(buf))
+            }
+            BtfKind::Struct(s) => {
+                let mut map = HashMap::new();
+                for member in &s.members {
+                    let member_ty = btf.get_type(member.r#type).unwrap();
+                    let name = btf.name(member.name_off).unwrap();
+                    let byte_offset = (member.offset / 8) as usize;
+                    let member_size = member_ty.kind.size(btf).unwrap() as usize;
+                    let val = Val::from_bytes(
+                        btf,
+                        member_ty,
+                        &bytes[byte_offset..byte_offset + member_size],
+                    );
+                    map.insert(name.to_string(), val);
+                }
+                Val::Map(map)
+            }
+            _ => todo!("from_bytes: unsupported BTF kind"),
         }
     }
 }

@@ -77,6 +77,8 @@ mem_insns! {
 
 /// LD IMM64 will load the map address with the FD given in IMM.
 pub const BPF_PSEUDO_MAP_FD: u8 = 1;
+/// LD IMM64 will load map_val(map_by_fd(imm)) + next_imm.
+pub const BPF_PSEUDO_MAP_VALUE: u8 = 2;
 
 /// The non-conventional load with IMM mode uses the
 /// wide instruction encoding to construct 64-bit
@@ -114,7 +116,16 @@ pub fn ld_imm64(state: &mut crate::vm::Vm, insn: Insn) {
             assert!(state.map_by_fd_exists(insn.imm()));
             state.registers[dst] = imm as u64;
         }
-        // 2 => dst = map_val(map_by_fd(imm)) + next_imm  imm: map fd      dst: data address
+        BPF_PSEUDO_MAP_VALUE => {
+            let map = state
+                .map_by_fd(imm)
+                .expect("PSEUDO_MAP_VALUE: invalid map fd");
+            let base = map
+                .repr
+                .lookup(&state.mem, &0u32.to_ne_bytes())
+                .expect("PSEUDO_MAP_VALUE: entry 0 not found");
+            state.registers[dst] = base as u64 + (next_imm >> 32);
+        }
         // 3 => dst = var_addr(imm)                       imm: variable id dst: data address
         // 4 => dst = code_addr(imm)                      imm: integer     dst: code address
         // 5 => dst = map_by_idx(imm)                     imm: map index   dst: map

@@ -143,8 +143,8 @@ pub const BPF_PSEUDO_KFUNC_CALL: u8 = 2;
 pub const BPF_HELPER_CALL: u8 = 0;
 
 pub type HelperExecFn = fn(&mut crate::vm::Vm, Insn);
-pub type HelperRetvalFn = fn(&[RegisterState; 11], Insn) -> RegisterState;
-pub type HelperParamsFn = fn(&[RegisterState; 11], Insn) -> Result<(), &'static str>;
+pub type HelperRetvalFn = fn(&crate::vm::Vm, &[RegisterState; 11], Insn) -> RegisterState;
+pub type HelperParamsFn = fn(&crate::vm::Vm, &[RegisterState; 11], Insn) -> Result<(), &'static str>;
 
 pub struct BpfHelper {
     pub exec: HelperExecFn,
@@ -156,11 +156,11 @@ fn noop_exec(_: &mut crate::vm::Vm, _: Insn) {
     panic!("unimplemented helper function");
 }
 
-fn noop_retval(_: &[RegisterState; 11], _: Insn) -> RegisterState {
+fn noop_retval(_: &crate::vm::Vm, _: &[RegisterState; 11], _: Insn) -> RegisterState {
     RegisterState::Uninit
 }
 
-fn noop_params(_: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
+fn noop_params(_: &crate::vm::Vm, _: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
     Err("unimplemented helper function")
 }
 
@@ -185,6 +185,10 @@ const BPF_FUNC_MAP_UPDATE_ELEM: i32 = 2;
 const BPF_FUNC_TRACE_PRINTK: i32 = 6;
 const BPF_FUNC_GET_CURRENT_PID_TGID: i32 = 14;
 
+const BPF_FUNC_MAP_PUSH_ELEM: i32 = 87;
+const BPF_FUNC_MAP_POP_ELEM: i32 = 88;
+const BPF_FUNC_MAP_PEEK_ELEM: i32 = 89;
+
 helper_table! {
     // static void *(* const bpf_map_lookup_elem)(void *map, const void *key) = (void *) 1;
     // R1: map pointer, R2: key pointer
@@ -196,13 +200,18 @@ helper_table! {
             let elem = state.map_lookup_from_guest(map_idx, key).unwrap_or_default();
             state.registers[0] = elem as u64;
         },
-        |regs, _| {
+        |vm, regs, _| {
             let RegisterState::PtrToMap { map_fd } = regs[1] else {
                 panic!("map_lookup_elem: R1 must be PtrToMap");
             };
-            RegisterState::PtrToMapValueOrNull { map_fd }
+            let map = vm.map_by_fd(map_fd).unwrap();
+            if map.spec.r#type == Some(crate::maps::BPF_MAP_TYPE_ARRAY) {
+                RegisterState::PtrToMapValue { map_fd, offset: 0 }
+            } else {
+                RegisterState::PtrToMapValueOrNull { map_fd }
+            }
         },
-        |regs, _| {
+        |_, regs, _| {
             if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
                 return Err("map_lookup_elem: R1 must be PtrToMap");
             }
@@ -225,8 +234,8 @@ helper_table! {
                 Err(_) => state.registers[0] = -1i64 as u64,
             }
         },
-        |_, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
-        |regs, _| {
+        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
+        |_, regs, _| {
             if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
                 return Err("map_update_elem: R1 must be PtrToMap");
             }
@@ -261,8 +270,8 @@ helper_table! {
             state.registers[0] = s.as_bytes().len() as u64;
             eprintln!("Print: {s:?}");
         },
-        |_, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
-        |regs, _| {
+        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
+        |_, regs, _| {
             if !regs[1].is_pointer() {
                 return Err("trace_printk: R1 must be a valid pointer");
             }
@@ -277,8 +286,77 @@ helper_table! {
     // TODO: should the vm have a configurable execution context?
     BPF_FUNC_GET_CURRENT_PID_TGID => (
         |state, _| state.registers[0] = (0xDEAD << 32) | 0xBEEF,
-        |_, _| RegisterState::Scalar(crate::verifier::Scalar::U64(0)),
-        |_, _| Ok(())
+        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::U64(crate::verifier::ScalarRange::exact(0))),
+        |_, _, _| Ok(())
+    );
+    // static long (* const bpf_map_push_elem)(void *map, const void *value, __u64 flags) = (void *) 87;
+    // R1: map pointer, R2: value pointer, R3: flags
+    // R0: success or errno
+    BPF_FUNC_MAP_PUSH_ELEM => (
+        |state, _| {
+            let map_idx = state.registers[1] as u32 as usize;
+            let value_addr = state.registers[2] as usize;
+            match state.map_push_from_guest(map_idx, value_addr) {
+                Ok(()) => state.registers[0] = 0,
+                Err(_) => state.registers[0] = -1i64 as u64,
+            }
+        },
+        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
+        |_, regs, _| {
+            if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
+                return Err("map_push_elem: R1 must be PtrToMap");
+            }
+            if !regs[2].is_pointer() {
+                return Err("map_push_elem: R2 must be a valid pointer");
+            }
+            Ok(())
+        }
+    );
+    // static long (* const bpf_map_pop_elem)(void *map, void *value) = (void *) 88;
+    // R1: map pointer, R2: value pointer (output)
+    // R0: success or errno
+    BPF_FUNC_MAP_POP_ELEM => (
+        |state, _| {
+            let map_idx = state.registers[1] as u32 as usize;
+            let value_addr = state.registers[2] as usize;
+            match state.map_pop_from_guest(map_idx, value_addr) {
+                Ok(()) => state.registers[0] = 0,
+                Err(_) => state.registers[0] = -1i64 as u64,
+            }
+        },
+        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
+        |_, regs, _| {
+            if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
+                return Err("map_pop_elem: R1 must be PtrToMap");
+            }
+            if !regs[2].is_pointer() {
+                return Err("map_pop_elem: R2 must be a valid pointer");
+            }
+            Ok(())
+        }
+    );
+    // static long (* const bpf_map_peek_elem)(void *map, void *value) = (void *) 89;
+    // R1: map pointer, R2: value pointer (output)
+    // R0: success or errno
+    BPF_FUNC_MAP_PEEK_ELEM => (
+        |state, _| {
+            let map_idx = state.registers[1] as u32 as usize;
+            let value_addr = state.registers[2] as usize;
+            match state.map_peek_from_guest(map_idx, value_addr) {
+                Ok(()) => state.registers[0] = 0,
+                Err(_) => state.registers[0] = -1i64 as u64,
+            }
+        },
+        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
+        |_, regs, _| {
+            if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
+                return Err("map_peek_elem: R1 must be PtrToMap");
+            }
+            if !regs[2].is_pointer() {
+                return Err("map_peek_elem: R2 must be a valid pointer");
+            }
+            Ok(())
+        }
     );
 }
 

@@ -157,6 +157,13 @@ impl HashTable {
         Ok(())
     }
 
+    pub fn clear(&mut self, mem: &mut Memory) {
+        self.flags.fill(Flag::Vacant);
+        let size = self.entry_layout.size() * self.max_entries;
+        mem.write_slice(self.region.start(), &vec![0u8; size])
+            .expect("clear: region out of bounds");
+    }
+
     pub(crate) fn update_from_guest(
         &mut self,
         mem: &mut Memory,

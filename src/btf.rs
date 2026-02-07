@@ -119,6 +119,19 @@ impl Btf {
                     self.is_offset_valid(member.r#type, offset, len)
                 })
             }
+            BtfKind::Datasec(datasec) if datasec.opaque => Some(true),
+            BtfKind::Datasec(datasec) => datasec.secinfos.iter().find_map(|info| {
+                let entry_offset = offset.checked_sub(info.offset)?;
+                if entry_offset + len.unwrap_or(0) > info.size {
+                    return None;
+                }
+                let var_type = self.types.get(&info.r#type)?;
+                let underlying = match &var_type.kind {
+                    BtfKind::Var(var) => var.ty,
+                    _ => info.r#type,
+                };
+                self.is_offset_valid(underlying, entry_offset, len)
+            }),
             BtfKind::Typedef(_) => todo!(),
             BtfKind::DeclTag => todo!(),
             BtfKind::TypeTag(_) => todo!(),
@@ -275,6 +288,10 @@ pub struct Var {
 pub struct Datasec {
     pub secinfos: Vec<VarSecInfo>,
     pub size: u32,
+    /// Set by the loader for synthesized data sections (.rodata, etc.)
+    /// where any byte-aligned access within bounds is valid. Cannot
+    /// be set through parsed BTF headers.
+    pub opaque: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -581,6 +598,7 @@ mod parser {
                     Self::Datasec(Datasec {
                         secinfos,
                         size: size_or_type,
+                        opaque: false,
                     })
                 }
                 BTF_KIND_FLOAT => Self::Float(Float { size: size_or_type }),

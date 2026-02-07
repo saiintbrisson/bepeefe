@@ -7,6 +7,41 @@ use crate::{
 
 mod array;
 mod hash_table;
+mod stack;
+
+pub const BPF_MAP_TYPE_UNSPEC: u32 = 0;
+pub const BPF_MAP_TYPE_HASH: u32 = 1;
+pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
+pub const BPF_MAP_TYPE_PROG_ARRAY: u32 = 3;
+pub const BPF_MAP_TYPE_PERF_EVENT_ARRAY: u32 = 4;
+pub const BPF_MAP_TYPE_PERCPU_HASH: u32 = 5;
+pub const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
+pub const BPF_MAP_TYPE_STACK_TRACE: u32 = 7;
+pub const BPF_MAP_TYPE_CGROUP_ARRAY: u32 = 8;
+pub const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
+pub const BPF_MAP_TYPE_LRU_PERCPU_HASH: u32 = 10;
+pub const BPF_MAP_TYPE_LPM_TRIE: u32 = 11;
+pub const BPF_MAP_TYPE_ARRAY_OF_MAPS: u32 = 12;
+pub const BPF_MAP_TYPE_HASH_OF_MAPS: u32 = 13;
+pub const BPF_MAP_TYPE_DEVMAP: u32 = 14;
+pub const BPF_MAP_TYPE_SOCKMAP: u32 = 15;
+pub const BPF_MAP_TYPE_CPUMAP: u32 = 16;
+pub const BPF_MAP_TYPE_XSKMAP: u32 = 17;
+pub const BPF_MAP_TYPE_SOCKHASH: u32 = 18;
+pub const BPF_MAP_TYPE_CGROUP_STORAGE: u32 = 19;
+pub const BPF_MAP_TYPE_REUSEPORT_SOCKARRAY: u32 = 20;
+pub const BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE: u32 = 21;
+pub const BPF_MAP_TYPE_QUEUE: u32 = 22;
+pub const BPF_MAP_TYPE_STACK: u32 = 23;
+pub const BPF_MAP_TYPE_SK_STORAGE: u32 = 24;
+pub const BPF_MAP_TYPE_DEVMAP_HASH: u32 = 25;
+pub const BPF_MAP_TYPE_STRUCT_OPS: u32 = 26;
+pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
+pub const BPF_MAP_TYPE_INODE_STORAGE: u32 = 28;
+pub const BPF_MAP_TYPE_TASK_STORAGE: u32 = 29;
+pub const BPF_MAP_TYPE_BLOOM_FILTER: u32 = 30;
+pub const BPF_MAP_TYPE_USER_RINGBUF: u32 = 31;
+pub const BPF_MAP_TYPE_CGRP_STORAGE: u32 = 32;
 
 #[derive(Clone, Debug, Default)]
 pub struct MapSpec {
@@ -26,6 +61,7 @@ pub struct MapSpec {
     pub value: Option<BtfTypeId>,
     pub values: Option<BtfTypeId>,
     pub pinning: MapPinning,
+    pub initial_data: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -68,7 +104,7 @@ pub enum MapRepr {
     ReuseportSockarray,
     PercpuCgroupStorage,
     Queue,
-    Stack,
+    Stack(stack::Stack),
     SkStorage,
     DevmapHash,
     StructOps,
@@ -116,6 +152,13 @@ macro_rules! delegate_map_impl {
             }
         }
 
+        pub fn clear(&mut self, mem: &mut crate::vm::mem::Memory) {
+            match self {
+                $(Self::$name(map) => map.clear(mem),)+
+                _ => todo!(),
+            }
+        }
+
         pub(crate) fn update_from_guest(
             &mut self,
             mem: &mut crate::vm::mem::Memory,
@@ -133,8 +176,8 @@ macro_rules! delegate_map_impl {
 impl MapRepr {
     pub fn create_from_btf(mem: &mut Memory, btf: &Btf, spec: &MapSpec) -> Option<Self> {
         Some(match spec.r#type? {
-            0 => Self::Unspec,
-            1 => Self::Hash(hash_table::HashTable::new(
+            BPF_MAP_TYPE_UNSPEC => Self::Unspec,
+            BPF_MAP_TYPE_HASH => Self::Hash(hash_table::HashTable::new(
                 mem,
                 spec.key_size
                     .or_else(|| spec.key.and_then(|id| btf.get_type(id))?.kind.size(btf))
@@ -144,48 +187,105 @@ impl MapRepr {
                     .expect("map missing value size"),
                 spec.max_entries?,
             )),
-            2 => Self::Array(array::Array::new(
+            BPF_MAP_TYPE_ARRAY => Self::Array(array::Array::new(
                 mem,
                 spec.max_entries?,
                 spec.value_size
                     .or_else(|| spec.value.and_then(|id| btf.get_type(id))?.kind.size(btf))
                     .expect("map missing value size"),
             )),
-            3 => Self::ProgArray,
-            4 => Self::PerfEventArray,
-            5 => Self::PercpuHash,
-            6 => Self::PercpuArray,
-            7 => Self::StackTrace,
-            8 => Self::CgroupArray,
-            9 => Self::LruHash,
-            10 => Self::LruPercpuHash,
-            11 => Self::LpmTrie,
-            12 => Self::ArrayOfMaps,
-            13 => Self::HashOfMaps,
-            14 => Self::Devmap,
-            15 => Self::Sockmap,
-            16 => Self::Cpumap,
-            17 => Self::Xskmap,
-            18 => Self::Sockhash,
-            19 => Self::CgroupStorage,
-            20 => Self::ReuseportSockarray,
-            21 => Self::PercpuCgroupStorage,
-            22 => Self::Queue,
-            23 => Self::Stack,
-            24 => Self::SkStorage,
-            25 => Self::DevmapHash,
-            26 => Self::StructOps,
-            27 => Self::Ringbuf,
-            28 => Self::InodeStorage,
-            29 => Self::TaskStorage,
-            30 => Self::BloomFilter,
-            31 => Self::UserRingbuf,
-            32 => Self::CgrpStorage,
+            BPF_MAP_TYPE_PROG_ARRAY => Self::ProgArray,
+            BPF_MAP_TYPE_PERF_EVENT_ARRAY => Self::PerfEventArray,
+            BPF_MAP_TYPE_PERCPU_HASH => Self::PercpuHash,
+            BPF_MAP_TYPE_PERCPU_ARRAY => Self::PercpuArray,
+            BPF_MAP_TYPE_STACK_TRACE => Self::StackTrace,
+            BPF_MAP_TYPE_CGROUP_ARRAY => Self::CgroupArray,
+            BPF_MAP_TYPE_LRU_HASH => Self::LruHash,
+            BPF_MAP_TYPE_LRU_PERCPU_HASH => Self::LruPercpuHash,
+            BPF_MAP_TYPE_LPM_TRIE => Self::LpmTrie,
+            BPF_MAP_TYPE_ARRAY_OF_MAPS => Self::ArrayOfMaps,
+            BPF_MAP_TYPE_HASH_OF_MAPS => Self::HashOfMaps,
+            BPF_MAP_TYPE_DEVMAP => Self::Devmap,
+            BPF_MAP_TYPE_SOCKMAP => Self::Sockmap,
+            BPF_MAP_TYPE_CPUMAP => Self::Cpumap,
+            BPF_MAP_TYPE_XSKMAP => Self::Xskmap,
+            BPF_MAP_TYPE_SOCKHASH => Self::Sockhash,
+            BPF_MAP_TYPE_CGROUP_STORAGE => Self::CgroupStorage,
+            BPF_MAP_TYPE_REUSEPORT_SOCKARRAY => Self::ReuseportSockarray,
+            BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE => Self::PercpuCgroupStorage,
+            BPF_MAP_TYPE_QUEUE => Self::Queue,
+            BPF_MAP_TYPE_STACK => Self::Stack(stack::Stack::new(
+                mem,
+                spec.max_entries?,
+                spec.value_size
+                    .or_else(|| spec.value.and_then(|id| btf.get_type(id))?.kind.size(btf))
+                    .expect("map missing value size"),
+            )),
+            BPF_MAP_TYPE_SK_STORAGE => Self::SkStorage,
+            BPF_MAP_TYPE_DEVMAP_HASH => Self::DevmapHash,
+            BPF_MAP_TYPE_STRUCT_OPS => Self::StructOps,
+            BPF_MAP_TYPE_RINGBUF => Self::Ringbuf,
+            BPF_MAP_TYPE_INODE_STORAGE => Self::InodeStorage,
+            BPF_MAP_TYPE_TASK_STORAGE => Self::TaskStorage,
+            BPF_MAP_TYPE_BLOOM_FILTER => Self::BloomFilter,
+            BPF_MAP_TYPE_USER_RINGBUF => Self::UserRingbuf,
+            BPF_MAP_TYPE_CGRP_STORAGE => Self::CgrpStorage,
             _ => return None,
         })
     }
 
     delegate_map_impl! {
-        Array, Hash,
+        Array, Hash, Stack,
+    }
+
+    pub fn push(
+        &mut self,
+        mem: &mut crate::vm::mem::Memory,
+        value: &[u8],
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Stack(map) => map.push(mem, value),
+            _ => Err(std::io::ErrorKind::Unsupported.into()),
+        }
+    }
+
+    pub fn pop(&mut self, mem: &crate::vm::mem::Memory) -> Option<usize> {
+        match self {
+            Self::Stack(map) => map.pop(mem),
+            _ => None,
+        }
+    }
+
+    pub fn push_from_guest(
+        &mut self,
+        mem: &mut crate::vm::mem::Memory,
+        value_addr: usize,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Stack(map) => map.push_from_guest(mem, value_addr),
+            _ => Err(std::io::ErrorKind::Unsupported.into()),
+        }
+    }
+
+    pub fn pop_from_guest(
+        &mut self,
+        mem: &mut crate::vm::mem::Memory,
+        value_addr: usize,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Stack(map) => map.pop_from_guest(mem, value_addr),
+            _ => Err(std::io::ErrorKind::Unsupported.into()),
+        }
+    }
+
+    pub fn peek_from_guest(
+        &self,
+        mem: &mut crate::vm::mem::Memory,
+        value_addr: usize,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Stack(map) => map.peek_from_guest(mem, value_addr),
+            _ => Err(std::io::ErrorKind::Unsupported.into()),
+        }
     }
 }
