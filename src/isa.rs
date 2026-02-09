@@ -28,7 +28,7 @@ use alu::*;
 use jmp::*;
 use load::*;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
 pub struct Insn(pub u64);
 

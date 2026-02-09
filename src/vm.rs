@@ -9,6 +9,7 @@ use crate::{
     },
     maps::{BpfMap, MapPinning, MapRepr},
     object::{Context, EbpfProgram, Val},
+    verifier::VerifierState,
 };
 
 pub mod debugger;
@@ -152,8 +153,8 @@ impl Vm {
         }
 
         let prog = Arc::new(prog);
-
-        crate::verifier::VerifierState::new(&self, prog.clone()).run();
+        let verifier = VerifierState::new(&self, prog.clone()).unwrap();
+        verifier.run().expect("verification failed");
 
         PreparedProgram(prog)
     }
