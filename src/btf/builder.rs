@@ -19,7 +19,7 @@ impl BtfBuilder {
             return 0;
         }
 
-        if let Some(off) = self.inner.find_name(s) {
+        if let Some(off) = self.inner.find_string(s) {
             return off;
         }
 
@@ -31,7 +31,7 @@ impl BtfBuilder {
 
     fn insert_type(&mut self, name_off: u32, kind: BtfKind) -> BtfTypeId {
         debug_assert!(
-            name_off == 0 || self.inner.name(name_off).is_some(),
+            name_off == 0 || self.inner.string(name_off).is_some(),
             "name_off {name_off} not in string table"
         );
 
@@ -271,7 +271,14 @@ impl BtfBuilder {
             .collect();
 
         let name_off = self.add_string(name);
-        self.insert_type(name_off, BtfKind::Datasec(Datasec { secinfos, size, opaque: false }))
+        self.insert_type(
+            name_off,
+            BtfKind::Datasec(Datasec {
+                secinfos,
+                size,
+                opaque: false,
+            }),
+        )
     }
 }
 

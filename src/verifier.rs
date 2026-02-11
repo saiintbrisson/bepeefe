@@ -22,6 +22,7 @@ pub enum VerifierError {
         insn: Insn,
         insn_off: usize,
         msg: &'static str,
+        registers: [RegisterState; 11],
     },
 }
 
@@ -41,11 +42,11 @@ pub enum RegisterState {
     Uninit,
     Scalar(Scalar),
     PtrToCtx {
-        offset: u32,
+        offset: ScalarRange<u32>,
         size: u32,
     },
     PtrToStack {
-        pointer: u32,
+        offset: ScalarRange<u32>,
     },
     PtrToMap {
         map_fd: i32,
@@ -54,7 +55,7 @@ pub enum RegisterState {
     /// Either returned by an array or refined through a check against NULL.
     PtrToMapValue {
         map_fd: i32,
-        offset: u32,
+        offset: ScalarRange<u32>,
     },
     /// Pointer to a map value or NULL. Returned by map_lookup_elem.
     /// Arrays never return null.
@@ -81,26 +82,40 @@ pub enum RegisterState {
 ///
 /// Let's illustrate what happens:
 /// ```asm
-/// 1: u16 arr = [0..64];
-/// 2: if r0 < 1 goto done   ; r0 = Range { min: 1, max: u32::MAX, stride: 1 }
-/// 3: r0 += 1               ; r0 = Range { min: 2, max: u32::MAX + 1, stride: 1 }
+/// 1: u16[] arr = [0..64]
+/// 2: r0 = X
+/// 3: if r0 < 1 goto done   ; r0 = Range { min: 1, max: u32::MAX, stride: 1 }
+/// 4: r0 += 1               ; r0 = Range { min: 2, max: u32::MAX + 1, stride: 1 }
 ///                          ; max wraps here, next line will fix this
-/// 4: if r0 >= 64 goto done ; r0 = Range { min: 2, max: 63, stride: 1 }
-/// 5: r0 = r0 << 1          ; r0 = Range { min: 4, max: 126, stride: 2 }
-/// 6: r1 = arr[r0]          ; verifier ensures r0.min and r0.max are within ranges,
+/// 5: if r0 >= 64 goto done ; r0 = Range { min: 2, max: 63, stride: 1 }
+/// 6: r0 = r0 << 1          ; r0 = Range { min: 4, max: 126, stride: 2 }
+/// 7: r1 = arr[r0]          ; verifier ensures r0.min and r0.max are within ranges,
 ///                          ; and that r0.stride is aligns to elements
-/// 7: done: exit
+/// 8: done: exit
 /// ```
 /// When accessing an array, the verifier must guarantee the code won't
-/// perform an out-of-bounds execution. By gating the code in line 2 and 4,
-/// the verifier ensures the access will happen within `arr` bounds. In line 3,
+/// perform an out-of-bounds execution. By gating the code in line 3 and 5,
+/// the verifier ensures the access will happen within `arr` bounds. In line 4,
 /// we expand the range to +1. Note that the array contains u16 elements,
-/// two bytes in size, so we adjust it to u16 boundaries in line 5.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// two bytes in size, so we adjust it to u16 boundaries in line 6.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ScalarRange<T: Copy> {
     pub min: T,
     pub max: T,
     pub stride: T,
+}
+
+impl<T: Copy + std::fmt::Debug + Eq> std::fmt::Debug for ScalarRange<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.min == self.max {
+            f.debug_tuple("ScalarRange").field(&self.min).finish()
+        } else {
+            f.debug_tuple("ScalarRange")
+                .field(&format_args!("{:?}..={:?}", self.min, self.max))
+                .field(&self.stride)
+                .finish()
+        }
+    }
 }
 
 impl<T: Copy + PartialEq + PartialOrd> ScalarRange<T> {
@@ -133,6 +148,37 @@ pub enum Scalar {
 }
 
 impl ScalarRange<u32> {
+    /// Add a signed range to this offset range, returning `None` on overflow.
+    ///
+    /// The resulting stride depends on whether each side is exact (min==max):
+    /// - both exact: single point, stride is irrelevant (1).
+    /// - self exact, other a range: adding a constant to every element doesn't
+    ///   change the spacing, so the other's stride carries through.
+    /// - other exact, self a range: same reasoning, self's stride survives.
+    /// - both ranges: the combined progression hits multiples of gcd(a, b).
+    fn checked_add_signed_range(self, min: i32, max: i32, stride: i32) -> Option<Self> {
+        let self_exact = self.min == self.max;
+        let other_exact = min == max;
+        let stride = match (self_exact, other_exact) {
+            (true, true) => 1,
+            (true, false) => stride.unsigned_abs(),
+            (false, true) => self.stride,
+            (false, false) => {
+                let (mut a, mut b) = (self.stride, stride.unsigned_abs());
+                while b != 0 {
+                    (a, b) = (b, a % b);
+                }
+                a
+            }
+        };
+
+        Some(ScalarRange {
+            min: self.min.checked_add_signed(min)?,
+            max: self.max.checked_add_signed(max)?,
+            stride: stride.max(1),
+        })
+    }
+
     fn wrapping_offset(self, val: u32, op: fn(u32, u32) -> u32, src_abs: u64) -> Self {
         ScalarRange {
             min: op(self.min, val),
@@ -381,7 +427,10 @@ impl<'a> VerifierState<'a> {
 
             registers[idx + 1] = match btf_type.kind {
                 BtfKind::Int(_) => RegisterState::Scalar(Scalar::Unknown),
-                BtfKind::Ptr(_) => RegisterState::PtrToCtx { offset: 0, size },
+                BtfKind::Ptr(_) => RegisterState::PtrToCtx {
+                    offset: ScalarRange::exact(0),
+                    size,
+                },
                 _ => {
                     return Err(VerifierError::UnsupportedContextType {
                         arg_id: idx,
@@ -391,7 +440,9 @@ impl<'a> VerifierState<'a> {
             };
         }
 
-        registers[10] = RegisterState::PtrToStack { pointer: 512 };
+        registers[10] = RegisterState::PtrToStack {
+            offset: ScalarRange::exact(512),
+        };
 
         Ok(Self {
             vm,
@@ -452,7 +503,7 @@ impl<'a> VerifierState<'a> {
                         .collect::<Vec<_>>()
                         .join(", ");
 
-                    eprintln!("{pad}{idx}: {name}: {disasm} — {dump}");
+                    eprintln!("{pad}{idx}: {name}: {disasm} [{dump}]");
                 }
 
                 self.check_jmp(insn)?
@@ -466,7 +517,7 @@ impl<'a> VerifierState<'a> {
             .collect::<Vec<_>>()
             .join(", ");
 
-        eprintln!("{pad}{idx}: {name}: {disasm} — {dump}");
+        eprintln!("{pad}{idx}: {name}: {disasm} [{dump}]");
 
         Ok(())
     }
@@ -544,6 +595,7 @@ impl<'a> VerifierState<'a> {
             insn,
             insn_off,
             msg,
+            registers: self.registers,
         }
     }
 
@@ -644,54 +696,28 @@ impl<'a> VerifierState<'a> {
             BPF_ADD => {
                 self.registers[insn.dst_reg() as usize] = match ptr {
                     RegisterState::PtrToCtx { offset, size } => {
-                        let max_off = offset
-                            .checked_add_signed(scalar_max)
+                        let offset = offset
+                            .checked_add_signed_range(scalar_min, scalar_max, scalar_stride)
                             .ok_or(self.err("new ptr overflows ctx"))?;
-                        guard!(self, size > max_off, "new ptr overflows ctx");
-                        RegisterState::PtrToCtx {
-                            offset: max_off,
-                            size,
-                        }
+                        guard!(self, size > offset.max, "new ptr overflows ctx");
+                        RegisterState::PtrToCtx { offset, size }
                     }
-                    RegisterState::PtrToStack { pointer } => {
-                        let pointer = pointer
-                            .checked_add_signed(scalar_min)
+                    RegisterState::PtrToStack { offset } => {
+                        let offset = offset
+                            .checked_add_signed_range(scalar_min, scalar_max, scalar_stride)
                             .ok_or(self.err("new ptr overflows stack"))?;
                         guard!(
                             self,
-                            pointer >= self.stack_range.start,
+                            offset.min >= self.stack_range.start,
                             "new ptr overflows stack"
                         );
-                        RegisterState::PtrToStack { pointer }
+                        RegisterState::PtrToStack { offset }
                     }
                     RegisterState::PtrToMapValue { map_fd, offset } => {
-                        let bpf_map = self
-                            .vm
-                            .map_by_fd(map_fd)
-                            .ok_or(self.err("ptr to map value points to unknown map FD"))?;
-                        let map_val = bpf_map
-                            .spec
-                            .value
-                            .ok_or(self.err("ptr to map value has no associated value BTF type"))?;
-
-                        for v in (scalar_min..=scalar_max).step_by(scalar_stride as usize) {
-                            let off = offset
-                                .checked_add_signed(v)
-                                .ok_or(self.err("new ptr to map value overflows map"))?;
-                            guard!(
-                                self,
-                                bpf_map.btf.is_offset_valid(map_val, off, None) == Some(true),
-                                "new ptr to map value has invalid offset"
-                            );
-                        }
-
-                        let max_off = offset
-                            .checked_add_signed(scalar_max)
+                        let offset = offset
+                            .checked_add_signed_range(scalar_min, scalar_max, scalar_stride)
                             .ok_or(self.err("new ptr to map value overflows map"))?;
-                        RegisterState::PtrToMapValue {
-                            map_fd,
-                            offset: max_off,
-                        }
+                        RegisterState::PtrToMapValue { map_fd, offset }
                     }
                     _ => todo!(),
                 };
@@ -834,29 +860,29 @@ impl<'a> VerifierState<'a> {
 
                 match self.src_reg(insn).expect("invalid src state for LD") {
                     RegisterState::PtrToCtx { offset, size } => {
-                        guard!(
-                            self,
-                            insn.offset() >= 0,
-                            "negative offset reads are not supported yet"
-                        );
-
-                        let read_offset = offset
+                        let read_min = offset
+                            .min
                             .checked_add_signed(insn.offset() as i32)
                             .ok_or(self.err("tried reading out of ctx bounds"))?;
+                        let read_max = offset
+                            .max
+                            .checked_add_signed(insn.offset() as i32)
+                            .ok_or(self.err("tried reading out of ctx bounds"))?;
+                        let _ = read_min; // underflow caught by checked_add_signed
                         guard!(
                             self,
-                            read_offset + load_size <= size,
+                            read_max + load_size <= size,
                             "tried reading out of ctx bounds"
                         );
                     }
-                    RegisterState::PtrToStack { pointer } => {
+                    RegisterState::PtrToStack { offset } => {
                         guard!(
                             self,
-                            insn.offset() < 0,
-                            "negative offset reads are not supported yet"
+                            offset.single_val().is_some(),
+                            "stack access requires exact pointer offset"
                         );
-
-                        let dst = pointer
+                        let dst = offset
+                            .min
                             .checked_add_signed(insn.offset() as i32)
                             .ok_or(self.err("tried reading out of stack bounds"))?;
                         let &(slot_size, saved_state) = self
@@ -869,15 +895,10 @@ impl<'a> VerifierState<'a> {
                             "load size does not match stack slot size"
                         );
                         self.registers[insn.dst_reg() as usize] = saved_state;
+                        return Ok(());
                     }
                     RegisterState::PtrToMap { map_fd } => todo!(),
                     RegisterState::PtrToMapValue { map_fd, offset } => {
-                        guard!(
-                            self,
-                            insn.offset() >= 0,
-                            "negative offset reads are not supported yet"
-                        );
-
                         let bpf_map = self
                             .vm
                             .map_by_fd(map_fd)
@@ -886,14 +907,27 @@ impl<'a> VerifierState<'a> {
                             .spec
                             .value
                             .ok_or(self.err("map has no associated value BTF type"))?;
-                        let offset = offset
+                        let read_min = offset
+                            .min
+                            .checked_add_signed(insn.offset() as i32)
+                            .ok_or(self.err("load overflows map value"))?;
+                        let read_max = offset
+                            .max
                             .checked_add_signed(insn.offset() as i32)
                             .ok_or(self.err("load overflows map value"))?;
                         guard!(
                             self,
                             bpf_map
                                 .btf
-                                .is_offset_valid(map_val, offset, Some(load_size))
+                                .is_offset_valid(map_val, read_min, Some(load_size))
+                                == Some(true),
+                            "tried reading from ptr to map value with invalid offset"
+                        );
+                        guard!(
+                            self,
+                            bpf_map
+                                .btf
+                                .is_offset_valid(map_val, read_max, Some(load_size))
                                 == Some(true),
                             "tried reading from ptr to map value with invalid offset"
                         );
@@ -949,8 +983,10 @@ impl<'a> VerifierState<'a> {
                     self.vm.map_by_fd_exists(map_fd),
                     "referenced non-existing map FD"
                 );
-                self.registers[insn.dst_reg() as usize] =
-                    RegisterState::PtrToMapValue { map_fd, offset };
+                self.registers[insn.dst_reg() as usize] = RegisterState::PtrToMapValue {
+                    map_fd,
+                    offset: ScalarRange::exact(offset),
+                };
             }
             _ => guard!(self, "unsupported pseudo function"),
         }
@@ -979,8 +1015,14 @@ impl<'a> VerifierState<'a> {
 
         match dst_reg {
             RegisterState::Uninit => guard!(self, "store to uninit register"),
-            RegisterState::PtrToStack { pointer } => {
-                let dst = pointer
+            RegisterState::PtrToStack { offset } => {
+                guard!(
+                    self,
+                    offset.single_val().is_some(),
+                    "stack access requires exact pointer offset"
+                );
+                let dst = offset
+                    .min
                     .checked_add_signed(insn.offset() as i32)
                     .ok_or(self.err("store overflows stack"))?;
                 guard!(
@@ -997,23 +1039,36 @@ impl<'a> VerifierState<'a> {
 
                 let write_end = dst + store_size;
 
-                let has_overlap = self
-                    .stack_objects
-                    .range(dst.saturating_sub(7)..write_end)
-                    .any(|(&addr, &(len, _))| {
-                        let obj_end = addr + len;
-                        !(addr == dst && len == store_size)
-                            && !(write_end <= addr || dst >= obj_end)
-                    });
-                guard!(
-                    self,
-                    !has_overlap,
-                    "store partially overlaps existing stack slot"
-                );
-
                 let src_state = self
                     .src_reg(insn)
                     .unwrap_or(scalar_reg(ScalarRange::exact(insn.imm() as u64)));
+
+                let overlapping: Vec<u32> = self
+                    .stack_objects
+                    .range(dst.saturating_sub(7)..write_end)
+                    .filter_map(|(&addr, &(len, _))| {
+                        let obj_end = addr + len;
+                        let exact_match = addr == dst && len == store_size;
+                        let disjoint = write_end <= addr || dst >= obj_end;
+                        (!exact_match && !disjoint).then_some(addr)
+                    })
+                    .collect();
+
+                if !overlapping.is_empty() {
+                    if src_state.is_pointer() {
+                        guard!(self, "pointer store partially overlaps existing stack slot");
+                    }
+
+                    for &addr in &overlapping {
+                        let (_, existing) = self.stack_objects[&addr];
+                        guard!(
+                            self,
+                            !existing.is_pointer(),
+                            "scalar store clobbers pointer on stack"
+                        );
+                        self.stack_objects.remove(&addr);
+                    }
+                }
 
                 self.stack_objects.insert(dst, (store_size, src_state));
             }
@@ -1026,14 +1081,27 @@ impl<'a> VerifierState<'a> {
                     .spec
                     .value
                     .ok_or(self.err("map has no associated value BTF type"))?;
-                let offset = offset
+                let write_min = offset
+                    .min
+                    .checked_add_signed(insn.offset() as i32)
+                    .ok_or(self.err("store overflows map value"))?;
+                let write_max = offset
+                    .max
                     .checked_add_signed(insn.offset() as i32)
                     .ok_or(self.err("store overflows map value"))?;
                 guard!(
                     self,
                     bpf_map
                         .btf
-                        .is_offset_valid(map_val, offset, Some(store_size))
+                        .is_offset_valid(map_val, write_min, Some(store_size))
+                        == Some(true),
+                    "store at invalid map value offset"
+                );
+                guard!(
+                    self,
+                    bpf_map
+                        .btf
+                        .is_offset_valid(map_val, write_max, Some(store_size))
                         == Some(true),
                     "store at invalid map value offset"
                 );
@@ -1322,7 +1390,7 @@ fn decide_branch(op: u8, lhs: ExprVal, rhs: ExprVal) -> BranchResult {
             let mut result = BranchResult::default();
             let register_state = Some(RegisterState::PtrToMapValue {
                 map_fd: fd,
-                offset: 0,
+                offset: ScalarRange::exact(0),
             });
 
             match op {
@@ -1465,7 +1533,7 @@ mod tests {
     fn decide_branch_map_null() {
         let non_null = Some(RegisterState::PtrToMapValue {
             map_fd: 0,
-            offset: 0,
+            offset: ScalarRange::exact(0),
         });
 
         let cases: &[(

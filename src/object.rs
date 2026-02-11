@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     ffi::CStr,
     io::{Error, ErrorKind},
     rc::Rc,
@@ -107,6 +107,8 @@ impl<'file> EbpfObject<'file> {
         self.load_code(&prog, &mut program);
         self.resolve_relocations(&mut program);
 
+        let line_info = self.collect_lines(&program);
+
         Ok(EbpfProgram {
             insns: program.insns,
             sig: prog.clone(),
@@ -114,7 +116,52 @@ impl<'file> EbpfObject<'file> {
             btf: self.btf.clone(),
             map_relos: program.map_relos,
             data_relos: program.data_relos,
+            line_info,
         })
+    }
+
+    fn collect_lines(&self, program: &ProgLoader) -> BTreeMap<usize, LineEntry> {
+        let Some(btf) = &self.btf else {
+            return Default::default();
+        };
+        let mut line_info = BTreeMap::new();
+
+        for info in &btf.ext.line_info {
+            let Some(sec_name) = btf.string(info.sec_name_off) else {
+                continue;
+            };
+
+            let mut funcs: Vec<_> = program
+                .loaded_progs
+                .iter()
+                .filter(|((sec, _), _)| {
+                    self.file.section_by_index(*sec).unwrap().name().unwrap() == sec_name.as_ref()
+                })
+                .map(|((_, sec_off), dst_off)| (*sec_off, *dst_off))
+                .collect();
+            funcs.sort_by_key(|(sec_off, _)| *sec_off);
+
+            for line in &info.data {
+                let insn_off = line.insn_off as usize;
+                let Some(&(sec_off, dst_off)) =
+                    funcs.iter().rev().find(|(sec_off, _)| *sec_off <= insn_off)
+                else {
+                    continue;
+                };
+
+                let pc = dst_off + (insn_off - sec_off) / 8;
+                line_info.insert(
+                    pc,
+                    LineEntry {
+                        line_off: line.line_off,
+                        line_no: line.line_no,
+                        column_no: line.column_no,
+                    },
+                );
+            }
+        }
+
+        line_info
     }
 
     fn load_code(&self, prog: &FunctionSignature, loader: &mut ProgLoader) {
@@ -392,7 +439,7 @@ fn fixup_btf_datasecs<'a>(btf: &mut Btf, file: &'a File<'a, &'a [u8]>) {
         for info in &mut datasec.secinfos {
             btf.types
                 .get(&info.r#type)
-                .and_then(|ty| btf.name(ty.name_off))
+                .and_then(|ty| btf.string(ty.name_off))
                 .and_then(|name| file.symbol_by_name(name.as_ref()))
                 .inspect(|sym| info.offset = sym.address() as _);
         }
@@ -409,7 +456,7 @@ fn find_or_create_datasec(btf: &mut Btf, sec: &Section) -> BtfTypeId {
     let name = sec.name().unwrap();
 
     if let Some((id, _)) = btf.types.iter().find(|(_, ty)| {
-        matches!(&ty.kind, BtfKind::Datasec(_)) && btf.name(ty.name_off).is_some_and(|n| n == name)
+        matches!(&ty.kind, BtfKind::Datasec(_)) && btf.string(ty.name_off).is_some_and(|n| n == name)
     }) {
         return *id;
     }
@@ -451,7 +498,7 @@ fn parse_maps(btf: &Btf, maps_sec: &Section) -> std::result::Result<Vec<MapSpec>
     let secinfos = btf
         .types
         .values()
-        .filter(|ty| btf.name(ty.name_off).is_some_and(|n| n == sec_name))
+        .filter(|ty| btf.string(ty.name_off).is_some_and(|n| n == sec_name))
         .find_map(|ty| match &ty.kind {
             BtfKind::Datasec(datasec) => Some(&datasec.secinfos),
             _ => None,
@@ -468,7 +515,7 @@ fn parse_maps(btf: &Btf, maps_sec: &Section) -> std::result::Result<Vec<MapSpec>
             return Err("unexpected map btf type");
         };
 
-        let Some(map_name) = btf.name(btf_ty.name_off) else {
+        let Some(map_name) = btf.string(btf_ty.name_off) else {
             return Err("map type missing name");
         };
 
@@ -485,7 +532,7 @@ fn parse_maps(btf: &Btf, maps_sec: &Section) -> std::result::Result<Vec<MapSpec>
         };
 
         for member in &s.members {
-            let Some(name) = btf.name(member.name_off) else {
+            let Some(name) = btf.string(member.name_off) else {
                 panic!("struct member missing name");
             };
 
@@ -538,7 +585,7 @@ fn collect_functions<'file>(
     if let Some(btf) = btf {
         for info in &btf.ext.func_info {
             let sec_name = btf
-                .name(info.sec_name_off)
+                .string(info.sec_name_off)
                 .ok_or(LoaderError::InvalidBtfNameOffset(info.sec_name_off))?;
             for func in &info.data {
                 let offset = func.insn_off;
@@ -546,7 +593,7 @@ fn collect_functions<'file>(
                     .get_type(func.type_id)
                     .ok_or(LoaderError::InvalidBtfTypeId(func.type_id))?;
                 let func_name = btf
-                    .name(func.name_off)
+                    .string(func.name_off)
                     .ok_or(LoaderError::InvalidBtfNameOffset(func.name_off))?;
                 let proto = match &func.kind {
                     BtfKind::Func(func) => btf
@@ -563,7 +610,7 @@ fn collect_functions<'file>(
                     .params
                     .iter()
                     .map(|param| {
-                        let name = btf.name(param.name_off)?;
+                        let name = btf.string(param.name_off)?;
                         btf.get_type(param.r#type)?;
                         Some((name.to_string(), param.r#type))
                     })
@@ -641,6 +688,12 @@ fn collect_functions<'file>(
     Ok(functions)
 }
 
+pub struct LineEntry {
+    pub line_off: u32,
+    pub line_no: u32,
+    pub column_no: u32,
+}
+
 pub struct EbpfProgram {
     pub(crate) insns: Vec<Insn>,
     pub(crate) sig: Arc<FunctionSignature>,
@@ -648,6 +701,7 @@ pub struct EbpfProgram {
     pub(crate) btf: Option<Arc<Btf>>,
     pub(crate) map_relos: HashMap<usize, (SectionIndex, usize)>,
     pub(crate) data_relos: HashMap<usize, (SectionIndex, usize)>,
+    pub(crate) line_info: BTreeMap<usize, LineEntry>,
 }
 
 impl EbpfProgram {
@@ -665,23 +719,22 @@ impl EbpfProgram {
     /// An entrypoint that takes `__sk_buff` can be built with:
     ///
     /// ```
-    /// # use bepeefe::{vm::Vm, loader::*};
+    /// # use bepeefe::{vm::Vm, object::*};
     /// # let file = std::fs::read("./examples/bpf/map_array.o").unwrap();
-    /// let obj = EbpfObject::from_elf(&file);
-    /// let prog = obj.load_prog("entry");
+    /// let obj = EbpfObject::from_elf(&file).unwrap();
+    /// let prog = obj.load_prog("entry").unwrap();
     /// let ctx = prog
     ///     .build_ctx(
-    ///         "entry",
     ///         &[
-    ///             &[
+    ///             [
     ///                 ("local_port", Val::Number(3000)),
     ///                 ("len", Val::Number(64))
     ///             ].into()
     ///         ]
-    ///     ).expect("failed to build entrypoint");
+    ///     );
     /// # let mut vm = Vm::new();
-    /// let prog_id = vm.prepare(prog);
-    /// vm.run(prog_id, ctx);
+    /// let prog_id = vm.prepare(prog, Default::default());
+    /// vm.run(&prog_id, &ctx);
     /// ```
     ///
     /// The resulting `Entrypoint::ctx` will be a zeroed buffer of
@@ -739,7 +792,7 @@ fn build_ctx_val(btf: &Arc<Btf>, param_ty: &crate::btf::BtfType, ctx_val: &Val) 
             for ele in &s.members {
                 let member_ty = btf.get_type(ele.r#type).unwrap();
                 let name = btf
-                    .name(ele.name_off)
+                    .string(ele.name_off)
                     .unwrap_or_else(|| todo!("missing name"));
                 let member_size = member_ty.kind.size(btf).unwrap() as usize;
 
@@ -826,7 +879,7 @@ impl Val {
                 for ele in &s.members {
                     let member_ty = btf.get_type(ele.r#type).unwrap();
                     let name = btf
-                        .name(ele.name_off)
+                        .string(ele.name_off)
                         .unwrap_or_else(|| todo!("missing name"));
                     let member_size = member_ty.kind.size(btf).unwrap() as usize;
 
@@ -877,7 +930,7 @@ impl Val {
                 let mut map = HashMap::new();
                 for member in &s.members {
                     let member_ty = btf.get_type(member.r#type).unwrap();
-                    let name = btf.name(member.name_off).unwrap();
+                    let name = btf.string(member.name_off).unwrap();
                     let byte_offset = (member.offset / 8) as usize;
                     let member_size = member_ty.kind.size(btf).unwrap() as usize;
                     let val = Val::from_bytes(

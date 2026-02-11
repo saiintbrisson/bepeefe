@@ -36,13 +36,13 @@ impl Default for Btf {
 
 impl Btf {
     /// Finds a name at the given offset if the offset is within bounds.
-    pub fn name(&self, offset: u32) -> Option<Cow<'_, str>> {
+    pub fn string(&self, offset: u32) -> Option<Cow<'_, str>> {
         CStr::from_bytes_until_nul(self.strings.get(offset as usize..)?)
             .ok()
             .map(CStr::to_string_lossy)
     }
 
-    pub fn find_name(&self, name: &str) -> Option<u32> {
+    pub fn find_string(&self, name: &str) -> Option<u32> {
         if self.strings.len() < name.len() {
             return None;
         } else if name.len() == 0 {
@@ -53,10 +53,10 @@ impl Btf {
         loop {
             let (idx, _) = f.by_ref().skip_while(|(_, b)| **b == 0).next()?;
 
-            let bytes = self.strings.get(idx..idx + name.len() - 1)?;
-            let s = CStr::from_bytes_with_nul(bytes).ok()?.to_str().ok()?;
+            let bytes = self.strings.get(idx..)?;
+            let s = CStr::from_bytes_until_nul(bytes).ok()?.to_str().ok()?;
 
-            if s == name {
+            if s.starts_with(name) {
                 return Some(idx as u32);
             }
         }
@@ -106,18 +106,65 @@ impl Btf {
             | BtfKind::Restrict(idx) => self.is_offset_valid(*idx, offset, len),
             BtfKind::Array(array) => {
                 let elem_size = self.type_size(array.r#type)?;
-                let elem_offset = offset % elem_size;
-                self.is_offset_valid(array.r#type, elem_offset, len)
-            }
-            BtfKind::Struct(Struct { members, .. }) | BtfKind::Union(Union { members, .. }) => {
-                members.iter().find_map(|member| {
-                    let offset = offset.checked_sub(member.offset / u8::BITS)?;
-                    if offset + len.unwrap_or(0) > self.type_size(member.r#type)? {
-                        return None;
+                let size = match len {
+                    None => {
+                        return self.is_offset_valid(array.r#type, offset % elem_size, None);
+                    }
+                    Some(s) => s,
+                };
+
+                let mut remaining = size;
+                let mut cur_in_elem = offset % elem_size;
+
+                while remaining > 0 {
+                    let avail = elem_size - cur_in_elem;
+                    let chunk = remaining.min(avail);
+
+                    if self.is_offset_valid(array.r#type, cur_in_elem, Some(chunk))? != true {
+                        return Some(false);
                     }
 
-                    self.is_offset_valid(member.r#type, offset, len)
-                })
+                    remaining -= chunk;
+                    cur_in_elem = 0;
+                }
+
+                Some(true)
+            }
+            BtfKind::Struct(Struct { members, .. }) | BtfKind::Union(Union { members, .. }) => {
+                let size = match len {
+                    None => {
+                        return members.iter().find_map(|member| {
+                            let off = offset.checked_sub(member.offset / u8::BITS)?;
+                            self.is_offset_valid(member.r#type, off, None)
+                        });
+                    }
+                    Some(s) => s,
+                };
+
+                let mut remaining = size;
+                let mut cur = offset;
+
+                while remaining > 0 {
+                    let (member, off_in_member) = members.iter().find_map(|m| {
+                        let start = m.offset / u8::BITS;
+                        let off = cur.checked_sub(start)?;
+                        let msz = self.type_size(m.r#type)?;
+                        (off < msz).then_some((m, off))
+                    })?;
+
+                    let msz = self.type_size(member.r#type)?;
+                    let avail = msz - off_in_member;
+                    let chunk = remaining.min(avail);
+
+                    if self.is_offset_valid(member.r#type, off_in_member, Some(chunk))? != true {
+                        return Some(false);
+                    }
+
+                    cur += chunk;
+                    remaining -= chunk;
+                }
+
+                Some(true)
             }
             BtfKind::Datasec(datasec) if datasec.opaque => Some(true),
             BtfKind::Datasec(datasec) => datasec.secinfos.iter().find_map(|info| {
@@ -637,12 +684,93 @@ mod tests {
         let mut btf = Btf::default();
         btf.strings = b"\0struct\0func_name\0\0u32\0".to_vec();
 
-        assert_eq!(btf.name(1).unwrap(), "struct");
-        assert_eq!(btf.name(8).unwrap(), "func_name");
-        assert_eq!(btf.name(19).unwrap(), "u32");
+        assert_eq!(btf.string(1).unwrap(), "struct");
+        assert_eq!(btf.string(8).unwrap(), "func_name");
+        assert_eq!(btf.string(19).unwrap(), "u32");
 
-        assert_eq!(btf.find_name("struct").unwrap(), 1);
-        assert_eq!(btf.find_name("func_name").unwrap(), 8);
-        assert_eq!(btf.find_name("u32").unwrap(), 19);
+        assert_eq!(btf.find_string("struct").unwrap(), 1);
+        assert_eq!(btf.find_string("func_name").unwrap(), 8);
+        assert_eq!(btf.find_string("u32").unwrap(), 19);
+    }
+
+    // Builds a BTF matching struct snake { u32 dir; u8 len; u8 head; u16 body[64]; }
+    // Total size = 4 + 1 + 1 + 128 = 134. No padding between members.
+    fn make_snake_btf() -> (Btf, BtfTypeId) {
+        let mut b = BtfBuilder::default();
+        let u8_ty = b.add_int("u8", 1, 0);
+        let u16_ty = b.add_int("u16", 2, 0);
+        let u32_ty = b.add_int("u32", 4, 0);
+        let u32_idx = b.add_int("__u32", 4, 0);
+        let body_ty = b.add_array(u16_ty, u32_idx, 64);
+        let snake = b.make_struct("snake", 134, |s| {
+            s.field("dir", u32_ty, 0); // byte 0
+            s.field("len", u8_ty, 32); // byte 4
+            s.field("head", u8_ty, 40); // byte 5
+            s.field("body", body_ty, 48); // byte 6
+        });
+        (b.build(), snake)
+    }
+
+    #[test]
+    fn single_field_access() {
+        let (btf, snake) = make_snake_btf();
+        assert_eq!(btf.is_offset_valid(snake, 0, Some(4)), Some(true)); // dir
+        assert_eq!(btf.is_offset_valid(snake, 4, Some(1)), Some(true)); // len
+        assert_eq!(btf.is_offset_valid(snake, 5, Some(1)), Some(true)); // head
+        assert_eq!(btf.is_offset_valid(snake, 6, Some(2)), Some(true)); // body[0]
+        assert_eq!(btf.is_offset_valid(snake, 8, Some(2)), Some(true)); // body[1]
+    }
+
+    #[test]
+    fn coalesced_write_across_members() {
+        let (btf, snake) = make_snake_btf();
+        // len (1) + head (1) + body[0] (2) = 4 bytes at offset 4
+        assert_eq!(btf.is_offset_valid(snake, 4, Some(4)), Some(true));
+    }
+
+    #[test]
+    fn coalesced_write_across_array_elements() {
+        let (btf, snake) = make_snake_btf();
+        // body[0] (2) + body[1] (2) = 4 bytes at offset 6
+        assert_eq!(btf.is_offset_valid(snake, 6, Some(4)), Some(true));
+    }
+
+    #[test]
+    fn partial_primitive_rejected() {
+        let (btf, snake) = make_snake_btf();
+        // 2 bytes of a u32 (dir) is not a full-width access
+        assert_eq!(btf.is_offset_valid(snake, 0, Some(2)), Some(false));
+    }
+
+    #[test]
+    fn write_across_padding_rejected() {
+        // struct padded { u8 a; /* 1 byte pad */; u16 b; }
+        let mut b = BtfBuilder::default();
+        let u8_ty = b.add_int("u8", 1, 0);
+        let u16_ty = b.add_int("u16", 2, 0);
+        let padded = b.make_struct("padded", 4, |s| {
+            s.field("a", u8_ty, 0); // byte 0
+            s.field("b", u16_ty, 16); // byte 2, byte 1 is pad
+        });
+        let btf = b.build();
+
+        // Writing 4 bytes at offset 0 hits padding at byte 1
+        assert_eq!(btf.is_offset_valid(padded, 0, Some(4)), None);
+        // Single-field accesses still work
+        assert_eq!(btf.is_offset_valid(padded, 0, Some(1)), Some(true));
+        assert_eq!(btf.is_offset_valid(padded, 2, Some(2)), Some(true));
+    }
+
+    #[test]
+    fn mid_member_write_rejected() {
+        let (btf, snake) = make_snake_btf();
+        // Starting at byte 1 (mid-dir) makes no member start exactly there
+        assert_eq!(btf.is_offset_valid(snake, 1, Some(1)), Some(false));
+    }
+
+    #[test]
+    fn write_past_struct_rejected() {
+        let (btf, snake) = make_snake_btf();
+        assert_eq!(btf.is_offset_valid(snake, 133, Some(2)), Some(false));
     }
 }

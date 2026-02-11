@@ -1,7 +1,7 @@
 use std::ffi::CStr;
 
 use super::Insn;
-use crate::verifier::RegisterState;
+use crate::verifier::{RegisterState, ScalarRange};
 
 /// JMP instructions OP mask
 pub const JMP_OP_MASK: u8 = 0b11110000;
@@ -206,7 +206,7 @@ helper_table! {
             };
             let map = vm.map_by_fd(map_fd).unwrap();
             if map.spec.r#type == Some(crate::maps::BPF_MAP_TYPE_ARRAY) {
-                RegisterState::PtrToMapValue { map_fd, offset: 0 }
+                RegisterState::PtrToMapValue { map_fd, offset: ScalarRange::exact(0) }
             } else {
                 RegisterState::PtrToMapValueOrNull { map_fd }
             }

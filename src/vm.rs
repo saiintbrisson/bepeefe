@@ -154,7 +154,70 @@ impl Vm {
 
         let prog = Arc::new(prog);
         let verifier = VerifierState::new(&self, prog.clone()).unwrap();
-        verifier.run().expect("verification failed");
+        if let Err(err) = verifier.run() {
+            match &err {
+                crate::verifier::VerifierError::Other {
+                    insn,
+                    insn_off,
+                    msg,
+                    registers,
+                } => {
+                    let btf = prog.btf.as_ref();
+                    let radius = 3;
+                    let start = insn_off.saturating_sub(radius);
+                    let end = (insn_off + radius + 1).min(prog.insns.len());
+
+                    eprintln!();
+                    let mut prev_line_off: Option<u32> = None;
+                    for pc in start..end {
+                        let cur = prog.insns[pc];
+                        let next = prog.insns.get(pc + 1).copied();
+                        let dis = crate::vm::debugger::disasm(cur, next);
+
+                        let line_entry = btf.and_then(|b| {
+                            let entry = prog.line_info.get(&pc)?;
+                            let line = b.string(entry.line_off)?;
+                            Some((entry.line_off, entry.line_no, line.into_owned()))
+                        });
+
+                        let src_line = match &line_entry {
+                            Some((off, _, _)) if prev_line_off == Some(*off) => String::new(),
+                            Some((_, line_no, line)) => {
+                                format!("        // @ {line_no}: {}", line.trim())
+                            }
+                            None => String::new(),
+                        };
+
+                        if let Some((off, _, _)) = &line_entry {
+                            prev_line_off = Some(*off);
+                        }
+
+                        if pc == *insn_off {
+                            eprintln!("  > {pc:>3}: {dis}{src_line}");
+                            eprintln!("         ^ {msg}");
+
+                            let dst = insn.dst_reg();
+                            let src = insn.src_reg();
+                            eprintln!(
+                                "         r{dst} = {:?}{}",
+                                registers[dst as usize],
+                                if src != dst {
+                                    format!(", r{src} = {:?}", registers[src as usize])
+                                } else {
+                                    String::new()
+                                }
+                            );
+                        } else {
+                            eprintln!("    {pc:>3}: {dis}{src_line}");
+                        }
+                    }
+                    eprintln!();
+                }
+                err => eprintln!("{err}"),
+            }
+
+            panic!("verification failed: {err}")
+        };
 
         PreparedProgram(prog)
     }
