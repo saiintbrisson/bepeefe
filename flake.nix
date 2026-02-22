@@ -24,18 +24,12 @@
             just
             git
 
-            llvmPackages_19.libllvm
-            llvmPackages_19.stdenv
-            llvmPackages_19.libcxx
-            llvmPackages_19.libcxxStdenv
-            llvmPackages_19.clang-unwrapped
+            libllvm
+            libclang
           ];
 
           shellHook = ''
-            export C_INCLUDE_PATH="${pkgs.llvmPackages_19.clang-unwrapped.lib}/lib/clang/19/include"
-            export CPLUS_INCLUDE_PATH="${pkgs.llvmPackages_19.libcxx.dev}/include/c++/v1:${pkgs.llvmPackages_19.clang-unwrapped.lib}/lib/clang/19/include"
-
-            export PATH="${pkgs.llvmPackages_19.clang-unwrapped}/bin:$PATH"
+            export PATH="${pkgs.libllvm}/bin:$PATH"
             echo "Using clang version: $(clang --version | head -n1)"
           '';
         };

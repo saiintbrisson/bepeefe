@@ -12,9 +12,10 @@ use object::{
 };
 
 use crate::{
-    btf::{Btf, BtfKind, BtfType, BtfTypeId, ext::BtfExt},
+    btf::{Btf, BtfKind, BtfTypeId, ext::BtfExt},
     isa::Insn,
     maps::{BPF_MAP_TYPE_ARRAY, MapPinning, MapSpec},
+    value::ProgramValue,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -43,7 +44,7 @@ pub struct EbpfObject<'file> {
     functions: Vec<Arc<FunctionSignature>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FunctionSignature {
     pub name: String,
     pub is_global: bool,
@@ -456,7 +457,8 @@ fn find_or_create_datasec(btf: &mut Btf, sec: &Section) -> BtfTypeId {
     let name = sec.name().unwrap();
 
     if let Some((id, _)) = btf.types.iter().find(|(_, ty)| {
-        matches!(&ty.kind, BtfKind::Datasec(_)) && btf.string(ty.name_off).is_some_and(|n| n == name)
+        matches!(&ty.kind, BtfKind::Datasec(_))
+            && btf.string(ty.name_off).is_some_and(|n| n == name)
     }) {
         return *id;
     }
@@ -617,9 +619,11 @@ fn collect_functions<'file>(
                     .collect::<Option<Vec<_>>>()
                     .ok_or_else(|| todo!("invalid func params"))?;
 
-                let _ = btf
-                    .get_type(proto.return_type)
-                    .ok_or_else(|| todo!("invalid func return"));
+                if proto.return_type > BtfTypeId(0) {
+                    let _ = btf
+                        .get_type(proto.return_type)
+                        .ok_or_else(|| todo!("invalid func return"));
+                }
 
                 ext_programs.insert(
                     (sec_name.clone(), func_name.clone()),
@@ -719,28 +723,24 @@ impl EbpfProgram {
     /// An entrypoint that takes `__sk_buff` can be built with:
     ///
     /// ```
-    /// # use bepeefe::{vm::Vm, object::*};
+    /// # use bepeefe::{vm::Vm, object::*, ProgramValue};
     /// # let file = std::fs::read("./examples/bpf/map_array.o").unwrap();
     /// let obj = EbpfObject::from_elf(&file).unwrap();
     /// let prog = obj.load_prog("entry").unwrap();
-    /// let ctx = prog
-    ///     .build_ctx(
-    ///         &[
-    ///             [
-    ///                 ("local_port", Val::Number(3000)),
-    ///                 ("len", Val::Number(64))
-    ///             ].into()
-    ///         ]
-    ///     );
+    /// let ctx = prog.build_ctx(&[ProgramValue::from([
+    ///     ("local_port", ProgramValue::Number(3000)),
+    ///     ("len", ProgramValue::Number(64)),
+    /// ])]);
     /// # let mut vm = Vm::new();
     /// let prog_id = vm.prepare(prog, Default::default());
     /// vm.run(&prog_id, &ctx);
     /// ```
     ///
-    /// The resulting `Entrypoint::ctx` will be a zeroed buffer of
-    /// the size of the `__sk_buff` struct as described by the BTF
-    /// type, populated with the `local_port` and `len` fields.
-    pub fn build_ctx(&self, ctx_params: &[Val]) -> Vec<Context> {
+    /// The resulting context will be a zeroed buffer of the size
+    /// of the `__sk_buff` struct as described by BTF, populated
+    /// with the `local_port` and `len` fields. Any type that
+    /// implements `serde::Serialize` can be passed directly.
+    pub fn build_ctx<T: serde::Serialize>(&self, ctx_params: &[T]) -> Vec<Context> {
         assert_eq!(
             self.sig.params_types.len(),
             ctx_params.len(),
@@ -760,63 +760,29 @@ impl EbpfProgram {
         let mut ctx = Vec::with_capacity(self.sig.params_types.len());
 
         for ((_, param_ty), ctx_val) in params {
-            ctx.push(build_ctx_val(btf, param_ty, ctx_val));
+            let val = crate::value::to_value(ctx_val).unwrap();
+            ctx.push(build_ctx_val(btf, param_ty, &val));
         }
 
         ctx
     }
 }
 
-fn build_ctx_val(btf: &Arc<Btf>, param_ty: &crate::btf::BtfType, ctx_val: &Val) -> Context {
-    let size = param_ty.kind.size(btf).unwrap() as usize;
-
+fn build_ctx_val(
+    btf: &Arc<Btf>,
+    param_ty: &crate::btf::BtfType,
+    ctx_val: &ProgramValue,
+) -> Context {
     match ctx_val {
-        Val::Zeroed => Context::Buffer(vec![0; size]),
-        Val::Number(num) => {
+        ProgramValue::Number(num) => {
             ctx_val.to_bytes(btf, param_ty);
             Context::Value(*num as u64)
         }
-        Val::Map(map) => {
-            let BtfKind::Ptr(p) = &param_ty.kind else {
-                todo!("expected param to be ptr");
-            };
-            let ptr = btf
-                .get_type(*p)
-                .unwrap_or_else(|| todo!("ptr points to invalid btf type"));
-            let BtfKind::Struct(s) = &ptr.kind else {
-                todo!("expected param to be struct");
-            };
-
-            let mut used_fields = Vec::with_capacity(map.len());
-            let mut buf = Vec::with_capacity(size);
-            for ele in &s.members {
-                let member_ty = btf.get_type(ele.r#type).unwrap();
-                let name = btf
-                    .string(ele.name_off)
-                    .unwrap_or_else(|| todo!("missing name"));
-                let member_size = member_ty.kind.size(btf).unwrap() as usize;
-
-                let Some(member_val) = map.get(name.as_ref()) else {
-                    buf.resize(buf.len() + member_size, 0);
-                    continue;
-                };
-
-                match build_ctx_val(btf, member_ty, member_val) {
-                    Context::Buffer(items) => buf.extend(items),
-                    Context::Value(v) => buf.extend(&v.to_ne_bytes()[..member_size]),
-                }
-
-                used_fields.push(name);
-            }
-
-            for (struct_field, _) in map {
-                if !used_fields.contains(&struct_field.as_str().into()) {
-                    todo!("field {struct_field:?} does not exist in struct");
-                }
-            }
-
-            Context::Buffer(buf)
+        ProgramValue::Float(f) => {
+            ctx_val.to_bytes(btf, param_ty);
+            Context::Value(f.to_bits())
         }
+        _ => Context::Buffer(ctx_val.to_bytes(btf, param_ty)),
     }
 }
 
@@ -824,131 +790,4 @@ fn build_ctx_val(btf: &Arc<Btf>, param_ty: &crate::btf::BtfType, ctx_val: &Val) 
 pub enum Context {
     Buffer(Vec<u8>),
     Value(u64),
-}
-
-#[derive(Clone, Debug, Default)]
-pub enum Val {
-    #[default]
-    Zeroed,
-    Number(i64),
-    Map(HashMap<String, Val>),
-}
-
-impl Val {
-    pub fn to_bytes<'b>(&self, btf: &'b Btf, mut ty: &'b BtfType) -> Vec<u8> {
-        let size = ty.kind.size(btf).unwrap() as usize;
-
-        match self {
-            Val::Zeroed => vec![0; size],
-            Val::Number(num) => match &ty.kind {
-                BtfKind::Int(int) => {
-                    if num.unbounded_shr(int.bits as _) > 0 {
-                        todo!("number {num} is larger than param size ({} bits)", int.bits);
-                    }
-                    num.to_ne_bytes()[..int.size as usize].to_vec()
-                }
-                BtfKind::Enum(e) => {
-                    e.values
-                        .iter()
-                        .find(|v| v.val == *num as i32)
-                        .expect("incorrect enum value");
-                    num.to_ne_bytes()[..e.size as usize].to_vec()
-                }
-                BtfKind::Enum64(e) => {
-                    e.values
-                        .iter()
-                        .find(|v| ((v.val_hi32 as i64) << 32 | v.val_lo32 as i64) == *num)
-                        .expect("incorrect enum64 value");
-                    num.to_ne_bytes()[..e.size as usize].to_vec()
-                }
-                _ => todo!("expected numeric type"),
-            },
-            Val::Map(map) => {
-                if let BtfKind::Ptr(p) = &ty.kind {
-                    ty = btf
-                        .get_type(*p)
-                        .unwrap_or_else(|| todo!("ptr points to invalid btf type"));
-                }
-
-                let BtfKind::Struct(s) = &ty.kind else {
-                    todo!("expected param to be struct");
-                };
-
-                let mut used_fields = Vec::with_capacity(map.len());
-                let mut buf = Vec::with_capacity(size);
-                for ele in &s.members {
-                    let member_ty = btf.get_type(ele.r#type).unwrap();
-                    let name = btf
-                        .string(ele.name_off)
-                        .unwrap_or_else(|| todo!("missing name"));
-                    let member_size = member_ty.kind.size(btf).unwrap() as usize;
-
-                    let Some(member_val) = map.get(name.as_ref()) else {
-                        buf.resize(buf.len() + member_size, 0);
-                        continue;
-                    };
-
-                    buf.extend(member_val.to_bytes(btf, member_ty));
-
-                    used_fields.push(name);
-                }
-
-                for (struct_field, _) in map {
-                    if !used_fields.contains(&struct_field.as_str().into()) {
-                        todo!("field {struct_field:?} does not exist in struct");
-                    }
-                }
-
-                buf
-            }
-        }
-    }
-}
-
-impl Val {
-    pub fn from_bytes(btf: &Btf, ty: &BtfType, bytes: &[u8]) -> Val {
-        match &ty.kind {
-            BtfKind::Int(int) => {
-                let size = int.size as usize;
-                let mut buf = [0u8; 8];
-                buf[..size].copy_from_slice(&bytes[..size]);
-                Val::Number(i64::from_ne_bytes(buf))
-            }
-            BtfKind::Enum(e) => {
-                let size = e.size as usize;
-                let mut buf = [0u8; 8];
-                buf[..size].copy_from_slice(&bytes[..size]);
-                Val::Number(i64::from_ne_bytes(buf))
-            }
-            BtfKind::Enum64(e) => {
-                let size = e.size as usize;
-                let mut buf = [0u8; 8];
-                buf[..size].copy_from_slice(&bytes[..size]);
-                Val::Number(i64::from_ne_bytes(buf))
-            }
-            BtfKind::Struct(s) => {
-                let mut map = HashMap::new();
-                for member in &s.members {
-                    let member_ty = btf.get_type(member.r#type).unwrap();
-                    let name = btf.string(member.name_off).unwrap();
-                    let byte_offset = (member.offset / 8) as usize;
-                    let member_size = member_ty.kind.size(btf).unwrap() as usize;
-                    let val = Val::from_bytes(
-                        btf,
-                        member_ty,
-                        &bytes[byte_offset..byte_offset + member_size],
-                    );
-                    map.insert(name.to_string(), val);
-                }
-                Val::Map(map)
-            }
-            _ => todo!("from_bytes: unsupported BTF kind"),
-        }
-    }
-}
-
-impl<const N: usize> From<[(&str, Val); N]> for Val {
-    fn from(value: [(&str, Val); N]) -> Self {
-        Self::Map(value.map(|(key, val)| (key.to_owned(), val)).into())
-    }
 }

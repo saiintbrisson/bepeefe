@@ -49,7 +49,8 @@ macro_rules! mem_insns {
                 let offset = insn.offset();
 
                 let ptr = (state.registers[src as usize] as isize + offset as isize) as usize;
-                let val: [_; SIZE] = state.mem.read_as(ptr).unwrap();
+                let val: [_; SIZE] = state.mem.read_as(ptr)
+                    .unwrap_or_else(|| panic!("{} @ {}: invalid ptr for size", stringify!($ld), state.code.pc() - 1));
 
                 state.registers[dst as usize] = $size::from_ne_bytes(val) as u64;
             }

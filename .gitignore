@@ -1,2 +1,7 @@
+/examples/**/target
 /target
+
+# sshfs files
+._*
+
 *.o

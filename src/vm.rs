@@ -8,7 +8,8 @@ use crate::{
         load::{BPF_PSEUDO_MAP_FD, BPF_PSEUDO_MAP_VALUE},
     },
     maps::{BpfMap, MapPinning, MapRepr},
-    object::{Context, EbpfProgram, Val},
+    object::{Context, EbpfProgram},
+    value::ProgramValue,
     verifier::VerifierState,
 };
 
@@ -385,17 +386,16 @@ pub struct MapHandle<'a> {
 }
 
 impl<'a> MapHandle<'a> {
-    pub fn update(&mut self, key: &Val, val: &Val) -> std::io::Result<()> {
-        let key_ty = self
-            .map
-            .btf
-            .get_type(self.map.spec.key.clone().unwrap())
-            .unwrap();
-        let val_ty = self
-            .map
-            .btf
-            .get_type(self.map.spec.value.clone().unwrap())
-            .unwrap();
+    pub fn update(
+        &mut self,
+        key: &(impl serde::Serialize + ?Sized),
+        val: &(impl serde::Serialize + ?Sized),
+    ) -> std::io::Result<()> {
+        let key = crate::value::to_value(key).unwrap();
+        let val = crate::value::to_value(val).unwrap();
+
+        let key_ty = self.map.btf.get_type(self.map.spec.key.unwrap()).unwrap();
+        let val_ty = self.map.btf.get_type(self.map.spec.value.unwrap()).unwrap();
 
         let key = key.to_bytes(&self.map.btf, key_ty);
         let val = val.to_bytes(&self.map.btf, val_ty);
@@ -403,26 +403,28 @@ impl<'a> MapHandle<'a> {
         self.map.repr.update(&mut self.mem, &key, &val)
     }
 
-    pub fn push_as_val(&mut self, val: &Val) -> std::io::Result<()> {
-        let val_ty = self
-            .map
-            .btf
-            .get_type(self.map.spec.value.clone().unwrap())
-            .unwrap();
+    pub fn push(&mut self, val: &(impl serde::Serialize + ?Sized)) -> std::io::Result<()> {
+        let val = crate::value::to_value(val).unwrap();
+        let val_ty = self.map.btf.get_type(self.map.spec.value.unwrap()).unwrap();
 
         let val = val.to_bytes(&self.map.btf, val_ty);
         self.map.repr.push(&mut self.mem, &val)
     }
 
-    pub fn pop_as_val(&mut self) -> Option<Val> {
+    pub fn pop<T: for<'de> serde::Deserialize<'de>>(&mut self) -> Option<T> {
         let val_ty = self.map.btf.get_type(self.map.spec.value.unwrap()).unwrap();
 
         let addr = self.map.repr.pop(&self.mem)?;
         let bytes = self.mem.slice(addr, self.map.repr.value_size())?;
-        Some(Val::from_bytes(&self.map.btf, val_ty, bytes))
+        let pv = ProgramValue::from_bytes(&self.map.btf, val_ty, bytes);
+        Some(crate::value::from_value(pv).unwrap())
     }
 
-    pub fn lookup_as_val(&self, key: &Val) -> Option<Val> {
+    pub fn lookup<T: for<'de> serde::Deserialize<'de>>(
+        &self,
+        key: &(impl serde::Serialize + ?Sized),
+    ) -> Option<T> {
+        let key = crate::value::to_value(key).unwrap();
         let key_ty = self.map.btf.get_type(self.map.spec.key.unwrap()).unwrap();
         let val_ty = self.map.btf.get_type(self.map.spec.value.unwrap()).unwrap();
 
@@ -430,7 +432,8 @@ impl<'a> MapHandle<'a> {
         let addr = self.map.repr.lookup(&self.mem, &key)?;
         let bytes = self.mem.slice(addr, self.map.repr.value_size())?;
 
-        Some(Val::from_bytes(&self.map.btf, val_ty, bytes))
+        let pv = ProgramValue::from_bytes(&self.map.btf, val_ty, bytes);
+        Some(crate::value::from_value(pv).unwrap())
     }
 
     pub fn clear(&mut self) {
