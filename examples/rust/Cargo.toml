@@ -5,7 +5,6 @@ edition = "2024"
 
 [target.'cfg(not(target_arch = "bpf"))'.dependencies]
 bepeefe = { path = "../.." }
-rand = "0.9.2"
 crossterm = "0.29.0"
 serde = { version = "1.0.228", features = ["derive"] }
 

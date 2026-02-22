@@ -64,7 +64,9 @@ mod parser {
 
     #[derive(Clone, Debug)]
     struct BtfExtHeader {
+        #[allow(dead_code)]
         version: u8,
+        #[allow(dead_code)]
         flags: u8,
         hdr_len: u32,
 
@@ -134,11 +136,11 @@ mod parser {
             let num_info = data.read_u32::<LittleEndian>()? as usize;
 
             let len = record_size * num_info;
-            let mut rec_data = &mut &data[..len];
+            let rec_data = &mut &data[..len];
 
-            let mut records = Vec::with_capacity(num_info as usize);
+            let mut records = Vec::with_capacity(num_info);
             for _ in 0..num_info {
-                records.push(R::read_record(&mut rec_data)?);
+                records.push(R::read_record(rec_data)?);
             }
 
             info_vec.push(InfoSec {

@@ -41,29 +41,26 @@ pub const SIZE_DW: u8 = 3 << 3;
 macro_rules! mem_insns {
     ($($ld:ident, $st:ident, $size:ident;)+) => {
         $(
-            pub fn $ld(state: &mut crate::vm::Vm, insn: Insn) {
+            pub fn $ld(state: &mut crate::vm::State, insn: Insn) {
                 const SIZE: usize = ($size::BITS / 8) as usize;
 
                 let src = insn.src_reg() as usize;
                 let dst = insn.dst_reg() as usize;
-                let offset = insn.offset();
 
-                let ptr = (state.registers[src as usize] as isize + offset as isize) as usize;
-                let val: [_; SIZE] = state.mem.read_as(ptr)
-                    .unwrap_or_else(|| panic!("{} @ {}: invalid ptr for size", stringify!($ld), state.code.pc() - 1));
+                let ptr = state.registers[src as usize].saturating_add_signed(insn.offset() as i64);
+                let val: [_; SIZE] = state.read(ptr);
 
                 state.registers[dst as usize] = $size::from_ne_bytes(val) as u64;
             }
 
-            pub fn $st(state: &mut crate::vm::Vm, insn: Insn) {
+            pub fn $st(state: &mut crate::vm::State, insn: Insn) {
                 let src = insn.src_reg() as usize;
                 let dst = insn.dst_reg() as usize;
-                let offset = insn.offset();
 
+                let ptr = state.registers[dst as usize].saturating_add_signed(insn.offset() as i64);
                 let val = state.registers[src as usize] as $size;
-                let ptr = (state.registers[dst as usize] as isize + offset as isize) as usize;
 
-                state.mem.write_slice(ptr, &val.to_ne_bytes()).expect("failed to write");
+                state.write(ptr, &val.to_ne_bytes());
             }
         )+
     };
@@ -105,25 +102,25 @@ pub const BPF_PSEUDO_MAP_VALUE: u8 = 2;
 /// Ref: <https://www.rfc-editor.org/rfc/rfc9669.html#name-64-bit-immediate-instructio>
 /// Ref: <https://github.com/torvalds/linux/blob/7ea30958b3054f5e488fa0b33c352723f7ab3a2a/kernel/bpf/verifier.c#L20519>
 /// Ref: <https://mechpen.github.io/posts/2019-08-03-bpf-map/>
-pub fn ld_imm64(state: &mut crate::vm::Vm, insn: Insn) {
+pub fn ld_imm64(state: &mut crate::vm::State, insn: Insn) {
     let dst = insn.dst_reg() as usize;
     let imm = insn.imm();
 
-    let next_imm = (state.code.step().unwrap().imm() as u64) << 32;
+    let next_imm = (state.prog.insns[state.pc].imm() as u64) << 32;
+    state.pc += 1;
 
     match insn.src_reg() {
         0 => state.registers[dst] = next_imm | imm as u64,
-        BPF_PSEUDO_MAP_FD => {
-            assert!(state.map_by_fd_exists(insn.imm()));
-            state.registers[dst] = imm as u64;
-        }
+        BPF_PSEUDO_MAP_FD => state.registers[dst] = imm as u64,
         BPF_PSEUDO_MAP_VALUE => {
             let map = state
-                .map_by_fd(imm)
+                .prog
+                .vm
+                .find_map(imm as u16)
                 .expect("PSEUDO_MAP_VALUE: invalid map fd");
             let base = map
                 .repr
-                .lookup(&state.mem, &0u32.to_ne_bytes())
+                .lookup(&0u32.to_ne_bytes())
                 .expect("PSEUDO_MAP_VALUE: entry 0 not found");
             state.registers[dst] = base as u64 + (next_imm >> 32);
         }
@@ -147,36 +144,29 @@ pub const ATOMIC_XCHG: u8 = 0xE0 | ATOMIC_FETCH;
 /// Atomic compare and exchange
 pub const ATOMIC_CMPXCHG: u8 = 0xF0;
 
-pub fn stx_atomic_dw(state: &mut crate::vm::Vm, insn: Insn) {
+pub fn stx_atomic_dw(state: &mut crate::vm::State, insn: Insn) {
     let src = insn.src_reg() as usize;
     let dst = insn.dst_reg() as usize;
     let imm = insn.imm();
-    let offset = insn.offset();
 
-    let ptr = (state.registers[dst as usize] as isize + offset as isize) as usize;
+    let ptr = state.registers[dst as usize].saturating_add_signed(insn.offset() as i64);
 
     match imm as u8 & 0xF0 {
         ATOMIC_ADD => {
-            let val = u64::from_ne_bytes(state.mem.read_as(ptr).expect("failed to read"));
-            let new_val = val + state.registers[src as usize];
-            state
-                .mem
-                .write_slice(ptr, &new_val.to_ne_bytes())
-                .expect("failed to write");
+            let val = u64::from_ne_bytes(state.read(ptr));
+            let new_val = val + state.registers[src];
+            state.write(ptr, &new_val.to_ne_bytes());
             if imm as u8 & ATOMIC_FETCH != 0 {
-                state.registers[src as usize] = val;
+                state.registers[src] = val;
             }
         }
         ATOMIC_CMPXCHG if imm as u8 & ATOMIC_FETCH > 0 => {
             let expected = state.registers[0];
-            let new_val = state.registers[src as usize];
-            let old_val = u64::from_ne_bytes(state.mem.read_as(ptr).expect("failed to read"));
+            let new_val = state.registers[src];
+            let old_val = u64::from_ne_bytes(state.read(ptr));
 
             if expected == old_val {
-                state
-                    .mem
-                    .write_slice(ptr, &new_val.to_ne_bytes())
-                    .expect("failed to write");
+                state.write(ptr, &new_val.to_ne_bytes());
             }
 
             state.registers[0] = old_val;

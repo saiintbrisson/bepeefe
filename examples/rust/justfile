@@ -1,5 +1,2 @@
 run bin="hash_map":
     cargo run --bin {{bin}}
-
-build-bpf:
-    RUSTFLAGS="-C debuginfo=2 -C link-arg=--btf" cargo +nightly build --release -Z build-std --target bpfel-unknown-none

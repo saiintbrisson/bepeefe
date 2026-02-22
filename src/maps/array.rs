@@ -1,13 +1,12 @@
 use std::{
     alloc::Layout,
     io::{ErrorKind, Result},
+    sync::Mutex,
 };
-
-use crate::vm::mem::{Memory, Region};
 
 #[derive(Debug)]
 pub struct Array {
-    region: Region,
+    region: Mutex<Vec<u8>>,
 
     max_entries: usize,
 
@@ -18,7 +17,7 @@ pub struct Array {
 }
 
 impl Array {
-    pub fn new(mem: &mut Memory, max_entries: u32, value_size: u32) -> Self {
+    pub fn new(max_entries: u32, value_size: u32) -> Self {
         assert!(max_entries > 0, "max entries must be greater than 0");
         assert!(value_size > 0, "value size must be greater than 0");
 
@@ -30,16 +29,10 @@ impl Array {
         let element_layout = Layout::from_size_align(value_size, 8).expect("invalid value size");
         let stride_layout = element_layout.pad_to_align();
 
-        let map_layout = Layout::from_size_align(
-            stride_layout.size() * max_entries,
-            stride_layout.align(),
-        )
-        .expect("invalid map config");
-
-        let region = mem.alloc_layout(map_layout).expect("vm mem oom");
+        let total = stride_layout.size() * max_entries;
 
         Self {
-            region,
+            region: Mutex::new(vec![0u8; total]),
             max_entries,
             element_layout,
             stride_layout,
@@ -54,7 +47,7 @@ impl Array {
         self.element_layout.size()
     }
 
-    pub fn lookup(&self, _: &Memory, key: &[u8]) -> Option<usize> {
+    pub fn lookup(&self, key: &[u8]) -> Option<usize> {
         let key: [u8; 4] = key.try_into().ok()?;
         let key = u32::from_ne_bytes(key) as usize;
 
@@ -62,43 +55,61 @@ impl Array {
             return None;
         }
 
-        Some(self.region.start() + self.stride_layout.size() * key)
+        Some(self.stride_layout.size() * key)
     }
 
-    pub fn update(&mut self, mem: &mut Memory, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn update(&self, key: &[u8], value: &[u8]) -> Result<()> {
         if value.len() != self.element_layout.size() {
             return Err(ErrorKind::InvalidInput.into());
         }
 
-        let key: [u8; 4] = key.try_into().map_err(|_| ErrorKind::InvalidInput)?;
-        let key = u32::from_ne_bytes(key) as usize;
-        if key >= self.max_entries {
-            return Err(ErrorKind::InvalidInput.into());
-        }
-
-        let addr = self.region.start() + self.stride_layout.size() * key;
-        mem.write_slice(addr, value)
+        let offset = self.lookup(key).ok_or(ErrorKind::InvalidInput)?;
+        let mut data = self.region.lock().unwrap();
+        data[offset..offset + value.len()].copy_from_slice(value);
+        Ok(())
     }
 
-    pub fn clear(&self, mem: &mut Memory) {
-        let size = self.stride_layout.size() * self.max_entries;
-        mem.write_slice(self.region.start(), &vec![0u8; size])
-            .expect("clear: region out of bounds");
+    pub fn clear(&self) {
+        self.region.lock().unwrap().fill(0);
     }
 
-    pub(crate) fn update_from_guest(
-        &mut self,
-        mem: &mut Memory,
-        key_addr: usize,
-        value_addr: usize,
-    ) -> Result<()> {
-        let key = u32::from_ne_bytes(mem.read_as(key_addr).ok_or(ErrorKind::InvalidInput)?);
+    /// Reads N bytes from the map storage at the given offset,
+    /// ensuring the read stays within a single element's value bounds.
+    pub fn read<const N: usize>(&self, offset: usize) -> Option<[u8; N]> {
+        self.check_bounds(offset, N)?;
+        let data = self.region.lock().unwrap();
+        Some(data[offset..offset + N].try_into().unwrap())
+    }
 
-        if key as usize >= self.max_entries {
-            return Err(ErrorKind::InvalidInput.into());
+    /// Writes bytes to the map storage at the given offset,
+    /// ensuring the write stays within a single element's value bounds.
+    pub fn write(&self, offset: usize, src: &[u8]) -> Result<()> {
+        self.check_bounds(offset, src.len())
+            .ok_or(ErrorKind::InvalidInput)?;
+        let mut data = self.region.lock().unwrap();
+        data[offset..offset + src.len()].copy_from_slice(src);
+        Ok(())
+    }
+
+    pub fn read_bytes(&self, offset: usize, len: usize) -> Option<Vec<u8>> {
+        self.check_bounds(offset, len)?;
+        let data = self.region.lock().unwrap();
+        Some(data[offset..offset + len].to_vec())
+    }
+
+    /// Ensures an access at `offset` of `len` bytes stays within
+    /// a single element's value region, never overflowing into
+    /// stride padding or adjacent entries.
+    fn check_bounds(&self, offset: usize, len: usize) -> Option<()> {
+        let stride = self.stride_layout.size();
+        let value_size = self.element_layout.size();
+
+        if offset + len > stride * self.max_entries {
+            return None;
         }
-
-        let dest = self.region.start() + key as usize * self.stride_layout.size();
-        mem.copy_within(value_addr, dest, self.element_layout.size())
+        if offset % stride + len > value_size {
+            return None;
+        }
+        Some(())
     }
 }

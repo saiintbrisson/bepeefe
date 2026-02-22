@@ -217,14 +217,14 @@ pub fn disasm_brief(insn: Insn, next: Option<Insn>) -> String {
     }
 }
 
-pub fn debugger(vm: &super::Vm, insn: Insn) -> String {
+pub fn debugger(state: &super::State, insn: Insn) -> String {
     let dst = insn.dst_reg();
     let src = insn.src_reg();
     let imm = insn.imm();
     let off = insn.offset();
-    let dst_val = vm.registers[dst as usize];
-    let src_val = vm.registers[src as usize];
-    let next = vm.code.peek();
+    let dst_val = state.registers[dst as usize];
+    let src_val = state.registers[src as usize];
+    let next = state.prog.insns.get(state.pc).copied();
 
     let brief = disasm_brief(insn, next);
     let ann = if brief.is_empty() {

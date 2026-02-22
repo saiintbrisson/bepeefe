@@ -3,8 +3,7 @@ use std::time::Duration;
 
 use bepeefe::{EbpfObject, ProgramValue, Vm, vm::MapReuseStrategy};
 use crossterm::{
-    ExecutableCommand,
-    cursor, event,
+    ExecutableCommand, cursor, event,
     terminal::{self, ClearType},
 };
 use rand::Rng;
@@ -19,7 +18,7 @@ fn main() {
 
     let prog = obj.load_prog("on_tick").unwrap();
 
-    let mut vm = Vm::new();
+    let vm = Vm::new();
     let prog = vm.prepare(prog, MapReuseStrategy::None);
 
     let mut grid = [[' '; GRID_W]; GRID_H];
@@ -55,7 +54,7 @@ fn main() {
                 ProgramValue::Number(rand::rng().random::<i32>() as _),
             ),
         ])]);
-        vm.run(&prog, &ctx);
+        let r0 = prog.run(&ctx);
 
         let mut map = vm.map("render_events");
         while let Some(ProgramValue::Map(ev)) = map.pop::<ProgramValue>() {
@@ -74,7 +73,7 @@ fn main() {
             };
         }
 
-        let new_score = vm.registers[0] as i32;
+        let new_score = r0 as i32;
 
         stdout.execute(terminal::Clear(ClearType::All)).unwrap();
         stdout.execute(cursor::MoveTo(0, 0)).unwrap();

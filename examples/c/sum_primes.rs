@@ -5,11 +5,11 @@ fn main() {
     let obj = EbpfObject::from_elf(&FILE).unwrap();
     let prog = obj.load_prog("entry").unwrap();
 
-    let mut vm = Vm::new();
+    let vm = Vm::new();
     let prog = vm.prepare(prog, MapReuseStrategy::None);
 
     let ctx = prog.build_ctx(&[ProgramValue::Number(100_000)]);
-    vm.run(&prog, &ctx);
+    let r0 = prog.run(&ctx);
 
-    eprintln!("result = {}", vm.registers[0] as i64);
+    eprintln!("result = {}", r0 as i64);
 }

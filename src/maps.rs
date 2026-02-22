@@ -1,9 +1,6 @@
 use std::sync::Arc;
 
-use crate::{
-    btf::{Btf, BtfTypeId},
-    vm::mem::Memory,
-};
+use crate::btf::{Btf, BtfTypeId};
 
 mod array;
 mod hash_table;
@@ -132,41 +129,44 @@ macro_rules! delegate_map_impl {
             }
         }
 
-        pub fn lookup(&self, mem: &crate::vm::mem::Memory, key: &[u8]) -> Option<usize> {
+        pub fn lookup(&self, key: &[u8]) -> Option<usize> {
             match self {
-                $(Self::$name(map) => map.lookup(mem, key),)+
+                $(Self::$name(map) => map.lookup(key),)+
                 _ => todo!(),
             }
         }
 
-        #[allow(dead_code)]
-        pub fn update(
-            &mut self,
-            mem: &mut crate::vm::mem::Memory,
-            key: &[u8],
-            value: &[u8],
-        ) -> std::io::Result<()> {
+        pub fn update(&self, key: &[u8], value: &[u8]) -> std::io::Result<()> {
             match self {
-                $(Self::$name(map) => map.update(mem, key, value),)+
+                $(Self::$name(map) => map.update(key, value),)+
                 _ => todo!(),
             }
         }
 
-        pub fn clear(&mut self, mem: &mut crate::vm::mem::Memory) {
+        pub fn clear(&self) {
             match self {
-                $(Self::$name(map) => map.clear(mem),)+
+                $(Self::$name(map) => map.clear(),)+
                 _ => todo!(),
             }
         }
 
-        pub(crate) fn update_from_guest(
-            &mut self,
-            mem: &mut crate::vm::mem::Memory,
-            key_addr: usize,
-            value_addr: usize,
-        ) -> std::io::Result<()> {
+        pub fn read<const N: usize>(&self, offset: usize) -> Option<[u8; N]> {
             match self {
-                $(Self::$name(map) => map.update_from_guest(mem, key_addr, value_addr),)+
+                $(Self::$name(map) => map.read(offset),)+
+                _ => todo!(),
+            }
+        }
+
+        pub fn write(&self, offset: usize, src: &[u8]) -> std::io::Result<()> {
+            match self {
+                $(Self::$name(map) => map.write(offset, src),)+
+                _ => todo!(),
+            }
+        }
+
+        pub fn read_bytes(&self, offset: usize, len: usize) -> Option<Vec<u8>> {
+            match self {
+                $(Self::$name(map) => map.read_bytes(offset, len),)+
                 _ => todo!(),
             }
         }
@@ -174,11 +174,10 @@ macro_rules! delegate_map_impl {
 }
 
 impl MapRepr {
-    pub fn create_from_btf(mem: &mut Memory, btf: &Btf, spec: &MapSpec) -> Option<Self> {
+    pub fn create_from_btf(btf: &Btf, spec: &MapSpec) -> Option<Self> {
         Some(match spec.r#type? {
             BPF_MAP_TYPE_UNSPEC => Self::Unspec,
             BPF_MAP_TYPE_HASH => Self::Hash(hash_table::HashTable::new(
-                mem,
                 spec.key_size
                     .or_else(|| spec.key.and_then(|id| btf.get_type(id))?.kind.size(btf))
                     .expect("map missing key size"),
@@ -188,7 +187,6 @@ impl MapRepr {
                 spec.max_entries?,
             )),
             BPF_MAP_TYPE_ARRAY => Self::Array(array::Array::new(
-                mem,
                 spec.max_entries?,
                 spec.value_size
                     .or_else(|| spec.value.and_then(|id| btf.get_type(id))?.kind.size(btf))
@@ -215,7 +213,6 @@ impl MapRepr {
             BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE => Self::PercpuCgroupStorage,
             BPF_MAP_TYPE_QUEUE => Self::Queue,
             BPF_MAP_TYPE_STACK => Self::Stack(stack::Stack::new(
-                mem,
                 spec.max_entries?,
                 spec.value_size
                     .or_else(|| spec.value.and_then(|id| btf.get_type(id))?.kind.size(btf))
@@ -238,54 +235,31 @@ impl MapRepr {
         Array, Hash, Stack,
     }
 
-    pub fn push(
-        &mut self,
-        mem: &mut crate::vm::mem::Memory,
-        value: &[u8],
-    ) -> std::io::Result<()> {
+    pub fn delete(&self, key: &[u8]) -> std::io::Result<()> {
         match self {
-            Self::Stack(map) => map.push(mem, value),
+            Self::Hash(map) => map.delete(key),
             _ => Err(std::io::ErrorKind::Unsupported.into()),
         }
     }
 
-    pub fn pop(&mut self, mem: &crate::vm::mem::Memory) -> Option<usize> {
+    pub fn push(&self, value: &[u8]) -> std::io::Result<()> {
         match self {
-            Self::Stack(map) => map.pop(mem),
+            Self::Stack(map) => map.push(value),
+            _ => Err(std::io::ErrorKind::Unsupported.into()),
+        }
+    }
+
+    pub fn pop(&self) -> Option<usize> {
+        match self {
+            Self::Stack(map) => map.pop(),
             _ => None,
         }
     }
 
-    pub fn push_from_guest(
-        &mut self,
-        mem: &mut crate::vm::mem::Memory,
-        value_addr: usize,
-    ) -> std::io::Result<()> {
+    pub fn peek(&self) -> Option<usize> {
         match self {
-            Self::Stack(map) => map.push_from_guest(mem, value_addr),
-            _ => Err(std::io::ErrorKind::Unsupported.into()),
-        }
-    }
-
-    pub fn pop_from_guest(
-        &mut self,
-        mem: &mut crate::vm::mem::Memory,
-        value_addr: usize,
-    ) -> std::io::Result<()> {
-        match self {
-            Self::Stack(map) => map.pop_from_guest(mem, value_addr),
-            _ => Err(std::io::ErrorKind::Unsupported.into()),
-        }
-    }
-
-    pub fn peek_from_guest(
-        &self,
-        mem: &mut crate::vm::mem::Memory,
-        value_addr: usize,
-    ) -> std::io::Result<()> {
-        match self {
-            Self::Stack(map) => map.peek_from_guest(mem, value_addr),
-            _ => Err(std::io::ErrorKind::Unsupported.into()),
+            Self::Stack(map) => map.peek(),
+            _ => None,
         }
     }
 }

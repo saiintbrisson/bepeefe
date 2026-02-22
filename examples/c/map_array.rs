@@ -5,7 +5,7 @@ fn main() {
     let obj = EbpfObject::from_elf(&FILE).unwrap();
     let prog = obj.load_prog("entry").unwrap();
 
-    let mut vm = Vm::new();
+    let vm = Vm::new();
     let prog = vm.prepare(prog, MapReuseStrategy::None);
 
     let init_kbs = ProgramValue::Number(3070);
@@ -18,7 +18,7 @@ fn main() {
         ("local_port", local_port.clone()),
         ("len", ProgramValue::Number(3)),
     ])]);
-    vm.run(&prog, &ctx);
+    let r0 = prog.run(&ctx);
 
-    eprintln!("result = {}", vm.registers[0] as i32);
+    eprintln!("result = {}", r0 as i32);
 }

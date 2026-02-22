@@ -11,7 +11,7 @@ pub struct BtfTypeId(pub u32);
 
 type BtfStrOffset = u32;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Btf {
     /// A map of strings contained in the BTF section, keyed by their byte
     /// offset within the section. Used in combination with `name_off` values.
@@ -22,16 +22,6 @@ pub struct Btf {
     /// Extension information on the object. Contains function declarations,
     /// code line mapping, and CO-RE relocations.
     pub ext: ext::BtfExt,
-}
-
-impl Default for Btf {
-    fn default() -> Self {
-        Self {
-            strings: Default::default(),
-            types: BTreeMap::new(),
-            ext: Default::default(),
-        }
-    }
 }
 
 impl Btf {
@@ -45,13 +35,13 @@ impl Btf {
     pub fn find_string(&self, name: &str) -> Option<u32> {
         if self.strings.len() < name.len() {
             return None;
-        } else if name.len() == 0 {
+        } else if name.is_empty() {
             return Some(0);
         }
 
         let mut f = self.strings.iter().enumerate();
         loop {
-            let (idx, _) = f.by_ref().skip_while(|(_, b)| **b == 0).next()?;
+            let (idx, _) = f.by_ref().find(|(_, b)| **b != 0)?;
 
             let bytes = self.strings.get(idx..)?;
             let s = CStr::from_bytes_until_nul(bytes).ok()?.to_str().ok()?;
@@ -120,7 +110,7 @@ impl Btf {
                     let avail = elem_size - cur_in_elem;
                     let chunk = remaining.min(avail);
 
-                    if self.is_offset_valid(array.r#type, cur_in_elem, Some(chunk))? != true {
+                    if !self.is_offset_valid(array.r#type, cur_in_elem, Some(chunk))? {
                         return Some(false);
                     }
 
@@ -156,7 +146,7 @@ impl Btf {
                     let avail = msz - off_in_member;
                     let chunk = remaining.min(avail);
 
-                    if self.is_offset_valid(member.r#type, off_in_member, Some(chunk))? != true {
+                    if !self.is_offset_valid(member.r#type, off_in_member, Some(chunk))? {
                         return Some(false);
                     }
 

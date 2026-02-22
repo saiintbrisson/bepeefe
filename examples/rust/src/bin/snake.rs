@@ -19,7 +19,6 @@ enum Direction {
 #[cfg_attr(not(target_arch = "bpf"), derive(serde::Serialize))]
 struct TickCtx {
     dir: Direction,
-    rand: u32,
 }
 
 #[repr(u8)]
@@ -43,7 +42,8 @@ struct RenderEvent {
 mod program {
     use core::{ffi::c_void, hint::black_box};
     use guest::{
-        BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_STACK, bpf_map_lookup_elem, bpf_map_push_elem, decl_map,
+        BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_STACK, bpf_get_prandom_u32, bpf_map_lookup_elem,
+        bpf_map_push_elem, decl_map,
     };
 
     use super::{DIE, Direction, GRID_H, GRID_W, RenderEvent, RenderEventType, TickCtx};
@@ -85,7 +85,7 @@ mod program {
         };
     }
 
-    fn push_event(x: u8, y: u8, ty: RenderEventType) {
+    unsafe fn push_event(x: u8, y: u8, ty: RenderEventType) {
         let event = RenderEvent { x, y, ty };
         bpf_map_push_elem(
             &render_events as *const _ as *const c_void,
@@ -94,7 +94,7 @@ mod program {
         );
     }
 
-    fn update_position(state: &mut Game, cell: u32) -> i64 {
+    unsafe fn update_position(state: &mut Game, cell: u32) -> i64 {
         let head = state.snake.head as usize;
         if head >= state.snake.body.len() {
             return DIE;
@@ -175,9 +175,9 @@ mod program {
     }
 
     #[unsafe(no_mangle)]
-    fn on_tick(ctx: &TickCtx) -> i64 {
+    unsafe fn on_tick(ctx: &TickCtx) -> i64 {
         let dir = ctx.dir;
-        let cell = ctx.rand % (GRID_W as u32 * GRID_H as u32);
+        let cell = bpf_get_prandom_u32() % (GRID_W as u32 * GRID_H as u32);
 
         let idx: u32 = 0;
         let state_ptr = bpf_map_lookup_elem(
@@ -186,7 +186,7 @@ mod program {
         );
         die_if!(state_ptr.is_null());
 
-        let state = unsafe { &mut *(state_ptr as *mut Game) };
+        let state = &mut *(state_ptr as *mut Game);
 
         if state.snake.len == 0 {
             state.snake.dir = Direction::Right;
@@ -224,7 +224,6 @@ fn main() {
         ExecutableCommand, cursor, event,
         terminal::{self, ClearType},
     };
-    use rand::Rng;
 
     const PROGRAM: &[u8] =
         include_bytes!(concat!(env!("BPF_OUT_DIR"), "/", env!("CARGO_BIN_NAME")));
@@ -232,7 +231,7 @@ fn main() {
     let obj = EbpfObject::from_elf(PROGRAM).unwrap();
     let prog = obj.load_prog("on_tick").unwrap();
 
-    let mut vm = Vm::new();
+    let vm = Vm::new();
     let prog = vm.prepare(prog, MapReuseStrategy::None);
 
     let mut grid = [[' '; GRID_W]; GRID_H];
@@ -261,11 +260,8 @@ fn main() {
             }
         }
 
-        let ctx = prog.build_ctx(&[TickCtx {
-            dir,
-            rand: rand::rng().random::<i32>() as _,
-        }]);
-        vm.run(&prog, &ctx);
+        let ctx = prog.build_ctx(&[TickCtx { dir }]);
+        let new_score = prog.run(&ctx) as i64;
 
         let mut map = vm.map("render_events");
         while let Some(ev) = map.pop::<RenderEvent>() {
@@ -275,8 +271,6 @@ fn main() {
                 RenderEventType::Food => '*',
             };
         }
-
-        let new_score = vm.registers[0] as i64;
 
         stdout.execute(terminal::Clear(ClearType::All)).unwrap();
         stdout.execute(cursor::MoveTo(0, 0)).unwrap();

@@ -74,7 +74,7 @@ impl<'file> EbpfObject<'file> {
             sec.data()
                 .ok()
                 .and_then(|data| CStr::from_bytes_until_nul(data).ok())
-                .and_then(|data| Some(data.to_string_lossy().to_string()))
+                .map(|data| data.to_string_lossy().to_string())
         });
 
         let (btf, maps) = parse_btf(&file)?;
@@ -105,7 +105,7 @@ impl<'file> EbpfObject<'file> {
             .unwrap_or_else(|| panic!(r#"program "{name}" not found"#));
 
         let mut program = ProgLoader::default();
-        self.load_code(&prog, &mut program);
+        self.load_code(prog, &mut program);
         self.resolve_relocations(&mut program);
 
         let line_info = self.collect_lines(&program);
@@ -672,7 +672,7 @@ fn collect_functions<'file>(
                 Some((offset, _, _)) if prog_insn_offset != *offset => {
                     todo!("func information does not match symbol address {sec_name}:{prog_name}")
                 }
-                Some((_, params, ret)) => (params.clone(), Some(ret.clone())),
+                Some((_, params, ret)) => (params.clone(), Some(*ret)),
                 None => Default::default(),
             };
 

@@ -31,13 +31,13 @@ mod program {
     });
 
     #[unsafe(no_mangle)]
-    fn entry(ctx: &Ctx) -> u64 {
+    unsafe fn entry(ctx: &Ctx) -> u64 {
         let map = &counters as *const _ as *const c_void;
         let key_ptr = &ctx.id as *const _ as *const c_void;
 
         let val = bpf_map_lookup_elem(map, key_ptr);
         if !val.is_null() {
-            let stats = unsafe { &mut *(val as *mut PacketStats) };
+            let stats = &mut *(val as *mut PacketStats);
             stats.tx_bytes += ctx.tx_bytes;
             stats.rx_bytes += ctx.rx_bytes;
         } else {
@@ -54,7 +54,8 @@ mod program {
 
 #[cfg(not(target_arch = "bpf"))]
 fn main() {
-    use bepeefe::{EbpfObject, ProgramValue, Vm, vm::MapReuseStrategy};
+    use bepeefe::{EbpfObject, Vm, vm::MapReuseStrategy};
+    use std::thread;
 
     const PROGRAM: &[u8] =
         include_bytes!(concat!(env!("BPF_OUT_DIR"), "/", env!("CARGO_BIN_NAME")));
@@ -62,23 +63,35 @@ fn main() {
     let obj = EbpfObject::from_elf(PROGRAM).unwrap();
     let prog = obj.load_prog("entry").unwrap();
 
-    let mut vm = Vm::new();
+    let vm = Vm::new();
     let handle = vm.prepare(prog, MapReuseStrategy::MatchByName);
 
-    let make_ctx = |id: u32, tx_bytes: u64, rx_bytes: u64| {
-        handle.build_ctx(&[Ctx {
-            id,
-            tx_bytes,
-            rx_bytes,
-        }])
-    };
+    let threads: Vec<_> = (0..4u32)
+        .map(|t| {
+            let handle = handle.clone();
+            thread::spawn(move || {
+                for id in 1..=16u32 {
+                    let ctx = handle.build_ctx(&[Ctx {
+                        id,
+                        tx_bytes: (t as u64 + 1) * 10,
+                        rx_bytes: (t as u64 + 1) * 20,
+                    }]);
+                    handle.run(&ctx);
+                }
+            })
+        })
+        .collect();
 
-    vm.run(&handle, &make_ctx(1, 100, 250));
-    vm.run(&handle, &make_ctx(2, 50, 75));
-    vm.run(&handle, &make_ctx(1, 200, 300));
+    for t in threads {
+        t.join().unwrap();
+    }
 
-    for id in [1, 2] {
-        let stats: Option<PacketStats> = vm.map("counters").lookup(&id);
+    for id in 1u32..=16 {
+        let stats: PacketStats = vm.map("counters").lookup(&id).unwrap();
+        assert_eq!(stats.tx_bytes, 100, "id {id} tx mismatch");
+        assert_eq!(stats.rx_bytes, 200, "id {id} rx mismatch");
         eprintln!("counters[{id}] = {stats:?}");
     }
+
+    eprintln!("all 16 ids verified");
 }

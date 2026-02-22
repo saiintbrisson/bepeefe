@@ -51,7 +51,7 @@ macro_rules! alu {
     ($($name:ident, |$dst:tt, $src:tt, $imm:tt| $func:expr;)+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::vm::Vm, insn: Insn) {
+            pub fn $name(state: &mut crate::vm::State, insn: Insn) {
                 let $src = state.registers[insn.src_reg() as usize];
                 let $dst = state.registers[insn.dst_reg() as usize];
                 let $imm = insn.imm() as u64;
@@ -96,10 +96,10 @@ alu! {
     rsh_src_32,    |dst, src, _| dst as u32 >> (src as u32 & SHIFT_MASK_32);
     rsh_src_64,    |dst, src, _| dst >> (src & SHIFT_MASK_64);
     rsh_imm_32,    |dst, _, imm| dst as u32 >> (imm as u32 & SHIFT_MASK_32);
-    rsh_imm_64,    |dst, _, imm| dst >> (imm as u64 & SHIFT_MASK_64);
+    rsh_imm_64,    |dst, _, imm| dst >> (imm & SHIFT_MASK_64);
 
     neg_imm_32,    |dst, _, _|   !dst as u32;
-    neg_imm_64,    |dst, _, _|   !dst as u64;
+    neg_imm_64,    |dst, _, _|   !dst;
 
     xor_src_32,    |dst, src, _| dst as u32 ^ src as u32;
     xor_src_64,    |dst, src, _| dst ^ src;
@@ -123,7 +123,7 @@ macro_rules! signed_alu {
     ($($name:ident { $($offset:pat => |$dst:tt, $src:tt, $imm:tt| $func:expr;)+ })+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::vm::Vm, insn: Insn) {
+            pub fn $name(state: &mut crate::vm::State, insn: Insn) {
                 let offset = insn.offset() & 1;
                 state.registers[insn.dst_reg() as usize] = match offset {
                     $($offset => {
@@ -175,7 +175,7 @@ macro_rules! mov_src {
     ($($name:ident, $uref:ty, $sref:ty, $mask:expr;)+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::vm::Vm, insn: Insn) {
+            pub fn $name(state: &mut crate::vm::State, insn: Insn) {
                 /// Offset can be either 0 for mov or 8/16/32 for movsx
                 const MOVSX_OFFSET_MASK: u64 = $mask;
 

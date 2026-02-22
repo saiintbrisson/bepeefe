@@ -8,4 +8,4 @@ pub mod vm;
 
 pub use object::EbpfObject;
 pub use value::ProgramValue;
-pub use vm::Vm;
+pub use vm::{PreparedProgram, Vm};

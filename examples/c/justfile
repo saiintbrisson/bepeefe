@@ -1,0 +1,8 @@
+run program: (build program)
+    cargo r --manifest-path ../../Cargo.toml --example {{program}}
+
+build program:
+    ${CC:-clang} -O2 -g -o {{program}}.o -target bpf -c {{program}}.c
+
+dump program: (build program)
+    ${OBJDUMP:-"llvm-objdump"} -drh {{program}}.o

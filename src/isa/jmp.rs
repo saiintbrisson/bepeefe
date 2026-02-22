@@ -42,7 +42,7 @@ macro_rules! jmp_src_cond {
     ($($name:ident, |$dst:tt, $src:tt| $cond:expr;)+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::vm::Vm, insn: Insn) {
+            pub fn $name(state: &mut crate::vm::State, insn: Insn) {
                 let dst = insn.dst_reg();
                 let src = insn.src_reg();
 
@@ -50,7 +50,7 @@ macro_rules! jmp_src_cond {
                 let $dst = state.registers[dst as usize];
 
                 if $cond {
-                    state.code.add_offset(insn.offset() as isize);
+                    state.add_offset(insn.offset() as isize);
                 }
             }
         )+
@@ -86,14 +86,14 @@ macro_rules! jmp_imm_cond {
     ($($name:ident, |$dst:tt, $imm:tt| $cond:expr;)+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::vm::Vm, insn: Insn) {
+            pub fn $name(state: &mut crate::vm::State, insn: Insn) {
                 let dst = insn.dst_reg();
 
                 let $imm = insn.imm() as u64;
                 let $dst = state.registers[dst as usize];
 
                 if $cond {
-                    state.code.add_offset(insn.offset() as isize);
+                    state.add_offset(insn.offset() as isize);
                 }
             }
         )+
@@ -125,16 +125,16 @@ jmp_imm_cond! {
     jsle_imm_64, |dst, imm| (dst as i64) <= (imm as i64);
 }
 
-pub fn ja_32(state: &mut crate::vm::Vm, insn: Insn) {
-    state.code.add_offset(insn.imm() as isize);
+pub fn ja_32(state: &mut crate::vm::State, insn: Insn) {
+    state.add_offset(insn.imm() as isize);
 }
 
-pub fn ja_16(state: &mut crate::vm::Vm, insn: Insn) {
-    state.code.add_offset(insn.offset() as isize);
+pub fn ja_16(state: &mut crate::vm::State, insn: Insn) {
+    state.add_offset(insn.offset() as isize);
 }
 
-pub fn exit(state: &mut crate::vm::Vm, _: Insn) {
-    state.call_exit();
+pub fn exit(state: &mut crate::vm::State, _: Insn) {
+    state.exit = true;
 }
 
 /// Ref: <https://github.com/libbpf/libbpf/blob/d65dbb412d661acae9d67c3786be5b36005b2ac1/include/uapi/linux/bpf.h#L1357-L1364>
@@ -142,9 +142,10 @@ pub const BPF_PSEUDO_CALL: u8 = 1;
 pub const BPF_PSEUDO_KFUNC_CALL: u8 = 2;
 pub const BPF_HELPER_CALL: u8 = 0;
 
-pub type HelperExecFn = fn(&mut crate::vm::Vm, Insn);
+pub type HelperExecFn = fn(&mut crate::vm::State, Insn);
 pub type HelperRetvalFn = fn(&crate::vm::Vm, &[RegisterState; 11], Insn) -> RegisterState;
-pub type HelperParamsFn = fn(&crate::vm::Vm, &[RegisterState; 11], Insn) -> Result<(), &'static str>;
+pub type HelperParamsFn =
+    fn(&crate::vm::Vm, &[RegisterState; 11], Insn) -> Result<(), &'static str>;
 
 pub struct BpfHelper {
     pub exec: HelperExecFn,
@@ -152,7 +153,7 @@ pub struct BpfHelper {
     pub params: HelperParamsFn,
 }
 
-fn noop_exec(_: &mut crate::vm::Vm, _: Insn) {
+fn noop_exec(_: &mut crate::vm::State, _: Insn) {
     panic!("unimplemented helper function");
 }
 
@@ -182,7 +183,9 @@ macro_rules! helper_table {
 
 const BPF_FUNC_MAP_LOOKUP_ELEM: i32 = 1;
 const BPF_FUNC_MAP_UPDATE_ELEM: i32 = 2;
+const BPF_FUNC_MAP_DELETE_ELEM: i32 = 3;
 const BPF_FUNC_TRACE_PRINTK: i32 = 6;
+const BPF_FUNC_GET_PRANDOM_U32: i32 = 7;
 const BPF_FUNC_GET_CURRENT_PID_TGID: i32 = 14;
 
 const BPF_FUNC_MAP_PUSH_ELEM: i32 = 87;
@@ -195,16 +198,16 @@ helper_table! {
     // R0: pointer to value or NULL
     BPF_FUNC_MAP_LOOKUP_ELEM => (
         |state, _| {
-            let map_idx = state.registers[1] as u32 as usize;
-            let key = state.registers[2] as u32 as usize;
-            let elem = state.map_lookup_from_guest(map_idx, key).unwrap_or_default();
+            let map_fd = state.registers[1] as u16;
+            let key = state.registers[2];
+            let elem = state.lookup_elem(map_fd, key).unwrap_or_default();
             state.registers[0] = elem as u64;
         },
         |vm, regs, _| {
             let RegisterState::PtrToMap { map_fd } = regs[1] else {
                 panic!("map_lookup_elem: R1 must be PtrToMap");
             };
-            let map = vm.map_by_fd(map_fd).unwrap();
+            let map = vm.find_map(map_fd).unwrap();
             if map.spec.r#type == Some(crate::maps::BPF_MAP_TYPE_ARRAY) {
                 RegisterState::PtrToMapValue { map_fd, offset: ScalarRange::exact(0) }
             } else {
@@ -226,10 +229,10 @@ helper_table! {
     // R0: success or errno
     BPF_FUNC_MAP_UPDATE_ELEM => (
         |state, _| {
-            let map_idx = state.registers[1] as u32 as usize;
-            let key_addr = state.registers[2] as usize;
-            let value_addr = state.registers[3] as usize;
-            match state.map_update_from_guest(map_idx, key_addr, value_addr) {
+            let map_fd = state.registers[1] as u16;
+            let key_ptr = state.registers[2];
+            let value_ptr = state.registers[3];
+            match state.map_update(map_fd, key_ptr, value_ptr) {
                 Ok(()) => state.registers[0] = 0,
                 Err(_) => state.registers[0] = -1i64 as u64,
             }
@@ -251,15 +254,38 @@ helper_table! {
             Ok(())
         }
     );
+    // static long (* const bpf_map_delete_elem)(void *map, const void *key) = (void *) 3;
+    // R1: map pointer, R2: key pointer
+    // R0: success or errno
+    BPF_FUNC_MAP_DELETE_ELEM => (
+        |state, _| {
+            let map_fd = state.registers[1] as u16;
+            let key_ptr = state.registers[2];
+            match state.map_delete(map_fd, key_ptr) {
+                Ok(()) => state.registers[0] = 0,
+                Err(_) => state.registers[0] = -1i64 as u64,
+            }
+        },
+        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
+        |_, regs, _| {
+            if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
+                return Err("map_delete_elem: R1 must be PtrToMap");
+            }
+            if !regs[2].is_pointer() {
+                return Err("map_delete_elem: R2 must be a valid pointer");
+            }
+            Ok(())
+        }
+    );
     // static long (* const bpf_trace_printk)(const char *fmt, __u32 fmt_size, ...) = (void *) 6;
     // R1: addr, R2: size, R3/R4/R5: formatting params
     // R0: n of written bytes or negative error code
     BPF_FUNC_TRACE_PRINTK => (
         |state, _| {
-            let addr = state.registers[1] as usize;
+            let addr = state.registers[1];
             let len = state.registers[2] as usize;
-            let data = state.mem.slice(addr, len).expect("addr is invalid");
-            let Ok(s) = CStr::from_bytes_until_nul(data) else {
+            let data = state.read_bytes(addr, len);
+            let Ok(s) = CStr::from_bytes_until_nul(&data) else {
                 state.registers[0] = -22i64 as u64; // EINVAL
                 return;
             };
@@ -267,7 +293,7 @@ helper_table! {
                 panic!("string is not utf8");
             };
             let s = prepare_bpf_trace_printk(state, s.to_string());
-            state.registers[0] = s.as_bytes().len() as u64;
+            state.registers[0] = s.len() as u64;
             eprintln!("Print: {s:?}");
         },
         |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
@@ -280,6 +306,13 @@ helper_table! {
             }
             Ok(())
         }
+    );
+    // static __u32 (* const bpf_get_prandom_u32)(void) = (void *) 7;
+    // R0: random u32
+    BPF_FUNC_GET_PRANDOM_U32 => (
+        |state, _| state.registers[0] = state.prog.vm.prandom_u32() as u64,
+        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
+        |_, _, _| Ok(())
     );
     // static __u64 (* const bpf_get_current_pid_tgid)(void) = (void *) 14;
     // R0: tgid << 32 | pid
@@ -294,9 +327,9 @@ helper_table! {
     // R0: success or errno
     BPF_FUNC_MAP_PUSH_ELEM => (
         |state, _| {
-            let map_idx = state.registers[1] as u32 as usize;
-            let value_addr = state.registers[2] as usize;
-            match state.map_push_from_guest(map_idx, value_addr) {
+            let map_fd = state.registers[1] as u16;
+            let value_ptr = state.registers[2];
+            match state.map_push(map_fd, value_ptr) {
                 Ok(()) => state.registers[0] = 0,
                 Err(_) => state.registers[0] = -1i64 as u64,
             }
@@ -317,9 +350,9 @@ helper_table! {
     // R0: success or errno
     BPF_FUNC_MAP_POP_ELEM => (
         |state, _| {
-            let map_idx = state.registers[1] as u32 as usize;
-            let value_addr = state.registers[2] as usize;
-            match state.map_pop_from_guest(map_idx, value_addr) {
+            let map_fd = state.registers[1] as u16;
+            let dest_ptr = state.registers[2];
+            match state.map_pop(map_fd, dest_ptr) {
                 Ok(()) => state.registers[0] = 0,
                 Err(_) => state.registers[0] = -1i64 as u64,
             }
@@ -340,9 +373,9 @@ helper_table! {
     // R0: success or errno
     BPF_FUNC_MAP_PEEK_ELEM => (
         |state, _| {
-            let map_idx = state.registers[1] as u32 as usize;
-            let value_addr = state.registers[2] as usize;
-            match state.map_peek_from_guest(map_idx, value_addr) {
+            let map_fd = state.registers[1] as u16;
+            let dest_ptr = state.registers[2];
+            match state.map_peek(map_fd, dest_ptr) {
                 Ok(()) => state.registers[0] = 0,
                 Err(_) => state.registers[0] = -1i64 as u64,
             }
@@ -369,7 +402,7 @@ helper_table! {
 /// used as PC-rel offset, and a stack frame is pushed.
 ///
 /// Ref: <https://github.com/torvalds/linux/blob/98ac9cc4b4452ed7e714eddc8c90ac4ae5da1a09/include/uapi/linux/bpf.h#L5870>
-pub fn jmp_call(state: &mut crate::vm::Vm, insn: Insn) {
+pub fn jmp_call(state: &mut crate::vm::State, insn: Insn) {
     let src = insn.src_reg();
 
     match src {
@@ -400,7 +433,7 @@ pub fn jmp_call(state: &mut crate::vm::Vm, insn: Insn) {
 /// > encounters an unknown specifier.
 ///
 /// Ref: <https://github.com/torvalds/linux/blob/f406055cb18c6e299c4a783fc1effeb16be41803/include/uapi/linux/bpf.h#L1961>
-fn prepare_bpf_trace_printk(state: &mut crate::vm::Vm, s: String) -> String {
+fn prepare_bpf_trace_printk(state: &mut crate::vm::State, s: String) -> String {
     let mut arg_count = 0;
 
     let mut buf: Option<Vec<_>> = None;
@@ -409,7 +442,7 @@ fn prepare_bpf_trace_printk(state: &mut crate::vm::Vm, s: String) -> String {
         if formatting {
             arg_count += 1;
             if arg_count >= 4 {
-                panic!()
+                panic!("too many printk arguments");
             }
 
             let param = state.registers[2 + arg_count];
@@ -419,9 +452,7 @@ fn prepare_bpf_trace_printk(state: &mut crate::vm::Vm, s: String) -> String {
                     buf.extend(param.to_string().as_bytes());
                 }
                 's' => {
-                    let addr = param as usize;
-                    let max_len = 256; // reasonable limit for printk strings
-                    let data = state.mem.slice(addr, max_len).unwrap_or(&[]);
+                    let data = state.try_buf(param).unwrap_or(&[0]);
                     let s = CStr::from_bytes_until_nul(data).unwrap();
                     buf.extend(s.to_bytes());
                 }
@@ -441,8 +472,7 @@ fn prepare_bpf_trace_printk(state: &mut crate::vm::Vm, s: String) -> String {
     }
 
     if let Some(buf) = buf {
-        let s = String::from_utf8(buf).unwrap();
-        s
+        String::from_utf8(buf).unwrap()
     } else {
         s
     }

@@ -37,7 +37,7 @@ macro_rules! decl_map {
 macro_rules! bpf_helper {
     ($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty = $imm:expr) => {
         #[inline(always)]
-        pub fn $name($($arg: $ty),*) -> $ret {
+        pub unsafe fn $name($($arg: $ty),*) -> $ret {
             let f: extern "C" fn($($ty),*) -> $ret =
                 unsafe { core::mem::transmute($imm as usize) };
             f($($arg),*)
@@ -47,6 +47,8 @@ macro_rules! bpf_helper {
 
 bpf_helper!(bpf_map_lookup_elem(map: *const c_void, key: *const c_void) -> *mut c_void = 1);
 bpf_helper!(bpf_map_update_elem(map: *const c_void, key: *const c_void, value: *const c_void, flags: u64) -> i64 = 2);
+bpf_helper!(bpf_map_delete_elem(map: *const c_void, key: *const c_void) -> i64 = 3);
+bpf_helper!(bpf_get_prandom_u32() -> u32 = 7);
 bpf_helper!(bpf_map_push_elem(map: *const c_void, value: *const c_void, flags: u64) -> i64 = 87);
 bpf_helper!(bpf_map_pop_elem(map: *const c_void, value: *mut c_void) -> i64 = 88);
 bpf_helper!(bpf_map_peek_elem(map: *const c_void, value: *mut c_void) -> i64 = 89);

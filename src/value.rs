@@ -104,7 +104,7 @@ impl ProgramValue {
                     used_fields.push(name);
                 }
 
-                for (struct_field, _) in map {
+                for struct_field in map.keys() {
                     if !used_fields.contains(&struct_field.as_str().into()) {
                         todo!("field {struct_field:?} does not exist in struct");
                     }

@@ -1,43 +1,66 @@
-use std::{alloc::Layout, ops::Deref, sync::Arc};
-
-use mem::{Memory, Region};
+use std::{
+    ops::Deref,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU32, Ordering},
+    },
+};
 
 use crate::{
     isa::{
-        self, Insn,
+        self,
         load::{BPF_PSEUDO_MAP_FD, BPF_PSEUDO_MAP_VALUE},
     },
     maps::{BpfMap, MapPinning, MapRepr},
     object::{Context, EbpfProgram},
     value::ProgramValue,
-    verifier::VerifierState,
+    verifier::Verifier,
+    vm::state::PtrTag,
 };
 
 pub mod debugger;
-pub mod mem;
+mod state;
 
-const DEFAULT_SIZE: usize = 1024 * 1024 * 2; // 2 MiB
-
-pub struct PreparedProgram(Arc<EbpfProgram>);
-impl Deref for PreparedProgram {
-    type Target = EbpfProgram;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
-    }
-}
+#[doc(hidden)]
+pub use state::State;
 
 pub struct Vm {
-    maps: Vec<BpfMap>,
+    maps: RwLock<Vec<Arc<BpfMap>>>,
+    rng_state: AtomicU32,
+}
 
-    pub code: VmCode,
-    pub exit: bool,
+impl Vm {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            maps: Default::default(),
+            rng_state: AtomicU32::new(0xDEAD_BEEF),
+        })
+    }
 
-    pub registers: [u64; 11],
-    call_stack: Vec<StackFrame>,
+    pub(crate) fn find_map(&self, fd: u16) -> Option<Arc<BpfMap>> {
+        let maps = self.maps.read().unwrap();
+        maps.get(fd as usize).cloned()
+    }
 
-    pub mem: Memory,
-    stack: Region,
+    pub fn set_rng_seed(&self, seed: u32) {
+        self.rng_state.store(seed, Ordering::Release);
+    }
+
+    /// Returns a random u32 and updates the RNG
+    /// state applying a xorshift.
+    pub(crate) fn prandom_u32(&self) -> u32 {
+        let mut rand = 0;
+        let _ = self
+            .rng_state
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |mut s| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                rand = s;
+                Some(s)
+            });
+        rand
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -54,46 +77,23 @@ pub enum MapReuseStrategy {
 }
 
 impl Vm {
-    /// Instantiates a new virtual machine with the given
-    /// program loaded. A 2MiB memory region is allocated
-    /// and zeroed. Maps are loaded and initiated. Code
-    /// is loaded to the memory and PC is set to `entry`.
-    pub fn new() -> Self {
-        let mut mem = Memory::with_capacity(DEFAULT_SIZE);
-
-        let stack_layout = Layout::from_size_align(STACK_FUNCTION_SIZE * 8, 8).unwrap();
-        let stack = mem.alloc_layout(stack_layout).expect("stack is valid");
-
-        let mut registers: [u64; 11] = Default::default();
-        registers[10] = (stack.end() - 1) as u64;
-
-        Self {
-            maps: Default::default(),
-            code: Default::default(),
-            exit: false,
-            registers,
-            call_stack: Vec::with_capacity(8),
-            mem,
-            stack,
-        }
-    }
-
     /// Prepares an eBPF program to be executed by the Vm, creating and linking all maps.
     ///
     /// `map_reuse` dictates how the Vm will find existing maps and reuse them
     /// if `pinning` is not declared for the map.
     pub fn prepare(
-        &mut self,
+        self: &Arc<Vm>,
         mut prog: EbpfProgram,
         map_reuse: MapReuseStrategy,
     ) -> PreparedProgram {
-        self.maps.reserve(prog.maps.len());
+        let mut maps = self.maps.write().unwrap();
+        maps.reserve(prog.maps.len());
 
         let mut maps_fds = Vec::with_capacity(prog.maps.len());
         for spec in &prog.maps {
             let btf = prog.btf.clone().unwrap();
 
-            let by_name = self.maps.iter().find(|map| map.spec.name == spec.name);
+            let by_name = maps.iter().find(|map| map.spec.name == spec.name);
             match (map_reuse, spec.pinning, by_name) {
                 (MapReuseStrategy::MatchByName, _, Some(map))
                 | (_, MapPinning::ByName, Some(map)) => {
@@ -105,26 +105,26 @@ impl Vm {
             }
 
             let bpf_map = BpfMap {
-                fd: self.maps.len() as i32,
-                repr: MapRepr::create_from_btf(&mut self.mem, &btf, &spec)
-                    .expect("invalid map type"),
+                fd: maps.len() as i32,
+                repr: MapRepr::create_from_btf(&btf, spec).expect("invalid map type"),
                 spec: spec.clone(),
                 btf,
             };
 
             maps_fds.push((spec, bpf_map.fd));
-            self.maps.push(bpf_map);
+            maps.push(Arc::new(bpf_map));
         }
 
         // Fill initial data for data-section maps (.rodata, .data, etc.)
-        for map in &mut self.maps {
-            if let Some(data) = map.spec.initial_data.take() {
+        for map in maps.iter_mut() {
+            if let Some(data) = &map.spec.initial_data {
                 let key = 0u32.to_ne_bytes();
                 map.repr
-                    .update(&mut self.mem, &key, &data)
+                    .update(&key, &data)
                     .expect("failed to fill initial data");
             }
         }
+        drop(maps);
 
         // Relocate map calls with their initialized FDs
         for (insn_offset, (sec, sec_offset)) in &prog.map_relos {
@@ -154,7 +154,7 @@ impl Vm {
         }
 
         let prog = Arc::new(prog);
-        let verifier = VerifierState::new(&self, prog.clone()).unwrap();
+        let verifier = Verifier::new(self, prog.clone()).unwrap();
         if let Err(err) = verifier.run() {
             match &err {
                 crate::verifier::VerifierError::Other {
@@ -220,203 +220,149 @@ impl Vm {
             panic!("verification failed: {err}")
         };
 
-        PreparedProgram(prog)
+        PreparedProgram::new(self.clone(), prog)
     }
 
-    pub fn run(&mut self, prog: &PreparedProgram, ctx: &[Context]) {
-        self.registers = Default::default();
-        self.registers[10] = (self.stack.end() - 1) as u64;
+    pub fn map(&self, name: &str) -> MapHandle {
+        let maps = self.maps.read().unwrap();
+        MapHandle(
+            maps.iter()
+                .find(|map| map.spec.name == name)
+                .unwrap()
+                .clone(),
+        )
+    }
+}
 
-        self.exit = false;
-        self.code.insns = prog.0.insns.clone();
-        self.code.set_pc(0);
+const STACK_SIZE: usize = 512;
+const SLOTS: usize = 64;
 
-        let ctx_regions: Vec<_> = ctx
+#[derive(Clone)]
+pub struct PreparedProgram {
+    pub(crate) vm: Arc<Vm>,
+    prog: Arc<EbpfProgram>,
+    buf_pool: Arc<RwLock<Vec<Vec<u8>>>>,
+    param_sizes: Vec<u32>,
+}
+
+impl PreparedProgram {
+    pub fn new(vm: Arc<Vm>, prog: Arc<EbpfProgram>) -> Self {
+        let btf = prog.btf.as_ref().unwrap();
+        let param_sizes: Vec<_> = prog
+            .sig
+            .params_types
             .iter()
-            .enumerate()
-            .filter_map(|(idx, ctx)| match ctx {
+            .map(|(_, param)| btf.get_type(*param).unwrap().kind.size(btf).unwrap())
+            .collect();
+        let ctx_size = param_sizes.iter().sum::<u32>().next_power_of_two();
+
+        let mut buf_pool = Vec::with_capacity(SLOTS);
+        for _ in 0..SLOTS {
+            buf_pool.push(vec![0; ctx_size as usize + STACK_SIZE]);
+        }
+
+        Self {
+            vm,
+            prog,
+            buf_pool: Arc::new(RwLock::new(buf_pool)),
+            param_sizes,
+        }
+    }
+
+    pub fn run(&self, ctx: &[Context]) -> u64 {
+        let buf = self
+            .buf_pool
+            .write()
+            .unwrap()
+            .pop()
+            .expect("no available execution slots");
+
+        let mut state = State {
+            prog: self.clone(),
+            buf,
+            pc: 0,
+            registers: Default::default(),
+            exit: false,
+        };
+        state.registers[10] = PtrTag::Local as u64 | state.buf.len() as u64 - 1;
+
+        assert_eq!(ctx.len(), self.param_sizes.len(), "TODO");
+
+        let mut buf_idx = 0;
+
+        for ((idx, ctx), param_size) in ctx.iter().enumerate().zip(&self.param_sizes) {
+            match ctx {
                 Context::Buffer(buf) => {
-                    let ctx_reg = self.mem.push_bytes(&buf, None);
-                    self.registers[idx + 1] = ctx_reg.start() as u64;
-                    Some(ctx_reg)
+                    assert_eq!(*param_size as usize, buf.len());
+
+                    state.buf[buf_idx..buf_idx + buf.len()].copy_from_slice(&buf);
+                    state.registers[idx + 1] = PtrTag::Local as u64 | buf_idx as u64;
+
+                    buf_idx += buf.len();
                 }
                 &Context::Value(val) => {
-                    self.registers[idx + 1] = val;
-                    None
-                }
-            })
-            .collect();
+                    assert_eq!(val >> (param_size * 8), 0);
 
-        while !self.exit {
-            let Some(insn) = self.code.step() else {
+                    state.registers[idx + 1] = val;
+                }
+            }
+        }
+
+        while !state.exit {
+            let Some(insn) = self.prog.insns.get(state.pc) else {
                 panic!();
             };
+            state.pc += 1;
 
-            isa::INSTRUCTION_TABLE[insn.opcode() as usize](self, insn);
+            isa::INSTRUCTION_TABLE[insn.opcode() as usize](&mut state, *insn);
         }
 
-        for ctx_reg in ctx_regions.into_iter().rev() {
-            self.mem.reclaim_region(ctx_reg);
-        }
-    }
-
-    pub fn call(&mut self, offset: i32) {
-        assert!(
-            self.call_stack.len() < 8,
-            "no more than 8 nested calls allowed"
-        );
-
-        self.call_stack.push(StackFrame {
-            ret_addr: self.code.pc,
-            registers: self.registers[6..=9].try_into().unwrap(),
-        });
-
-        self.registers[10] -= STACK_FUNCTION_SIZE as u64;
-        self.code.add_offset(offset as isize);
-    }
-
-    pub fn call_exit(&mut self) {
-        let Some(frame) = self.call_stack.pop() else {
-            self.exit = true;
-            return;
-        };
-
-        self.code.pc = frame.ret_addr;
-        self.registers[10] += STACK_FUNCTION_SIZE as u64;
-
-        // Registers R6-R9 are restored while R1-R5 are reset to unreadable.
-        // https://github.com/torvalds/linux/blob/master/Documentation/bpf/classic_vs_extended.rst
-        self.registers[1..=5].fill(0);
-        self.registers[6..=9].copy_from_slice(&frame.registers);
+        state.registers[0]
     }
 }
 
-impl Vm {
-    pub fn map_by_fd_exists(&self, fd: i32) -> bool {
-        (fd as usize) < self.maps.len()
-    }
+impl Deref for PreparedProgram {
+    type Target = EbpfProgram;
 
-    pub fn map_by_fd(&self, fd: i32) -> Option<&BpfMap> {
-        self.maps.get(fd as usize)
-    }
-    pub fn map_by_id_mut(&mut self, id: usize) -> Option<&mut BpfMap> {
-        self.maps.get_mut(id)
-    }
-
-    pub fn map_by_name(&mut self, name: &str) -> Option<&mut BpfMap> {
-        self.maps.iter_mut().find(|map| map.spec.name == name)
-    }
-
-    pub(crate) fn map_lookup_from_guest(&self, map: usize, key_addr: usize) -> Option<usize> {
-        let map = &self.maps[map as usize];
-        let key = self
-            .mem
-            .slice(key_addr, map.repr.key_size())
-            .expect("tried reading out of memory bounds");
-        map.repr.lookup(&self.mem, key)
-    }
-
-    pub(crate) fn map_update_from_guest(
-        &mut self,
-        map_idx: usize,
-        key_addr: usize,
-        value_addr: usize,
-    ) -> std::io::Result<()> {
-        let map = self
-            .maps
-            .get_mut(map_idx)
-            .ok_or(std::io::ErrorKind::NotFound)?;
-        map.repr
-            .update_from_guest(&mut self.mem, key_addr, value_addr)
-    }
-
-    pub(crate) fn map_push_from_guest(
-        &mut self,
-        map_idx: usize,
-        value_addr: usize,
-    ) -> std::io::Result<()> {
-        let map = self
-            .maps
-            .get_mut(map_idx)
-            .ok_or(std::io::ErrorKind::NotFound)?;
-        map.repr.push_from_guest(&mut self.mem, value_addr)
-    }
-
-    pub(crate) fn map_pop_from_guest(
-        &mut self,
-        map_idx: usize,
-        value_addr: usize,
-    ) -> std::io::Result<()> {
-        let map = self
-            .maps
-            .get_mut(map_idx)
-            .ok_or(std::io::ErrorKind::NotFound)?;
-        map.repr.pop_from_guest(&mut self.mem, value_addr)
-    }
-
-    pub(crate) fn map_peek_from_guest(
-        &mut self,
-        map_idx: usize,
-        value_addr: usize,
-    ) -> std::io::Result<()> {
-        let map = self
-            .maps
-            .get_mut(map_idx)
-            .ok_or(std::io::ErrorKind::NotFound)?;
-        map.repr.peek_from_guest(&mut self.mem, value_addr)
-    }
-
-    pub fn map(&mut self, name: &str) -> MapHandle<'_> {
-        let map = self
-            .maps
-            .iter_mut()
-            .find(|map| map.spec.name == name)
-            .unwrap();
-
-        MapHandle {
-            mem: &mut self.mem,
-            map,
-        }
+    fn deref(&self) -> &Self::Target {
+        self.prog.as_ref()
     }
 }
 
-pub struct MapHandle<'a> {
-    mem: &'a mut Memory,
-    map: &'a mut BpfMap,
-}
+pub struct MapHandle(Arc<BpfMap>);
 
-impl<'a> MapHandle<'a> {
+impl MapHandle {
     pub fn update(
-        &mut self,
+        &self,
         key: &(impl serde::Serialize + ?Sized),
         val: &(impl serde::Serialize + ?Sized),
     ) -> std::io::Result<()> {
         let key = crate::value::to_value(key).unwrap();
         let val = crate::value::to_value(val).unwrap();
 
-        let key_ty = self.map.btf.get_type(self.map.spec.key.unwrap()).unwrap();
-        let val_ty = self.map.btf.get_type(self.map.spec.value.unwrap()).unwrap();
+        let key_ty = self.0.btf.get_type(self.0.spec.key.unwrap()).unwrap();
+        let val_ty = self.0.btf.get_type(self.0.spec.value.unwrap()).unwrap();
 
-        let key = key.to_bytes(&self.map.btf, key_ty);
-        let val = val.to_bytes(&self.map.btf, val_ty);
+        let key = key.to_bytes(&self.0.btf, key_ty);
+        let val = val.to_bytes(&self.0.btf, val_ty);
 
-        self.map.repr.update(&mut self.mem, &key, &val)
+        self.0.repr.update(&key, &val)
     }
 
     pub fn push(&mut self, val: &(impl serde::Serialize + ?Sized)) -> std::io::Result<()> {
         let val = crate::value::to_value(val).unwrap();
-        let val_ty = self.map.btf.get_type(self.map.spec.value.unwrap()).unwrap();
+        let val_ty = self.0.btf.get_type(self.0.spec.value.unwrap()).unwrap();
 
-        let val = val.to_bytes(&self.map.btf, val_ty);
-        self.map.repr.push(&mut self.mem, &val)
+        let val = val.to_bytes(&self.0.btf, val_ty);
+        self.0.repr.push(&val)
     }
 
     pub fn pop<T: for<'de> serde::Deserialize<'de>>(&mut self) -> Option<T> {
-        let val_ty = self.map.btf.get_type(self.map.spec.value.unwrap()).unwrap();
+        let val_ty = self.0.btf.get_type(self.0.spec.value.unwrap()).unwrap();
 
-        let addr = self.map.repr.pop(&self.mem)?;
-        let bytes = self.mem.slice(addr, self.map.repr.value_size())?;
-        let pv = ProgramValue::from_bytes(&self.map.btf, val_ty, bytes);
+        let addr = self.0.repr.pop()?;
+        let bytes = self.0.repr.read_bytes(addr, self.0.repr.value_size())?;
+        let pv = ProgramValue::from_bytes(&self.0.btf, val_ty, &bytes);
         Some(crate::value::from_value(pv).unwrap())
     }
 
@@ -425,69 +371,28 @@ impl<'a> MapHandle<'a> {
         key: &(impl serde::Serialize + ?Sized),
     ) -> Option<T> {
         let key = crate::value::to_value(key).unwrap();
-        let key_ty = self.map.btf.get_type(self.map.spec.key.unwrap()).unwrap();
-        let val_ty = self.map.btf.get_type(self.map.spec.value.unwrap()).unwrap();
+        let key_ty = self.0.btf.get_type(self.0.spec.key.unwrap()).unwrap();
+        let val_ty = self.0.btf.get_type(self.0.spec.value.unwrap()).unwrap();
 
-        let key = key.to_bytes(&self.map.btf, key_ty);
-        let addr = self.map.repr.lookup(&self.mem, &key)?;
-        let bytes = self.mem.slice(addr, self.map.repr.value_size())?;
-
-        let pv = ProgramValue::from_bytes(&self.map.btf, val_ty, bytes);
+        let key = key.to_bytes(&self.0.btf, key_ty);
+        let addr = self.0.repr.lookup(&key)?;
+        let bytes = self.0.repr.read_bytes(addr, self.0.repr.value_size())?;
+        let pv = ProgramValue::from_bytes(&self.0.btf, val_ty, &bytes);
         Some(crate::value::from_value(pv).unwrap())
     }
 
     pub fn clear(&mut self) {
-        self.map.repr.clear(self.mem);
+        self.0.repr.clear();
     }
 
     pub fn btf(&self) -> &crate::btf::Btf {
-        &self.map.btf
+        &self.0.btf
     }
 
     pub fn btf_val_type(&self) -> &crate::btf::BtfType {
-        self.map
+        self.0
             .btf
-            .get_type(self.map.spec.value.unwrap())
+            .get_type(self.0.spec.value.unwrap())
             .expect("map missing value BTF type")
     }
-}
-
-#[derive(Default)]
-pub struct VmCode {
-    insns: Vec<Insn>,
-    pc: usize,
-}
-
-impl VmCode {
-    pub fn step(&mut self) -> Option<Insn> {
-        self.pc += 1;
-        self.insns.get(self.pc - 1).copied()
-    }
-
-    pub fn peek(&self) -> Option<Insn> {
-        self.insns.get(self.pc).copied()
-    }
-
-    pub fn add_offset(&mut self, offset: isize) {
-        self.pc = (self.pc as isize + offset) as usize;
-    }
-
-    pub fn set_pc(&mut self, pc: usize) {
-        self.pc = pc;
-    }
-
-    pub fn pc(&self) -> usize {
-        self.pc
-    }
-}
-
-/// This is a arbitrary number. The eBPF verifier is able to figure out stack
-/// usage per function by tracking register states and using a PTR_TO_STACK
-/// state. I won't do this, for now at least.
-const STACK_FUNCTION_SIZE: usize = 512;
-
-#[derive(Default, Debug)]
-struct StackFrame {
-    ret_addr: usize,
-    registers: [u64; 4],
 }
