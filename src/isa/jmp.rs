@@ -1,7 +1,5 @@
-use std::ffi::CStr;
-
 use super::Insn;
-use crate::verifier::{RegisterState, ScalarRange};
+use crate::vm::helpers;
 
 /// JMP instructions OP mask
 pub const JMP_OP_MASK: u8 = 0b11110000;
@@ -42,15 +40,12 @@ macro_rules! jmp_src_cond {
     ($($name:ident, |$dst:tt, $src:tt| $cond:expr;)+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::vm::State, insn: Insn) {
-                let dst = insn.dst_reg();
-                let src = insn.src_reg();
-
-                let $src = state.registers[src as usize];
-                let $dst = state.registers[dst as usize];
+            pub fn $name(state: &mut crate::vm::Cpu, insn: Insn) {
+                let $src = state.reg(insn.src_reg());
+                let $dst = state.reg(insn.dst_reg());
 
                 if $cond {
-                    state.add_offset(insn.offset() as isize);
+                    state.advance_pc_by(insn.offset() as isize);
                 }
             }
         )+
@@ -86,14 +81,12 @@ macro_rules! jmp_imm_cond {
     ($($name:ident, |$dst:tt, $imm:tt| $cond:expr;)+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::vm::State, insn: Insn) {
-                let dst = insn.dst_reg();
-
+            pub fn $name(state: &mut crate::vm::Cpu, insn: Insn) {
                 let $imm = insn.imm() as u64;
-                let $dst = state.registers[dst as usize];
+                let $dst = state.reg(insn.dst_reg());
 
                 if $cond {
-                    state.add_offset(insn.offset() as isize);
+                    state.advance_pc_by(insn.offset() as isize);
                 }
             }
         )+
@@ -125,273 +118,22 @@ jmp_imm_cond! {
     jsle_imm_64, |dst, imm| (dst as i64) <= (imm as i64);
 }
 
-pub fn ja_32(state: &mut crate::vm::State, insn: Insn) {
-    state.add_offset(insn.imm() as isize);
+pub fn ja_32(state: &mut crate::vm::Cpu, insn: Insn) {
+    state.advance_pc_by(insn.imm() as isize);
 }
 
-pub fn ja_16(state: &mut crate::vm::State, insn: Insn) {
-    state.add_offset(insn.offset() as isize);
+pub fn ja_16(state: &mut crate::vm::Cpu, insn: Insn) {
+    state.advance_pc_by(insn.offset() as isize);
 }
 
-pub fn exit(state: &mut crate::vm::State, _: Insn) {
-    state.exit = true;
+pub fn exit(state: &mut crate::vm::Cpu, _: Insn) {
+    state.call_exit();
 }
 
 /// Ref: <https://github.com/libbpf/libbpf/blob/d65dbb412d661acae9d67c3786be5b36005b2ac1/include/uapi/linux/bpf.h#L1357-L1364>
 pub const BPF_PSEUDO_CALL: u8 = 1;
 pub const BPF_PSEUDO_KFUNC_CALL: u8 = 2;
 pub const BPF_HELPER_CALL: u8 = 0;
-
-pub type HelperExecFn = fn(&mut crate::vm::State, Insn);
-pub type HelperRetvalFn = fn(&crate::vm::Vm, &[RegisterState; 11], Insn) -> RegisterState;
-pub type HelperParamsFn =
-    fn(&crate::vm::Vm, &[RegisterState; 11], Insn) -> Result<(), &'static str>;
-
-pub struct BpfHelper {
-    pub exec: HelperExecFn,
-    pub retval: HelperRetvalFn,
-    pub params: HelperParamsFn,
-}
-
-fn noop_exec(_: &mut crate::vm::State, _: Insn) {
-    panic!("unimplemented helper function");
-}
-
-fn noop_retval(_: &crate::vm::Vm, _: &[RegisterState; 11], _: Insn) -> RegisterState {
-    RegisterState::Uninit
-}
-
-fn noop_params(_: &crate::vm::Vm, _: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
-    Err("unimplemented helper function")
-}
-
-const NOOP_HELPER: BpfHelper = BpfHelper {
-    exec: noop_exec,
-    retval: noop_retval,
-    params: noop_params,
-};
-
-macro_rules! helper_table {
-    ($($id:expr => ($exec:expr, $retval:expr, $params:expr);)+) => {
-        pub const BPF_HELPER_TABLE: [BpfHelper; 256] = {
-            let mut table: [BpfHelper; 256] = [NOOP_HELPER; 256];
-            $(table[$id as usize] = BpfHelper { exec: $exec, retval: $retval, params: $params };)+
-            table
-        };
-    };
-}
-
-const BPF_FUNC_MAP_LOOKUP_ELEM: i32 = 1;
-const BPF_FUNC_MAP_UPDATE_ELEM: i32 = 2;
-const BPF_FUNC_MAP_DELETE_ELEM: i32 = 3;
-const BPF_FUNC_TRACE_PRINTK: i32 = 6;
-const BPF_FUNC_GET_PRANDOM_U32: i32 = 7;
-const BPF_FUNC_GET_CURRENT_PID_TGID: i32 = 14;
-
-const BPF_FUNC_MAP_PUSH_ELEM: i32 = 87;
-const BPF_FUNC_MAP_POP_ELEM: i32 = 88;
-const BPF_FUNC_MAP_PEEK_ELEM: i32 = 89;
-
-helper_table! {
-    // static void *(* const bpf_map_lookup_elem)(void *map, const void *key) = (void *) 1;
-    // R1: map pointer, R2: key pointer
-    // R0: pointer to value or NULL
-    BPF_FUNC_MAP_LOOKUP_ELEM => (
-        |state, _| {
-            let map_fd = state.registers[1] as u16;
-            let key = state.registers[2];
-            let elem = state.lookup_elem(map_fd, key).unwrap_or_default();
-            state.registers[0] = elem as u64;
-        },
-        |vm, regs, _| {
-            let RegisterState::PtrToMap { map_fd } = regs[1] else {
-                panic!("map_lookup_elem: R1 must be PtrToMap");
-            };
-            let map = vm.find_map(map_fd).unwrap();
-            if map.spec.r#type == Some(crate::maps::BPF_MAP_TYPE_ARRAY) {
-                RegisterState::PtrToMapValue { map_fd, offset: ScalarRange::exact(0) }
-            } else {
-                RegisterState::PtrToMapValueOrNull { map_fd }
-            }
-        },
-        |_, regs, _| {
-            if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
-                return Err("map_lookup_elem: R1 must be PtrToMap");
-            }
-            if !regs[2].is_pointer() {
-                return Err("map_lookup_elem: R2 must be a valid pointer");
-            }
-            Ok(())
-        }
-    );
-    // static long (* const bpf_map_update_elem)(void *map, const void *key, const void *value, __u64 flags) = (void *) 2;
-    // R1: map pointer, R2: key pointer, R3: value, R4: flags
-    // R0: success or errno
-    BPF_FUNC_MAP_UPDATE_ELEM => (
-        |state, _| {
-            let map_fd = state.registers[1] as u16;
-            let key_ptr = state.registers[2];
-            let value_ptr = state.registers[3];
-            match state.map_update(map_fd, key_ptr, value_ptr) {
-                Ok(()) => state.registers[0] = 0,
-                Err(_) => state.registers[0] = -1i64 as u64,
-            }
-        },
-        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
-        |_, regs, _| {
-            if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
-                return Err("map_update_elem: R1 must be PtrToMap");
-            }
-            if !regs[2].is_pointer() {
-                return Err("map_update_elem: R2 must be a valid pointer");
-            }
-            if !regs[3].is_pointer() {
-                return Err("map_update_elem: R3 must be a valid pointer");
-            }
-            if !matches!(regs[4], RegisterState::Scalar(_)) {
-                return Err("map_update_elem: R4 must be a scalar");
-            }
-            Ok(())
-        }
-    );
-    // static long (* const bpf_map_delete_elem)(void *map, const void *key) = (void *) 3;
-    // R1: map pointer, R2: key pointer
-    // R0: success or errno
-    BPF_FUNC_MAP_DELETE_ELEM => (
-        |state, _| {
-            let map_fd = state.registers[1] as u16;
-            let key_ptr = state.registers[2];
-            match state.map_delete(map_fd, key_ptr) {
-                Ok(()) => state.registers[0] = 0,
-                Err(_) => state.registers[0] = -1i64 as u64,
-            }
-        },
-        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
-        |_, regs, _| {
-            if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
-                return Err("map_delete_elem: R1 must be PtrToMap");
-            }
-            if !regs[2].is_pointer() {
-                return Err("map_delete_elem: R2 must be a valid pointer");
-            }
-            Ok(())
-        }
-    );
-    // static long (* const bpf_trace_printk)(const char *fmt, __u32 fmt_size, ...) = (void *) 6;
-    // R1: addr, R2: size, R3/R4/R5: formatting params
-    // R0: n of written bytes or negative error code
-    BPF_FUNC_TRACE_PRINTK => (
-        |state, _| {
-            let addr = state.registers[1];
-            let len = state.registers[2] as usize;
-            let data = state.read_bytes(addr, len);
-            let Ok(s) = CStr::from_bytes_until_nul(&data) else {
-                state.registers[0] = -22i64 as u64; // EINVAL
-                return;
-            };
-            let Ok(s) = s.to_str() else {
-                panic!("string is not utf8");
-            };
-            let s = prepare_bpf_trace_printk(state, s.to_string());
-            state.registers[0] = s.len() as u64;
-            eprintln!("Print: {s:?}");
-        },
-        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
-        |_, regs, _| {
-            if !regs[1].is_pointer() {
-                return Err("trace_printk: R1 must be a valid pointer");
-            }
-            if !matches!(regs[2], RegisterState::Scalar(_)) {
-                return Err("trace_printk: R2 must be a scalar");
-            }
-            Ok(())
-        }
-    );
-    // static __u32 (* const bpf_get_prandom_u32)(void) = (void *) 7;
-    // R0: random u32
-    BPF_FUNC_GET_PRANDOM_U32 => (
-        |state, _| state.registers[0] = state.prog.vm.prandom_u32() as u64,
-        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
-        |_, _, _| Ok(())
-    );
-    // static __u64 (* const bpf_get_current_pid_tgid)(void) = (void *) 14;
-    // R0: tgid << 32 | pid
-    // TODO: should the vm have a configurable execution context?
-    BPF_FUNC_GET_CURRENT_PID_TGID => (
-        |state, _| state.registers[0] = (0xDEAD << 32) | 0xBEEF,
-        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::U64(crate::verifier::ScalarRange::exact(0))),
-        |_, _, _| Ok(())
-    );
-    // static long (* const bpf_map_push_elem)(void *map, const void *value, __u64 flags) = (void *) 87;
-    // R1: map pointer, R2: value pointer, R3: flags
-    // R0: success or errno
-    BPF_FUNC_MAP_PUSH_ELEM => (
-        |state, _| {
-            let map_fd = state.registers[1] as u16;
-            let value_ptr = state.registers[2];
-            match state.map_push(map_fd, value_ptr) {
-                Ok(()) => state.registers[0] = 0,
-                Err(_) => state.registers[0] = -1i64 as u64,
-            }
-        },
-        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
-        |_, regs, _| {
-            if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
-                return Err("map_push_elem: R1 must be PtrToMap");
-            }
-            if !regs[2].is_pointer() {
-                return Err("map_push_elem: R2 must be a valid pointer");
-            }
-            Ok(())
-        }
-    );
-    // static long (* const bpf_map_pop_elem)(void *map, void *value) = (void *) 88;
-    // R1: map pointer, R2: value pointer (output)
-    // R0: success or errno
-    BPF_FUNC_MAP_POP_ELEM => (
-        |state, _| {
-            let map_fd = state.registers[1] as u16;
-            let dest_ptr = state.registers[2];
-            match state.map_pop(map_fd, dest_ptr) {
-                Ok(()) => state.registers[0] = 0,
-                Err(_) => state.registers[0] = -1i64 as u64,
-            }
-        },
-        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
-        |_, regs, _| {
-            if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
-                return Err("map_pop_elem: R1 must be PtrToMap");
-            }
-            if !regs[2].is_pointer() {
-                return Err("map_pop_elem: R2 must be a valid pointer");
-            }
-            Ok(())
-        }
-    );
-    // static long (* const bpf_map_peek_elem)(void *map, void *value) = (void *) 89;
-    // R1: map pointer, R2: value pointer (output)
-    // R0: success or errno
-    BPF_FUNC_MAP_PEEK_ELEM => (
-        |state, _| {
-            let map_fd = state.registers[1] as u16;
-            let dest_ptr = state.registers[2];
-            match state.map_peek(map_fd, dest_ptr) {
-                Ok(()) => state.registers[0] = 0,
-                Err(_) => state.registers[0] = -1i64 as u64,
-            }
-        },
-        |_, _, _| RegisterState::Scalar(crate::verifier::Scalar::Unknown),
-        |_, regs, _| {
-            if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
-                return Err("map_peek_elem: R1 must be PtrToMap");
-            }
-            if !regs[2].is_pointer() {
-                return Err("map_peek_elem: R2 must be a valid pointer");
-            }
-            Ok(())
-        }
-    );
-}
 
 /// Performs a call jump.
 ///
@@ -402,78 +144,23 @@ helper_table! {
 /// used as PC-rel offset, and a stack frame is pushed.
 ///
 /// Ref: <https://github.com/torvalds/linux/blob/98ac9cc4b4452ed7e714eddc8c90ac4ae5da1a09/include/uapi/linux/bpf.h#L5870>
-pub fn jmp_call(state: &mut crate::vm::State, insn: Insn) {
+pub fn jmp_call(state: &mut crate::vm::Cpu, insn: Insn) {
     let src = insn.src_reg();
 
     match src {
         // BPF-local functions / subprograms
         BPF_PSEUDO_CALL => state.call(insn.imm()),
         BPF_HELPER_CALL => {
-            let helper_id = insn.imm() as usize;
-            (BPF_HELPER_TABLE[helper_id].exec)(state, insn);
+            if let Some(helper) = helpers::lookup(insn.imm()) {
+                helper.exec(state, insn)
+            }
         }
+        #[expect(
+            clippy::todo,
+            reason = "kfunc support is a deliberate missing feature; programs reaching here failed \
+                      to be rejected by the verifier (which does not yet handle kfunc src_reg)"
+        )]
         BPF_PSEUDO_KFUNC_CALL => todo!("kfunc calls not implemented"),
-        _ => panic!("invalid call src_reg"),
-    }
-}
-
-/// Prepares the formatting string for `printk()` calls.
-///
-/// This is a very small reproduction of the Kernel's `printk`
-/// functionality, currently only supporting two specifiers,
-/// `d` and `s`.
-///
-/// From the kernel:
-/// > The conversion specifiers supported by *fmt* are similar, but
-/// > more limited than for printk(). They are **%d**, **%i**,
-/// > **%u**, **%x**, **%ld**, **%li**, **%lu**, **%lx**, **%lld**,
-/// > **%lli**, **%llu**, **%llx**, **%p**, **%s**. No modifier (size
-/// > of field, padding with zeroes, etc.) is available, and the
-/// > helper will return **-EINVAL** (but print nothing) if it
-/// > encounters an unknown specifier.
-///
-/// Ref: <https://github.com/torvalds/linux/blob/f406055cb18c6e299c4a783fc1effeb16be41803/include/uapi/linux/bpf.h#L1961>
-fn prepare_bpf_trace_printk(state: &mut crate::vm::State, s: String) -> String {
-    let mut arg_count = 0;
-
-    let mut buf: Option<Vec<_>> = None;
-    let mut formatting = false;
-    for (idx, c) in s.char_indices() {
-        if formatting {
-            arg_count += 1;
-            if arg_count >= 4 {
-                panic!("too many printk arguments");
-            }
-
-            let param = state.registers[2 + arg_count];
-            let buf = buf.as_mut().unwrap();
-            match c {
-                'd' => {
-                    buf.extend(param.to_string().as_bytes());
-                }
-                's' => {
-                    let data = state.try_buf(param).unwrap_or(&[0]);
-                    let s = CStr::from_bytes_until_nul(data).unwrap();
-                    buf.extend(s.to_bytes());
-                }
-                _ => todo!(),
-            }
-            formatting = false;
-        } else if c == '%' {
-            if buf.is_none() {
-                let mut items = Vec::with_capacity(s.len());
-                items.extend_from_slice(&s.as_bytes()[..idx]);
-                buf = Some(items)
-            }
-            formatting = true;
-        } else if let Some(buf) = &mut buf {
-            buf.push(s.as_bytes()[idx]);
-        }
-    }
-
-    if let Some(buf) = buf {
-        String::from_utf8(buf).unwrap()
-    } else {
-        s
+        _ => {}
     }
 }

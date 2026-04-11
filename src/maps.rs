@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use crate::btf::{Btf, BtfTypeId};
+use crate::{
+    btf::{Btf, BtfTypeId},
+    error::{PrepareError, RuntimeError},
+};
 
 mod array;
 mod hash_table;
@@ -82,7 +85,7 @@ pub enum MapRepr {
     Hash(hash_table::HashTable),
     Array(array::Array),
     ProgArray,
-    PerfEventArray,
+    PerfEventArray(array::Array),
     PercpuHash,
     PercpuArray,
     StackTrace,
@@ -136,7 +139,7 @@ macro_rules! delegate_map_impl {
             }
         }
 
-        pub fn update(&self, key: &[u8], value: &[u8]) -> std::io::Result<()> {
+        pub fn update(&self, key: &[u8], value: &[u8]) -> Result<(), RuntimeError> {
             match self {
                 $(Self::$name(map) => map.update(key, value),)+
                 _ => todo!(),
@@ -157,7 +160,7 @@ macro_rules! delegate_map_impl {
             }
         }
 
-        pub fn write(&self, offset: usize, src: &[u8]) -> std::io::Result<()> {
+        pub fn write(&self, offset: usize, src: &[u8]) -> Result<(), RuntimeError> {
             match self {
                 $(Self::$name(map) => map.write(offset, src),)+
                 _ => todo!(),
@@ -170,30 +173,62 @@ macro_rules! delegate_map_impl {
                 _ => todo!(),
             }
         }
+
+        pub fn for_each_entry(&self, f: impl FnMut(&[u8], &[u8])) {
+            match self {
+                $(Self::$name(map) => map.for_each_entry(f),)+
+                _ => (),
+            }
+        }
     };
 }
 
 impl MapRepr {
-    pub fn create_from_btf(btf: &Btf, spec: &MapSpec) -> Option<Self> {
-        Some(match spec.r#type? {
+    pub fn create_from_btf(btf: &Btf, spec: &MapSpec) -> Result<Self, PrepareError> {
+        let invalid = |reason: &'static str| PrepareError::InvalidMap {
+            name: spec.name.clone(),
+            reason,
+        };
+        let key_size = || {
+            spec.key_size
+                .or_else(|| {
+                    spec.key
+                        .and_then(|id| btf.get_type(id))
+                        .map(|t| t.kind.size(btf))
+                })
+                .ok_or_else(|| invalid("missing key size"))
+        };
+        let value_size = || {
+            spec.value_size
+                .or_else(|| {
+                    spec.value
+                        .and_then(|id| btf.get_type(id))
+                        .map(|t| t.kind.size(btf))
+                })
+                .ok_or_else(|| invalid("missing value size"))
+        };
+        let max_entries = || {
+            spec.max_entries
+                .ok_or_else(|| invalid("missing max_entries"))
+        };
+        let r#type = spec.r#type.ok_or_else(|| invalid("missing map type"))?;
+
+        Ok(match r#type {
             BPF_MAP_TYPE_UNSPEC => Self::Unspec,
-            BPF_MAP_TYPE_HASH => Self::Hash(hash_table::HashTable::new(
-                spec.key_size
-                    .or_else(|| spec.key.and_then(|id| btf.get_type(id))?.kind.size(btf))
-                    .expect("map missing key size"),
-                spec.value_size
-                    .or_else(|| spec.value.and_then(|id| btf.get_type(id))?.kind.size(btf))
-                    .expect("map missing value size"),
-                spec.max_entries?,
-            )),
-            BPF_MAP_TYPE_ARRAY => Self::Array(array::Array::new(
-                spec.max_entries?,
-                spec.value_size
-                    .or_else(|| spec.value.and_then(|id| btf.get_type(id))?.kind.size(btf))
-                    .expect("map missing value size"),
-            )),
+            BPF_MAP_TYPE_HASH => Self::Hash(
+                hash_table::HashTable::new(key_size()?, value_size()?, max_entries()?)
+                    .map_err(invalid)?,
+            ),
+            BPF_MAP_TYPE_ARRAY => {
+                Self::Array(array::Array::new(max_entries()?, value_size()?).map_err(invalid)?)
+            }
             BPF_MAP_TYPE_PROG_ARRAY => Self::ProgArray,
-            BPF_MAP_TYPE_PERF_EVENT_ARRAY => Self::PerfEventArray,
+            BPF_MAP_TYPE_PERF_EVENT_ARRAY => Self::PerfEventArray(
+                // Each slot holds a u32 fd, matching what libbpf and the
+                // kernel use. `max_entries` defaults to 1 (single CPU).
+                array::Array::new(spec.max_entries.unwrap_or(1), spec.value_size.unwrap_or(4))
+                    .map_err(invalid)?,
+            ),
             BPF_MAP_TYPE_PERCPU_HASH => Self::PercpuHash,
             BPF_MAP_TYPE_PERCPU_ARRAY => Self::PercpuArray,
             BPF_MAP_TYPE_STACK_TRACE => Self::StackTrace,
@@ -212,12 +247,9 @@ impl MapRepr {
             BPF_MAP_TYPE_REUSEPORT_SOCKARRAY => Self::ReuseportSockarray,
             BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE => Self::PercpuCgroupStorage,
             BPF_MAP_TYPE_QUEUE => Self::Queue,
-            BPF_MAP_TYPE_STACK => Self::Stack(stack::Stack::new(
-                spec.max_entries?,
-                spec.value_size
-                    .or_else(|| spec.value.and_then(|id| btf.get_type(id))?.kind.size(btf))
-                    .expect("map missing value size"),
-            )),
+            BPF_MAP_TYPE_STACK => {
+                Self::Stack(stack::Stack::new(max_entries()?, value_size()?).map_err(invalid)?)
+            }
             BPF_MAP_TYPE_SK_STORAGE => Self::SkStorage,
             BPF_MAP_TYPE_DEVMAP_HASH => Self::DevmapHash,
             BPF_MAP_TYPE_STRUCT_OPS => Self::StructOps,
@@ -227,25 +259,25 @@ impl MapRepr {
             BPF_MAP_TYPE_BLOOM_FILTER => Self::BloomFilter,
             BPF_MAP_TYPE_USER_RINGBUF => Self::UserRingbuf,
             BPF_MAP_TYPE_CGRP_STORAGE => Self::CgrpStorage,
-            _ => return None,
+            _ => return Err(invalid("unsupported map type")),
         })
     }
 
     delegate_map_impl! {
-        Array, Hash, Stack,
+        Array, Hash, Stack, PerfEventArray,
     }
 
-    pub fn delete(&self, key: &[u8]) -> std::io::Result<()> {
+    pub fn delete(&self, key: &[u8]) -> Result<(), RuntimeError> {
         match self {
             Self::Hash(map) => map.delete(key),
-            _ => Err(std::io::ErrorKind::Unsupported.into()),
+            _ => Err(RuntimeError::MapOpUnsupported),
         }
     }
 
-    pub fn push(&self, value: &[u8]) -> std::io::Result<()> {
+    pub fn push(&self, value: &[u8]) -> Result<(), RuntimeError> {
         match self {
             Self::Stack(map) => map.push(value),
-            _ => Err(std::io::ErrorKind::Unsupported.into()),
+            _ => Err(RuntimeError::MapOpUnsupported),
         }
     }
 

@@ -1,8 +1,8 @@
 #![cfg_attr(target_arch = "bpf", no_std)]
 #![cfg_attr(target_arch = "bpf", no_main)]
 
-const GRID_W: usize = 64;
-const GRID_H: usize = 16;
+const GRID_W: usize = 32;
+const GRID_H: usize = 32;
 const DIE: i64 = -1;
 
 #[repr(u8)]
@@ -41,7 +41,7 @@ struct RenderEvent {
 #[cfg(target_arch = "bpf")]
 mod program {
     use core::{ffi::c_void, hint::black_box};
-    use guest::{
+    use rust_examples::{
         BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_STACK, bpf_get_prandom_u32, bpf_map_lookup_elem,
         bpf_map_push_elem, decl_map,
     };
@@ -85,16 +85,18 @@ mod program {
         };
     }
 
-    unsafe fn push_event(x: u8, y: u8, ty: RenderEventType) {
+    fn push_event(x: u8, y: u8, ty: RenderEventType) {
         let event = RenderEvent { x, y, ty };
-        bpf_map_push_elem(
-            &render_events as *const _ as *const c_void,
-            &event as *const _ as *const c_void,
-            0,
-        );
+        unsafe {
+            bpf_map_push_elem(
+                &render_events as *const _ as *const c_void,
+                &event as *const _ as *const c_void,
+                0,
+            );
+        }
     }
 
-    unsafe fn update_position(state: &mut Game, cell: u32) -> i64 {
+    fn update_position(state: &mut Game, cell: u32) -> i64 {
         let head = state.snake.head as usize;
         if head >= state.snake.body.len() {
             return DIE;
@@ -161,7 +163,7 @@ mod program {
         state.grid[byte_idx] |= bit;
 
         let mut new_head = head + 1;
-        if (new_head >= state.snake.body.len()) {
+        if new_head >= state.snake.body.len() {
             new_head = 0;
         }
 
@@ -175,18 +177,20 @@ mod program {
     }
 
     #[unsafe(no_mangle)]
-    unsafe fn on_tick(ctx: &TickCtx) -> i64 {
+    fn on_tick(ctx: &TickCtx) -> i64 {
         let dir = ctx.dir;
-        let cell = bpf_get_prandom_u32() % (GRID_W as u32 * GRID_H as u32);
+        let cell = unsafe { bpf_get_prandom_u32() } % (GRID_W as u32 * GRID_H as u32);
 
         let idx: u32 = 0;
-        let state_ptr = bpf_map_lookup_elem(
-            &state_map as *const _ as *const c_void,
-            &idx as *const _ as *const c_void,
-        );
+        let state_ptr = unsafe {
+            bpf_map_lookup_elem(
+                &state_map as *const _ as *const c_void,
+                &idx as *const _ as *const c_void,
+            )
+        };
         die_if!(state_ptr.is_null());
 
-        let state = &mut *(state_ptr as *mut Game);
+        let state = unsafe { &mut *(state_ptr as *mut Game) };
 
         if state.snake.len == 0 {
             state.snake.dir = Direction::Right;
@@ -219,7 +223,11 @@ fn main() {
     use std::io::{Write, stdout};
     use std::time::Duration;
 
-    use bepeefe::{EbpfObject, Vm, vm::MapReuseStrategy};
+    use bepeefe::{
+        EbpfObject, Vm,
+        verifier::VerifierConfig,
+        vm::{HostEnv, MapReuseStrategy},
+    };
     use crossterm::{
         ExecutableCommand, cursor, event,
         terminal::{self, ClearType},
@@ -232,7 +240,9 @@ fn main() {
     let prog = obj.load_prog("on_tick").unwrap();
 
     let vm = Vm::new();
-    let prog = vm.prepare(prog, MapReuseStrategy::None);
+    let prog = vm
+        .prepare(prog, MapReuseStrategy::None, &VerifierConfig::default())
+        .unwrap();
 
     let mut grid = [[' '; GRID_W]; GRID_H];
     let mut dir = Direction::Right;
@@ -260,11 +270,11 @@ fn main() {
             }
         }
 
-        let ctx = prog.build_ctx(&[TickCtx { dir }]);
-        let new_score = prog.run(&ctx) as i64;
+        let image = prog.build_image(&[TickCtx { dir }]).unwrap();
+        let new_score = prog.run(image, HostEnv::default(), None) as i64;
 
-        let mut map = vm.map("render_events");
-        while let Some(ev) = map.pop::<RenderEvent>() {
+        let mut map = vm.map("render_events").unwrap();
+        while let Some(ev) = map.pop::<RenderEvent>().unwrap() {
             grid[ev.y as usize][ev.x as usize] = match ev.ty {
                 RenderEventType::Clear => ' ',
                 RenderEventType::Snake => '#',
@@ -295,11 +305,7 @@ fn main() {
             score = new_score;
         }
 
-        let delay = match dir {
-            Direction::Left | Direction::Right => 100,
-            _ => 200,
-        };
-        std::thread::sleep(Duration::from_millis(delay));
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

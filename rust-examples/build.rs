@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_macros)]
+
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
@@ -13,15 +15,18 @@ fn main() {
 
     let status = Command::new("cargo")
         .args([
-            "+nightly",
             "build",
+            "--examples",
             "--release",
             "-Z",
-            "build-std",
+            "build-std=core,alloc",
             "--target",
             "bpfel-unknown-none",
         ])
-        .env("RUSTFLAGS", "-C debuginfo=2 -C link-arg=--btf")
+        .env(
+            "RUSTFLAGS",
+            r#"-C debuginfo=2 -C linker=bpf-linker -C link-arg=--btf -C link-arg=--disable-memory-builtins"#,
+        )
         .env("CARGO_TARGET_DIR", &target_dir)
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTC")
@@ -33,8 +38,8 @@ fn main() {
 
     assert!(status.success(), "BPF build failed");
 
-    let bpf_out = target_dir.join("bpfel-unknown-none/release");
+    let bpf_out = target_dir.join("bpfel-unknown-none/release/examples");
     println!("cargo:rustc-env=BPF_OUT_DIR={}", bpf_out.display());
-    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=lib.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
 }

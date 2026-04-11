@@ -1,2 +1,0 @@
-run bin="hash_map":
-    cargo run --bin {{bin}}

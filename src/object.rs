@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     ffi::CStr,
     io::{Error, ErrorKind},
     rc::Rc,
@@ -13,62 +13,53 @@ use object::{
 
 use crate::{
     btf::{Btf, BtfKind, BtfTypeId, ext::BtfExt},
+    error::LoaderError,
+    hook::Hook,
     isa::Insn,
     maps::{BPF_MAP_TYPE_ARRAY, MapPinning, MapSpec},
-    value::ProgramValue,
 };
-
-#[derive(Debug, thiserror::Error)]
-pub enum LoaderError {
-    #[error("malformed BTF section: {0:?}")]
-    InvalidBtf(std::io::Error),
-    #[error("malformed BTF extension section: {0:?}")]
-    InvalidBtfExt(std::io::Error),
-    #[error("invalid BTF name offset: {0:?}")]
-    InvalidBtfNameOffset(u32),
-    #[error("invalid BTF type ID: {0:?}")]
-    InvalidBtfTypeId(BtfTypeId),
-
-    #[error("deprecated 'maps' section, use '.maps' format instead")]
-    DeprecatedMapsSection,
-
-    #[error("invalid map declaration: {0:?}")]
-    InvalidMapDeclaration(&'static str),
-}
 
 pub struct EbpfObject<'file> {
     file: Rc<File<'file, &'file [u8]>>,
     license: Option<String>,
-    btf: Option<Arc<Btf>>,
+    btf: Arc<Btf>,
     maps: Vec<MapSpec>,
-    functions: Vec<Arc<FunctionSignature>>,
+    functions: Vec<FunctionSignature>,
 }
 
 #[derive(Clone, Debug)]
 pub struct FunctionSignature {
     pub name: String,
+    /// Whether the symbol declaring this function is global, that is, it's an
+    /// entrypoint program.
     pub is_global: bool,
-    pub section_idx: SectionIndex,
     pub params_types: Vec<(String, BtfTypeId)>,
     pub return_type: Option<BtfTypeId>,
 
-    pub insn_offset: usize,
-    pub insn_size: usize,
-}
-
-#[derive(Default)]
-struct ProgLoader {
-    insns: Vec<Insn>,
-    loaded_progs: HashMap<(SectionIndex, usize), usize>,
-    relos: Vec<(usize, Relocation)>,
-    map_relos: HashMap<usize, (SectionIndex, usize)>,
-    data_relos: HashMap<usize, (SectionIndex, usize)>,
+    pub section_idx: SectionIndex,
+    pub section_offset: usize,
+    pub size: usize,
 }
 
 impl<'file> EbpfObject<'file> {
-    /// Parses an ELF file, extracting all BTF and extension
+    /// Parses an ELF object and pulls out everything we'll need to prepare
+    /// programs later: the BTF type graph, BTF.ext (func_info, line_info, CO-RE
+    /// relos), map declarations from `.maps`, synthesized data maps for
+    /// `.rodata`/`.data`/`.bss`, and the list of function signatures.
+    ///
+    /// BTF is required. Without it the verifier has no way to describe context
+    /// arguments to a program, and maps have no key/value schema. Objects
+    /// compiled without BTF debug info will fail here.
+    ///
+    /// From here, use [`Self::load_prog`] to extract a specific entrypoint as
+    /// an [`EbpfProgram`], then [`Vm::prepare`] to wire it up against a VM.
+    /// Nothing in `from_elf` itself touches the VM: no maps created, no FDs
+    /// assigned, no map relocations patched.
+    ///
+    /// [`Vm`]: crate::vm::Vm
+    /// [`Vm::prepare`]: crate::vm::Vm::prepare
     pub fn from_elf(file: &'file [u8]) -> Result<Self, LoaderError> {
-        let file = Rc::new(File::parse(file).unwrap());
+        let file = Rc::new(File::parse(file)?);
 
         let license = file.section_by_name("license").and_then(|sec| {
             sec.data()
@@ -78,14 +69,15 @@ impl<'file> EbpfObject<'file> {
         });
 
         let (btf, maps) = parse_btf(&file)?;
+        let btf = btf.ok_or(LoaderError::MissingBtf)?;
         let functions = collect_functions(&file, &btf)?;
 
         Ok(Self {
             file,
             license,
-            btf: btf.map(Arc::new),
+            btf: Arc::new(btf),
             maps,
-            functions: functions.into_iter().map(Arc::new).collect(),
+            functions: functions.into_iter().collect(),
         })
     }
 
@@ -93,52 +85,360 @@ impl<'file> EbpfObject<'file> {
         self.license.as_deref()
     }
 
-    pub fn programs(&self) -> impl Iterator<Item = &Arc<FunctionSignature>> {
+    pub fn programs(&self) -> impl Iterator<Item = &FunctionSignature> {
         self.functions.iter().filter(|f| f.is_global)
     }
 
+    pub fn functions(&self) -> &[FunctionSignature] {
+        &self.functions
+    }
+
+    pub fn maps(&self) -> &[MapSpec] {
+        &self.maps
+    }
+
+    pub fn section_name(&self, sec_idx: SectionIndex) -> Option<&str> {
+        self.file.section_by_index(sec_idx).ok()?.name().ok()
+    }
+
+    pub fn btf(&self) -> &Arc<Btf> {
+        &self.btf
+    }
+
+    /// Loads a named entrypoint from this object, flattening it together
+    /// with any subprograms it calls into a single instruction stream
+    /// ready to hand to [`Vm::prepare`].
+    ///
+    /// `name` must match a global symbol, typically a function annotated with
+    /// `SEC(...)`. Static helpers and uncalled subprograms aren't reachable
+    /// here, they only get pulled in when an entrypoint transitively calls
+    /// them.
+    ///
+    /// Map and data-section relocations are recorded but not yet patched.
+    /// Those FDs don't exist until the program is prepared against a [`Vm`], at
+    /// which point the deferred relocations get rewritten with the assigned
+    /// FDs.
+    ///
+    /// [`Vm`]: crate::vm::Vm
+    /// [`Vm::prepare`]: crate::vm::Vm::prepare
     pub fn load_prog(&self, name: &str) -> Result<EbpfProgram, LoaderError> {
-        let prog = self
+        let func = self
             .functions
             .iter()
             .find(|f| f.is_global && f.name == name)
-            .unwrap_or_else(|| panic!(r#"program "{name}" not found"#));
+            .ok_or_else(|| LoaderError::ProgramNotFound(name.to_string()))?;
+        ProgLoader::load(self, func)
+    }
 
-        let mut program = ProgLoader::default();
-        self.load_code(prog, &mut program);
-        self.resolve_relocations(&mut program);
+    fn get_func(&self, sec_idx: SectionIndex, sec_off: usize) -> Option<&FunctionSignature> {
+        self.functions
+            .iter()
+            .find(|p| p.section_idx == sec_idx && p.section_offset == sec_off)
+    }
 
-        let line_info = self.collect_lines(&program);
+    fn rel_symbol_target(&self, rel: &Relocation) -> Result<(SectionIndex, usize), LoaderError> {
+        let RelocationTarget::Symbol(idx) = rel.target() else {
+            return Err(LoaderError::Unsupported("non-symbol relocation target"));
+        };
+        let sym = self.file.symbol_by_index(idx)?;
+        let sym_sec = sym.section_index().ok_or_else(|| {
+            LoaderError::Malformed(format!(
+                "symbol {:?} has no associated section",
+                sym.name().unwrap_or("?")
+            ))
+        })?;
+        Ok((sym_sec, sym.address() as usize))
+    }
+}
+
+#[derive(Clone)]
+struct LoadedSubprog {
+    /// Position in `ProgLoader::insns` where this subprogram was copied to.
+    insn_pc: usize,
+    func: FunctionSignature,
+}
+
+#[derive(Default)]
+struct ProgLoader {
+    insns: Vec<Insn>,
+    /// All programs that have been copied into `insns`.
+    loaded_progs: Vec<LoadedSubprog>,
+    relos: Vec<(usize, Relocation)>,
+}
+
+impl ProgLoader {
+    fn load<'obj>(
+        obj: &'obj EbpfObject<'obj>,
+        func: &FunctionSignature,
+    ) -> Result<EbpfProgram, LoaderError> {
+        let mut loader = ProgLoader::default();
+
+        loader.load_code(func, obj)?;
+        let deferred = loader.resolve_relocations(obj)?;
+        let line_info = loader.collect_lines(obj);
+
+        let subprogs = loader
+            .loaded_progs
+            .into_iter()
+            .map(|p| (p.insn_pc, p.func))
+            .collect();
+
+        let hook = obj.section_name(func.section_idx).and_then(Hook::parse);
 
         Ok(EbpfProgram {
-            insns: program.insns,
-            sig: prog.clone(),
-            maps: self.maps.clone(),
-            btf: self.btf.clone(),
-            map_relos: program.map_relos,
-            data_relos: program.data_relos,
+            insns: loader.insns,
+            func: func.clone(),
+            maps: obj.maps.clone(),
+            btf: obj.btf.clone(),
+            hook,
+            deferred,
             line_info,
+            subprogs,
         })
     }
 
-    fn collect_lines(&self, program: &ProgLoader) -> BTreeMap<usize, LineEntry> {
-        let Some(btf) = &self.btf else {
-            return Default::default();
-        };
+    fn find_loaded(&self, section_idx: SectionIndex, byte_offset: usize) -> Option<usize> {
+        self.loaded_progs
+            .iter()
+            .find(|p| p.func.section_idx == section_idx && p.func.section_offset == byte_offset)
+            .map(|p| p.insn_pc)
+    }
+
+    /// Copies a function's instructions into the flat program buffer and
+    /// recurses into any subprograms it calls so they end up in the same
+    /// buffer. The point is to flatten what the compiler split across
+    /// `.text` sections into a single instruction stream the VM can step
+    /// through linearly.
+    ///
+    /// Subprogram calls come in two flavors:
+    ///
+    /// * `R_BPF_64_32` relocation against a text symbol, when the callee lives
+    ///   in a different section. The symbol address tells us where the callee
+    ///   is in its own section.
+    /// * PC-relative call with no relocation, when the callee is in the same
+    ///   section. The instruction's immediate is a count of 8-byte instructions
+    ///   from the call site to the target.
+    ///
+    /// `ld_imm64` relocations (map and data-section references) are
+    /// accumulated into `self.relos` for `resolve_relocations` to patch later,
+    /// once the VM has assigned FDs.
+    fn load_code<'obj>(
+        &mut self,
+        func: &FunctionSignature,
+        obj: &'obj EbpfObject<'obj>,
+    ) -> Result<(), LoaderError> {
+        let sec = obj.file.section_by_index(func.section_idx)?;
+
+        let (chunks, _) = sec
+            .data()?
+            .get(func.section_offset..func.section_offset + func.size)
+            .ok_or_else(|| {
+                LoaderError::Malformed(format!(
+                    "function {:?} extends past section data",
+                    func.name
+                ))
+            })?
+            .as_chunks::<{ Insn::WIDTH }>();
+
+        self.insns.reserve(chunks.len());
+        self.loaded_progs.push(LoadedSubprog {
+            insn_pc: self.insns.len(),
+            func: func.clone(),
+        });
+
+        let mut sec_off = func.section_offset;
+        for chunk in chunks {
+            let insn = Insn(u64::from_le_bytes(*chunk));
+            let flat_pc = self.insns.len();
+            self.insns.push(insn);
+
+            match sec.relocations().find(|(r, _)| *r as usize == sec_off) {
+                Some((_, rel)) if insn.is_subprog_call() => {
+                    let (sym_sec, sym_off) = obj.rel_symbol_target(&rel)?;
+                    self.ensure_subprog_loaded(
+                        obj,
+                        sym_sec,
+                        sym_off,
+                        "subprogram referenced by symbol was not found in section",
+                    )?;
+                    self.relos.push((flat_pc, rel));
+                }
+
+                Some((_, rel)) if insn.is_ld_imm64() => self.relos.push((flat_pc, rel)),
+
+                None if insn.is_subprog_call() => {
+                    let target_off = sec_off + (insn.imm() as usize + 1) * Insn::WIDTH;
+                    self.ensure_subprog_loaded(
+                        obj,
+                        func.section_idx,
+                        target_off,
+                        "pc-relative subprogram was not found in same section",
+                    )?;
+                }
+
+                _ => {}
+            }
+
+            sec_off += Insn::WIDTH;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_subprog_loaded<'obj>(
+        &mut self,
+        obj: &'obj EbpfObject<'obj>,
+        sec_idx: SectionIndex,
+        sec_off: usize,
+        err: &'static str,
+    ) -> Result<(), LoaderError> {
+        if self.find_loaded(sec_idx, sec_off).is_some() {
+            return Ok(());
+        }
+        let subprogram = obj
+            .get_func(sec_idx, sec_off)
+            .ok_or_else(|| LoaderError::Malformed(err.into()))?;
+        self.load_code(subprogram, obj)
+    }
+
+    fn resolve_relocations<'obj>(
+        &mut self,
+        obj: &'obj EbpfObject<'obj>,
+    ) -> Result<BTreeMap<usize, Deferred>, LoaderError> {
+        let mut deferred = BTreeMap::new();
+
+        for (insn_pc, rel) in std::mem::take(&mut self.relos) {
+            let RelocationFlags::Elf { r_type } = rel.flags() else {
+                return Err(LoaderError::Unsupported("non-ELF relocation flags"));
+            };
+            let RelocationTarget::Symbol(sym) = rel.target() else {
+                return Err(LoaderError::Unsupported("non-symbol relocation target"));
+            };
+
+            let sym = obj.file.symbol_by_index(sym)?;
+            let sec_idx = sym.section_index().ok_or_else(|| {
+                LoaderError::Malformed(format!(
+                    "relocation symbol {:?} has no section",
+                    sym.name().unwrap_or("?")
+                ))
+            })?;
+
+            let sec_name = obj
+                .file
+                .section_by_index(sec_idx)
+                .ok()
+                .and_then(|s| s.name().ok().map(String::from));
+
+            let def =
+                self.resolve_relo(insn_pc, r_type, sym.address(), sec_idx, sec_name.as_deref())?;
+
+            if let Some(d) = def {
+                deferred.insert(insn_pc, d);
+            }
+        }
+
+        Ok(deferred)
+    }
+
+    /// Resolve a relocation following the Kernel rules for LLVM relos.
+    ///
+    /// Ref: <https://github.com/torvalds/linux/blob/master/Documentation/bpf/llvm_reloc.rst>
+    fn resolve_relo(
+        &mut self,
+        insn_pc: usize,
+        relo_type: u32,
+        addr: u64,
+        sec_idx: SectionIndex,
+        sec_name: Option<&str>,
+    ) -> Result<Option<Deferred>, LoaderError> {
+        #![allow(dead_code)]
+        /// Relocation used for jumping to program-local functions. The value is
+        /// 32-bit wide and is usually summed with the program counter. The
+        /// value is in number of 64-bit instructions. If the resulting value
+        /// falls within a wide instruction, it is undefined behavior.
+        ///
+        /// call insn        32       r_offset + 4  (S + A) / 8 - 1
+        const R_BPF_64_32: u32 = 10;
+        /// Relocation targetting maps and data sections
+        /// (`.rodata`/`.data`/`.bss`)
+        ///
+        /// ld_imm64 insn    32       r_offset + 4  S + A
+        const R_BPF_64_64: u32 = 1;
+        /// normal data      64       r_offset      S + A
+        const R_BPF_64_ABS64: u32 = 2;
+        /// normal data      32       r_offset      S + A
+        const R_BPF_64_ABS32: u32 = 3;
+        /// .BTF[.ext] data  32       r_offset      S + A
+        const R_BPF_64_NODYLD32: u32 = 4;
+
+        let target_pc = self.find_loaded(sec_idx, addr as usize);
+
+        let insn = self.insns.get_mut(insn_pc).ok_or_else(|| {
+            LoaderError::Malformed(format!(
+                "relocation references insn offset {insn_pc} past loaded code"
+            ))
+        })?;
+
+        match (relo_type, target_pc, insn.is_ld_imm64()) {
+            (R_BPF_64_32, Some(target_pc), _) => {
+                let addend = insn.imm() / 8;
+                let rel = target_pc as i32 - insn_pc as i32 + addend - 1;
+                insn.with_imm(rel);
+
+                Ok(None)
+            }
+
+            (R_BPF_64_32, None, _) | (R_BPF_64_64, None, false) => {
+                Err(LoaderError::Malformed(format!(
+                    "relocation target at section {sec_idx:?} address {} was not loaded",
+                    addr
+                )))
+            }
+
+            (R_BPF_64_64, Some(_), _) => Err(LoaderError::Unsupported(
+                "R_BPF_64_64 relocation against a code symbol",
+            )),
+
+            (R_BPF_64_64, None, true) => {
+                let is_data_sec = sec_name
+                    .is_some_and(|n| n.starts_with(".rodata") || n == ".data" || n == ".bss");
+
+                if is_data_sec {
+                    Ok(Some(Deferred::Data {
+                        sec_idx,
+                        offset: addr as usize + insn.imm() as usize,
+                    }))
+                } else {
+                    Ok(Some(Deferred::Map {
+                        sec_idx,
+                        addr: addr as usize,
+                    }))
+                }
+            }
+
+            _ => Err(LoaderError::UnsupportedRelocation(relo_type)),
+        }
+    }
+
+    fn collect_lines<'obj>(&self, obj: &'obj EbpfObject<'obj>) -> BTreeMap<usize, LineEntry> {
         let mut line_info = BTreeMap::new();
 
-        for info in &btf.ext.line_info {
-            let Some(sec_name) = btf.string(info.sec_name_off) else {
+        for info in &obj.btf.ext.line_info {
+            let Some(sec_name) = obj.btf.string(info.sec_name_off) else {
                 continue;
             };
 
-            let mut funcs: Vec<_> = program
+            let mut funcs: Vec<_> = self
                 .loaded_progs
                 .iter()
-                .filter(|((sec, _), _)| {
-                    self.file.section_by_index(*sec).unwrap().name().unwrap() == sec_name.as_ref()
+                .filter(|p| {
+                    obj.file
+                        .section_by_index(p.func.section_idx)
+                        .ok()
+                        .and_then(|s| s.name().ok())
+                        .is_some_and(|n| n == sec_name.as_ref())
                 })
-                .map(|((_, sec_off), dst_off)| (*sec_off, *dst_off))
+                .map(|p| (p.func.section_offset, p.insn_pc))
                 .collect();
             funcs.sort_by_key(|(sec_off, _)| *sec_off);
 
@@ -150,7 +450,7 @@ impl<'file> EbpfObject<'file> {
                     continue;
                 };
 
-                let pc = dst_off + (insn_off - sec_off) / 8;
+                let pc = dst_off + (insn_off - sec_off) / Insn::WIDTH;
                 line_info.insert(
                     pc,
                     LineEntry {
@@ -164,174 +464,20 @@ impl<'file> EbpfObject<'file> {
 
         line_info
     }
+}
 
-    fn load_code(&self, prog: &FunctionSignature, loader: &mut ProgLoader) {
-        let sec = self.file.section_by_index(prog.section_idx).unwrap();
-        let data = sec.data().unwrap();
-
-        let sec_data_offset = prog.insn_offset * 8;
-        let sec_data_len = prog.insn_size * 8;
-
-        let insns = &data[sec_data_offset..sec_data_offset + sec_data_len];
-        let (insns, _) = insns.as_chunks::<8>();
-
-        let prog_dst_offset = loader.insns.len();
-        loader
-            .loaded_progs
-            .insert((prog.section_idx, sec_data_offset), prog_dst_offset);
-
-        loader
-            .insns
-            .extend(insns.iter().map(|&insn| Insn(u64::from_le_bytes(insn))));
-
-        for (insn_offset, insn) in insns
-            .iter()
-            .map(|&insn| Insn(u64::from_le_bytes(insn)))
-            .enumerate()
-        {
-            if !insn.is_ld_imm64() && !insn.is_subprog_call() {
-                continue;
-            }
-
-            let sec_insn_offset = sec_data_offset + insn_offset * 8;
-            let prog_dst_insn_offset = prog_dst_offset + insn_offset;
-            let rel = sec.relocations().find(|r| r.0 as usize == sec_insn_offset);
-
-            if let Some((_, rel)) = rel {
-                let RelocationTarget::Symbol(sym) = rel.target() else {
-                    todo!("unsupported call rel target")
-                };
-
-                let sym = self
-                    .file
-                    .symbol_by_index(sym)
-                    .unwrap_or_else(|_| todo!("sym points to unknown symbol decl"));
-                let sym_insn = sym.address() as usize / Insn::WIDTH;
-                let sym_sec = sym
-                    .section_index()
-                    .unwrap_or_else(|| todo!("symbol must be related to section"));
-
-                if insn.is_subprog_call() {
-                    let subprogram = self
-                        .functions
-                        .iter()
-                        .find(|p| p.section_idx == sym_sec && p.insn_offset == sym_insn)
-                        .unwrap_or_else(|| {
-                            todo!("symbol subprogram was not found in same section")
-                        });
-
-                    if !loader
-                        .loaded_progs
-                        .contains_key(&(sym_sec, sym.address() as usize))
-                    {
-                        self.load_code(subprogram, loader);
-                    }
-                }
-
-                loader.relos.push((prog_dst_insn_offset, rel));
-            } else if insn.is_subprog_call() {
-                let target_insn = sec_insn_offset + insn.imm() as usize;
-                let subprogram = self
-                    .functions
-                    .iter()
-                    .find(|p| p.section_idx == prog.section_idx && p.insn_offset == target_insn)
-                    .unwrap_or_else(|| todo!("pc-rel subprogram was not found in same section"));
-                if !loader
-                    .loaded_progs
-                    .contains_key(&(sec.index(), target_insn * 8))
-                {
-                    self.load_code(subprogram, loader);
-                }
-            }
-        }
-    }
-
-    /// This function resolves relocations and updates the code
-    /// with the correct values. The actual relocation performed
-    /// here is very simple: we find the start of each loaded
-    /// section, an index to our loaded code buffer.
-    fn resolve_relocations(&self, loader: &mut ProgLoader) {
-        #![allow(dead_code)]
-
-        /// ld_imm64 insn    32       r_offset + 4  S + A
-        const R_BPF_64_64: u32 = 1;
-        /// Relocation used for jumping to program-local functions.
-        /// The value is 32-bit wide and is usually summed with the
-        /// program counter. The value is in number of 64-bit instructions.
-        ///
-        /// If the resulting value falls within a wide instruction, it is
-        /// undefined behavior.
-        ///
-        /// Per the kernel docs:
-        /// call insn        32       r_offset + 4  (S + A) / 8 - 1
-        const R_BPF_64_32: u32 = 10;
-
-        /// normal data      64       r_offset      S + A
-        const R_BPF_64_ABS64: u32 = 2;
-        /// normal data      32       r_offset      S + A
-        const R_BPF_64_ABS32: u32 = 3;
-        /// .BTF[.ext] data  32       r_offset      S + A
-        const R_BPF_64_NODYLD32: u32 = 4;
-
-        for (insn_offset, rel) in &loader.relos {
-            let mut insn = loader.insns[*insn_offset];
-
-            let RelocationFlags::Elf { r_type } = rel.flags() else {
-                panic!("unknown flags {:?}", rel.flags());
-            };
-            assert!(
-                r_type == R_BPF_64_32 || r_type == R_BPF_64_64,
-                "{r_type:?} rel type not supported"
-            );
-
-            let RelocationTarget::Symbol(sym) = rel.target() else {
-                todo!("unsupported call rel target")
-            };
-
-            let sym = self.file.symbol_by_index(sym).expect("invalid symbol");
-            let sym_sec = sym.section_index().unwrap();
-
-            let target_insn_offset = loader.loaded_progs.get(&(sym_sec, sym.address() as usize));
-
-            if insn.is_ld_imm64() && r_type == R_BPF_64_64 && target_insn_offset.is_none() {
-                let sec_name = self
-                    .file
-                    .section_by_index(sym_sec)
-                    .ok()
-                    .and_then(|s| s.name().ok().map(|n| n.to_string()));
-                let is_data_sec = sec_name
-                    .as_deref()
-                    .is_some_and(|n| n.starts_with(".rodata") || n == ".data" || n == ".bss");
-
-                if is_data_sec {
-                    let offset = sym.address() as usize + insn.imm() as usize;
-                    loader.data_relos.insert(*insn_offset, (sym_sec, offset));
-                } else {
-                    loader
-                        .map_relos
-                        .insert(*insn_offset, (sym_sec, sym.address() as usize));
-                }
-                continue;
-            }
-
-            let target_insn_offset =
-                target_insn_offset.unwrap_or_else(|| todo!("target not loaded"));
-
-            match r_type {
-                R_BPF_64_32 => {
-                    let target_offset = *target_insn_offset as i32 - *insn_offset as i32;
-                    let addend = insn.imm() / 8;
-                    insn.with_imm(target_offset + addend - 1);
-                }
-                R_BPF_64_64 => {
-                    insn.with_imm((target_insn_offset / 8) as i32 + insn.imm());
-                }
-                _ => todo!("relocation type not supported {r_type}"),
-            }
-
-            loader.insns[*insn_offset] = insn;
-        }
-    }
+/// A relocation that gets patched at program preparation time, once the VM has
+/// assigned map FDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Deferred {
+    /// `ld_imm64` with imm set to the FD of the map at `(sec_idx, addr)`.
+    Map { sec_idx: SectionIndex, addr: usize },
+    /// `ld_imm64` with imm set to the FD of the data map covering `sec_idx`,
+    /// with `offset` written into the second half of the wide insn.
+    Data {
+        sec_idx: SectionIndex,
+        offset: usize,
+    },
 }
 
 fn parse_btf<'a>(
@@ -356,6 +502,8 @@ fn parse_btf<'a>(
             .map_err(LoaderError::InvalidBtfExt)?;
     }
 
+    btf.validate()?;
+
     if file.section_by_name("maps").is_some() {
         return Err(LoaderError::DeprecatedMapsSection);
     }
@@ -363,8 +511,7 @@ fn parse_btf<'a>(
     let mut maps = file
         .section_by_name(".maps")
         .map(|sec| parse_maps(&btf, &sec))
-        .transpose()
-        .map_err(LoaderError::InvalidMapDeclaration)?
+        .transpose()?
         .unwrap_or_default();
 
     for sec in file.sections() {
@@ -373,9 +520,9 @@ fn parse_btf<'a>(
             continue;
         }
 
-        let datasec_id = find_or_create_datasec(&mut btf, &sec);
+        let datasec_id = find_or_create_datasec(&mut btf, &sec)?;
 
-        let data = sec.data().unwrap();
+        let data = sec.data()?;
         maps.push(MapSpec {
             name: name.to_string(),
             r#type: Some(BPF_MAP_TYPE_ARRAY),
@@ -393,33 +540,30 @@ fn parse_btf<'a>(
     Ok((Some(btf), maps))
 }
 
-/// Calculates and updates the offsets and sizes for BTF datasec
-/// entries.
+/// Calculates and updates the offsets and sizes for BTF datasec entries.
 ///
-/// `Datasec`s describe ELF sections and their contents, generally
-/// used to inform the Kernel of special structs defined by the
-/// program. Each datasec entry contains BTF type ID, a size, and
-/// the offset at which the entry is located in the section.
+/// `Datasec`s describe ELF sections and their contents, generally used to
+/// inform the Kernel of special structs defined by the program. Each datasec
+/// entry contains BTF type ID, a size, and the offset at which the entry is
+/// located in the section.
 ///
-/// Clang, however, does not populate sizes and offsets, and that
-/// is left for the linker/loader to do.
+/// Clang, however, does not populate sizes and offsets, and that is left for
+/// the linker/loader to do.
 ///
-/// An example is the special ELF `.maps` section. It describes
-/// BPF maps used by the program during execution. Each map has a
-/// corresponding [`BtfVarSecInfo`] entry in the Datasec type for
-/// that section. During resolution, a `R_BPF_64_64` relocation
-/// searches for a map entry in the datasec where
-/// `BtfVarSecInfo::offset` matches the relocation target offset
-/// (symbol address of the map).
+/// An example is the special ELF `.maps` section. It describes BPF maps used by
+/// the program during execution. Each map has a corresponding [`BtfVarSecInfo`]
+/// entry in the Datasec type for that section. During resolution, a
+/// `R_BPF_64_64` relocation searches for a map entry in the datasec where
+/// `BtfVarSecInfo::offset` matches the relocation target offset (symbol address
+/// of the map).
 ///
 /// From libbpf:
-/// > Clang leaves DATASEC size and VAR offsets as zeroes, so we need to
-/// > fix this up. But BPF static linker already fixes this up and fills
-/// > all the sizes and offsets during static linking. So this step has
-/// > to be optional. But the STV_HIDDEN handling is non-optional for any
-/// > non-extern DATASEC, so the variable fixup loop below handles both
-/// > functions at the same time, paying the cost of BTF VAR <-> ELF
-/// > symbol matching just once.
+/// > Clang leaves DATASEC size and VAR offsets as zeroes, so we need to fix
+/// > this up. But BPF static linker already fixes this up and fills all the
+/// > sizes and offsets during static linking. So this step has to be optional.
+/// > But the STV_HIDDEN handling is non-optional for any non-extern DATASEC, so
+/// > the variable fixup loop below handles both functions at the same time,
+/// > paying the cost of BTF VAR <-> ELF symbol matching just once.
 ///
 /// Ref: <https://github.com/libbpf/libbpf/blob/3d451d916f833afed06bfc74026a3650de8dd649/src/libbpf.c#L3321>
 fn fixup_btf_datasecs<'a>(btf: &mut Btf, file: &'a File<'a, &'a [u8]>) {
@@ -434,15 +578,19 @@ fn fixup_btf_datasecs<'a>(btf: &mut Btf, file: &'a File<'a, &'a [u8]>) {
 
     for (id, mut ty) in datasecs {
         let BtfKind::Datasec(datasec) = &mut ty.kind else {
-            unreachable!()
+            continue;
         };
 
         for info in &mut datasec.secinfos {
-            btf.types
+            if let Some(sec) = btf
+                .types
                 .get(&info.r#type)
                 .and_then(|ty| btf.string(ty.name_off))
-                .and_then(|name| file.symbol_by_name(name.as_ref()))
-                .inspect(|sym| info.offset = sym.address() as _);
+                .and_then(|sym| file.symbol_by_name(sym.as_ref()))
+            {
+                info.offset = sec.address() as u32;
+                info.size = sec.size() as u32;
+            }
         }
         datasec.secinfos.sort_unstable_by_key(|ty| ty.offset);
 
@@ -450,17 +598,16 @@ fn fixup_btf_datasecs<'a>(btf: &mut Btf, file: &'a File<'a, &'a [u8]>) {
     }
 }
 
-/// Finds or synthesizes a BTF DATASEC for a data section. The
-/// DATASEC just needs the right size so `is_offset_valid` can
-/// do a bounds check.
-fn find_or_create_datasec(btf: &mut Btf, sec: &Section) -> BtfTypeId {
-    let name = sec.name().unwrap();
+/// Finds or synthesizes a BTF DATASEC for a data section. The DATASEC just
+/// needs the right size so `is_offset_valid` can do a bounds check.
+fn find_or_create_datasec(btf: &mut Btf, sec: &Section) -> Result<BtfTypeId, LoaderError> {
+    let name = sec.name()?;
 
     if let Some((id, _)) = btf.types.iter().find(|(_, ty)| {
         matches!(&ty.kind, BtfKind::Datasec(_))
             && btf.string(ty.name_off).is_some_and(|n| n == name)
     }) {
-        return *id;
+        return Ok(*id);
     }
 
     let name_off = btf.strings.len() as u32;
@@ -481,22 +628,20 @@ fn find_or_create_datasec(btf: &mut Btf, sec: &Section) -> BtfTypeId {
         },
     );
 
-    btf_id
+    Ok(btf_id)
 }
 
-/// Finds declared maps by looking for the .maps section and matching it
-/// against the .maps BTF type. Maps are BTF structs behind
-/// [`VariableLinkage::GlobalAllocated`] variables. Once you find the
-/// struct, its fields are behind PTR types, and when you finally get to
-/// the correct type, it is either a type, say `unsigned int` for fields
-/// like `key`/`value`, or as an ARRAY, where the value itself is the
-/// dimensionality of the array for other fields, like `type`.
-///
-/// TODO: Support .data, .rodata, .bss maps
+/// Finds declared maps by looking for the .maps section and matching it against
+/// the .maps BTF type. Maps are BTF structs behind
+/// [`VariableLinkage::GlobalAllocated`] variables. Once you find the struct,
+/// its fields are behind PTR types, and when you finally get to the correct
+/// type, it is either a type, say `unsigned int` for fields like `key`/`value`,
+/// or as an ARRAY, where the value itself is the dimensionality of the array
+/// for other fields, like `type`.
 ///
 /// Ref: <https://github.com/libbpf/libbpf/blob/09b9e83102eb8ab9e540d36b4559c55f3bcdb95d/src/libbpf.c#L2429>
-fn parse_maps(btf: &Btf, maps_sec: &Section) -> std::result::Result<Vec<MapSpec>, &'static str> {
-    let sec_name = maps_sec.name().map_err(|_| "missing section name")?;
+fn parse_maps(btf: &Btf, maps_sec: &Section) -> Result<Vec<MapSpec>, LoaderError> {
+    let sec_name = maps_sec.name()?;
     let secinfos = btf
         .types
         .values()
@@ -505,25 +650,39 @@ fn parse_maps(btf: &Btf, maps_sec: &Section) -> std::result::Result<Vec<MapSpec>
             BtfKind::Datasec(datasec) => Some(&datasec.secinfos),
             _ => None,
         })
-        .ok_or("missing datasec for .maps section")?;
+        .ok_or(LoaderError::InvalidMapDeclaration(
+            "missing datasec for .maps section",
+        ))?;
 
     let mut maps = Vec::with_capacity(secinfos.len());
 
     for info in secinfos {
+        #[expect(
+            clippy::expect_used,
+            reason = "BTF graph was validated upstream in parse_btf"
+        )]
         let btf_ty = btf
             .get_type(info.r#type)
             .expect("secinfo references invalid type");
         let BtfKind::Var(var) = &btf_ty.kind else {
-            return Err("unexpected map btf type");
+            return Err(LoaderError::InvalidMapDeclaration(
+                "datasec entry is not a Var",
+            ));
         };
 
-        let Some(map_name) = btf.string(btf_ty.name_off) else {
-            return Err("map type missing name");
-        };
+        let map_name = btf
+            .string(btf_ty.name_off)
+            .ok_or(LoaderError::InvalidMapDeclaration("map var has no name"))?;
 
+        #[expect(
+            clippy::expect_used,
+            reason = "BTF graph was validated upstream in parse_btf"
+        )]
         let btf_ty = btf.get_type(var.ty).expect("missing map definition");
         let BtfKind::Struct(s) = &btf_ty.kind else {
-            return Err("unexpected map btf type");
+            return Err(LoaderError::InvalidMapDeclaration(
+                "map var does not point at a struct",
+            ));
         };
 
         let mut map = MapSpec {
@@ -534,17 +693,19 @@ fn parse_maps(btf: &Btf, maps_sec: &Section) -> std::result::Result<Vec<MapSpec>
         };
 
         for member in &s.members {
-            let Some(name) = btf.string(member.name_off) else {
-                panic!("struct member missing name");
-            };
+            let name = btf
+                .string(member.name_off)
+                .ok_or(LoaderError::InvalidMapDeclaration("map member has no name"))?;
 
             let ty = btf
                 .get_type(member.r#type)
                 .and_then(|m| match &m.kind {
                     BtfKind::Ptr(ty) => btf.get_type(*ty),
-                    kind => panic!("wrong map field ty {name:?}: {kind:?}"),
+                    _ => None,
                 })
-                .expect("map field references invalid ty {name:?}");
+                .ok_or(LoaderError::InvalidMapDeclaration(
+                    "map member must be a pointer to a typed value",
+                ))?;
 
             match name.as_ref() {
                 "type" => map.r#type = ty.kind.array_no_elems(),
@@ -555,11 +716,11 @@ fn parse_maps(btf: &Btf, maps_sec: &Section) -> std::result::Result<Vec<MapSpec>
                 "key_size" => map.key_size = ty.kind.array_no_elems(),
                 "value_size" => map.value_size = ty.kind.array_no_elems(),
                 "key" => {
-                    map.key_size = Some(btf.type_size(ty.btf_id).ok_or("invalid type key")?);
+                    map.key_size = Some(btf.type_size(ty.btf_id));
                     map.key = Some(ty.btf_id);
                 }
                 "value" => {
-                    map.value_size = Some(btf.type_size(ty.btf_id).ok_or("invalid type value")?);
+                    map.value_size = Some(btf.type_size(ty.btf_id));
                     map.value = Some(ty.btf_id);
                 }
                 "values" => map.values = Some(ty.btf_id),
@@ -568,7 +729,7 @@ fn parse_maps(btf: &Btf, maps_sec: &Section) -> std::result::Result<Vec<MapSpec>
                         map.pinning = MapPinning::ByName;
                     }
                 }
-                name => panic!("unknown map field: {name:?}"),
+                _ => return Err(LoaderError::InvalidMapDeclaration("unknown map field")),
             }
         }
 
@@ -580,56 +741,51 @@ fn parse_maps(btf: &Btf, maps_sec: &Section) -> std::result::Result<Vec<MapSpec>
 
 fn collect_functions<'file>(
     file: &Rc<File<'file, &'file [u8]>>,
-    btf: &Option<Btf>,
+    btf: &Btf,
 ) -> Result<Vec<FunctionSignature>, LoaderError> {
-    let mut ext_programs = HashMap::new();
+    let mut ext_programs = BTreeMap::new();
 
-    if let Some(btf) = btf {
-        for info in &btf.ext.func_info {
-            let sec_name = btf
-                .string(info.sec_name_off)
-                .ok_or(LoaderError::InvalidBtfNameOffset(info.sec_name_off))?;
-            for func in &info.data {
-                let offset = func.insn_off;
-                let func = btf
-                    .get_type(func.type_id)
-                    .ok_or(LoaderError::InvalidBtfTypeId(func.type_id))?;
-                let func_name = btf
-                    .string(func.name_off)
-                    .ok_or(LoaderError::InvalidBtfNameOffset(func.name_off))?;
-                let proto = match &func.kind {
-                    BtfKind::Func(func) => btf
-                        .get_type(func.func_proto)
-                        .ok_or(LoaderError::InvalidBtfTypeId(func.func_proto))?,
-                    kind => todo!("only funcs are allowed in this position, got: {kind:?}"),
-                };
-                let proto = match &proto.kind {
-                    BtfKind::FuncProto(proto) => proto,
-                    kind => todo!("only protos are allowed in this position, got: {kind:?}"),
-                };
+    let name = |off| {
+        btf.string(off)
+            .ok_or(LoaderError::InvalidBtfNameOffset(off))
+    };
 
-                let params_types = proto
-                    .params
-                    .iter()
-                    .map(|param| {
-                        let name = btf.string(param.name_off)?;
-                        btf.get_type(param.r#type)?;
-                        Some((name.to_string(), param.r#type))
-                    })
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| todo!("invalid func params"))?;
-
-                if proto.return_type > BtfTypeId(0) {
-                    let _ = btf
-                        .get_type(proto.return_type)
-                        .ok_or_else(|| todo!("invalid func return"));
+    for info in &btf.ext.func_info {
+        let sec_name = name(info.sec_name_off)?;
+        for func in &info.data {
+            let section_offset = func.insn_off as usize * Insn::WIDTH;
+            let func = btf.resolve_must(func.type_id).ty();
+            let func_name = name(func.name_off)?;
+            let proto = match &func.kind {
+                BtfKind::Func(func) => btf.resolve_must(func.func_proto).ty(),
+                _ => {
+                    return Err(LoaderError::Malformed(
+                        "func_info entry does not point at a Func BTF type".to_string(),
+                    ));
                 }
+            };
+            let proto = match &proto.kind {
+                BtfKind::FuncProto(proto) => proto,
+                _ => {
+                    return Err(LoaderError::Malformed(
+                        "Func.func_proto does not resolve to a FuncProto".to_string(),
+                    ));
+                }
+            };
 
-                ext_programs.insert(
-                    (sec_name.clone(), func_name.clone()),
-                    (offset as usize, params_types, proto.return_type),
-                );
-            }
+            let params_types = proto
+                .params
+                .iter()
+                .map(|param| {
+                    let name = name(param.name_off)?;
+                    Ok((name.to_string(), param.r#type))
+                })
+                .collect::<Result<Vec<_>, LoaderError>>()?;
+
+            ext_programs.insert(
+                (sec_name.clone(), func_name.clone()),
+                (section_offset, params_types, proto.return_type),
+            );
         }
     }
 
@@ -639,12 +795,8 @@ fn collect_functions<'file>(
         if sec.kind() != SectionKind::Text {
             continue;
         }
-        let Ok(sec_name) = sec.name() else {
-            todo!("progbits exec section must have name");
-        };
-        let Ok(data) = sec.data() else {
-            todo!("progbits exec section must have data");
-        };
+        let sec_name = sec.name()?;
+        let data = sec.data()?;
 
         let syms = file
             .symbols()
@@ -652,25 +804,30 @@ fn collect_functions<'file>(
             .filter(|s| s.section_index().is_some_and(|i| i == sec.index()));
 
         for sym in syms {
-            let Ok(prog_name) = sym.name() else {
-                todo!("program must have valid name");
-            };
+            let prog_name = sym.name()?;
 
             let prog_size = sym.size() as usize;
             let prog_addr = sym.address() as usize;
-            let prog_insn_offset = prog_addr / Insn::WIDTH;
 
-            let Some(insns) = data.get(prog_addr..prog_addr + prog_size) else {
-                todo!("prog size exceeds section boundary");
-            };
+            let insns = data.get(prog_addr..prog_addr + prog_size).ok_or_else(|| {
+                LoaderError::Malformed(format!(
+                    "program {prog_name:?} (size {prog_size}) extends past section {sec_name}"
+                ))
+            })?;
 
-            if !insns.len().is_multiple_of(8) {
-                todo!("progbits exec must be multiple of insn size");
+            if !insns.len().is_multiple_of(Insn::WIDTH) {
+                return Err(LoaderError::Malformed(format!(
+                    "program {prog_name:?} byte length is not a multiple of {}",
+                    Insn::WIDTH
+                )));
             }
 
             let (params, ret) = match ext_programs.get(&(sec_name.into(), prog_name.into())) {
-                Some((offset, _, _)) if prog_insn_offset != *offset => {
-                    todo!("func information does not match symbol address {sec_name}:{prog_name}")
+                Some((offset, _, _)) if prog_addr != *offset => {
+                    return Err(LoaderError::Malformed(format!(
+                        "func_info insn offset {offset} does not match symbol address \
+                         for {sec_name}:{prog_name}"
+                    )));
                 }
                 Some((_, params, ret)) => (params.clone(), Some(*ret)),
                 None => Default::default(),
@@ -679,12 +836,12 @@ fn collect_functions<'file>(
             functions.push(FunctionSignature {
                 name: prog_name.to_string(),
                 is_global: sym.is_global(),
-                section_idx: sec.index(),
                 params_types: params,
                 return_type: ret,
 
-                insn_offset: prog_insn_offset,
-                insn_size: prog_size / Insn::WIDTH,
+                section_idx: sec.index(),
+                section_offset: prog_addr,
+                size: prog_size,
             });
         }
     }
@@ -692,102 +849,213 @@ fn collect_functions<'file>(
     Ok(functions)
 }
 
+#[derive(Clone, Debug)]
 pub struct LineEntry {
     pub line_off: u32,
     pub line_no: u32,
     pub column_no: u32,
 }
 
+#[derive(Clone)]
 pub struct EbpfProgram {
     pub(crate) insns: Vec<Insn>,
-    pub(crate) sig: Arc<FunctionSignature>,
+    pub(crate) func: FunctionSignature,
     pub(crate) maps: Vec<MapSpec>,
-    pub(crate) btf: Option<Arc<Btf>>,
-    pub(crate) map_relos: HashMap<usize, (SectionIndex, usize)>,
-    pub(crate) data_relos: HashMap<usize, (SectionIndex, usize)>,
+    pub(crate) btf: Arc<Btf>,
+    /// Parsed `SEC(...)` annotation. `None` if the section name didn't match
+    /// any known hook prefix.
+    pub hook: Option<Hook>,
+    pub(crate) deferred: BTreeMap<usize, Deferred>,
     pub(crate) line_info: BTreeMap<usize, LineEntry>,
+    pub(crate) subprogs: BTreeMap<usize, FunctionSignature>,
 }
 
 impl EbpfProgram {
-    /// Given a function name, we search for a matching BTF
-    /// function entry. The `ctx_params` are a list of
-    /// `(field name, value)` used to generate a function
-    /// context, the eBPFs proogram parameter, like `__sk_buff`.
-    ///
-    /// The function uses BTF information to generate the entire
-    /// struct, and each entry in `ctx_params` overrides one of
-    /// the context's fields.
-    ///
-    /// # Example
-    ///
-    /// An entrypoint that takes `__sk_buff` can be built with:
-    ///
-    /// ```
-    /// # use bepeefe::{vm::Vm, object::*, ProgramValue};
-    /// # let file = std::fs::read("./examples/bpf/map_array.o").unwrap();
-    /// let obj = EbpfObject::from_elf(&file).unwrap();
-    /// let prog = obj.load_prog("entry").unwrap();
-    /// let ctx = prog.build_ctx(&[ProgramValue::from([
-    ///     ("local_port", ProgramValue::Number(3000)),
-    ///     ("len", ProgramValue::Number(64)),
-    /// ])]);
-    /// # let mut vm = Vm::new();
-    /// let prog_id = vm.prepare(prog, Default::default());
-    /// vm.run(&prog_id, &ctx);
-    /// ```
-    ///
-    /// The resulting context will be a zeroed buffer of the size
-    /// of the `__sk_buff` struct as described by BTF, populated
-    /// with the `local_port` and `len` fields. Any type that
-    /// implements `serde::Serialize` can be passed directly.
-    pub fn build_ctx<T: serde::Serialize>(&self, ctx_params: &[T]) -> Vec<Context> {
+    pub fn insns(&self) -> &[Insn] {
+        &self.insns
+    }
+
+    pub fn subprogs(&self) -> &BTreeMap<usize, FunctionSignature> {
+        &self.subprogs
+    }
+
+    pub fn line_info(&self) -> &BTreeMap<usize, LineEntry> {
+        &self.line_info
+    }
+
+    pub fn btf(&self) -> &Arc<Btf> {
+        &self.btf
+    }
+
+    pub fn maps(&self) -> &[MapSpec] {
+        &self.maps
+    }
+}
+
+impl std::fmt::Debug for EbpfProgram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EbpfProgram")
+            .field("sig", &self.func)
+            .field("maps", &self.maps)
+            .field("subprogs", &self.subprogs)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const R_BPF_64_64: u32 = 1;
+    const R_BPF_64_32: u32 = 10;
+
+    /// ld_imm64 r0, imm
+    fn ld_imm64(imm: i32) -> Insn {
+        Insn(0x18 | ((imm as u32 as u64) << 32))
+    }
+
+    fn call(imm: i32) -> Insn {
+        Insn(0x85 | ((imm as u32 as u64) << 32))
+    }
+
+    fn loader_with(
+        insn_pc: usize,
+        insn: Insn,
+        progs: &[(SectionIndex, usize, usize)],
+    ) -> ProgLoader {
+        let mut insns = vec![Insn(0); insn_pc + 1];
+        insns[insn_pc] = insn;
+        ProgLoader {
+            insns,
+            loaded_progs: progs
+                .iter()
+                .map(|&(section_idx, byte_offset, flat_pc)| LoadedSubprog {
+                    insn_pc: flat_pc,
+                    func: FunctionSignature {
+                        name: String::new(),
+                        is_global: false,
+                        params_types: Vec::new(),
+                        return_type: None,
+
+                        section_idx,
+                        section_offset: byte_offset,
+                        size: 0,
+                    },
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn subprog_call_patches_pc_relative_imm() {
+        // call at PC 2, subprog at PC 5
+        let mut loader = loader_with(2, call(0), &[(SectionIndex(1), 5 * 8, 5)]);
+
+        let r = loader
+            .resolve_relo(
+                2,
+                R_BPF_64_32,
+                (5 * 8) as u64,
+                SectionIndex(1),
+                Some(".text"),
+            )
+            .unwrap();
+
+        assert_eq!(r, None);
+        assert_eq!(loader.insns[2].imm(), 2, "5 - 2 - 1 + 0");
+    }
+
+    #[test]
+    fn subprog_call_includes_addend() {
+        // addend set to 16 bytes
+        let mut loader = loader_with(1, call(16), &[(SectionIndex(1), 7 * 8, 7)]);
+
+        loader
+            .resolve_relo(
+                1,
+                R_BPF_64_32,
+                (7 * 8) as u64,
+                SectionIndex(1),
+                Some(".text"),
+            )
+            .unwrap();
+
+        assert_eq!(loader.insns[1].imm(), 7, "7 - 1 - 1 + 2");
+    }
+
+    #[test]
+    fn subprog_call_to_unloaded_target_errors() {
+        let mut loader = loader_with(0, call(0), &[]);
+
+        let err = loader
+            .resolve_relo(0, R_BPF_64_32, 40, SectionIndex(1), Some(".text"))
+            .unwrap_err();
+
+        assert!(matches!(err, LoaderError::Malformed(_)));
+    }
+
+    #[test]
+    fn map_ref_emits_deferred_and_leaves_insn_alone() {
+        let mut loader = loader_with(0, ld_imm64(0), &[]);
+
+        let r = loader
+            .resolve_relo(0, R_BPF_64_64, 32, SectionIndex(7), Some(".maps"))
+            .unwrap();
+
         assert_eq!(
-            self.sig.params_types.len(),
-            ctx_params.len(),
-            "function takes {} arguments but only received {}",
-            self.sig.params_types.len(),
-            ctx_params.len()
+            r,
+            Some(Deferred::Map {
+                sec_idx: SectionIndex(7),
+                addr: 32,
+            })
         );
-        let btf = self.btf.as_ref().unwrap();
-
-        let params = self
-            .sig
-            .params_types
-            .iter()
-            .map(|(name, ty)| (name, btf.get_type(*ty).unwrap()))
-            .zip(ctx_params);
-
-        let mut ctx = Vec::with_capacity(self.sig.params_types.len());
-
-        for ((_, param_ty), ctx_val) in params {
-            let val = crate::value::to_value(ctx_val).unwrap();
-            ctx.push(build_ctx_val(btf, param_ty, &val));
-        }
-
-        ctx
+        assert_eq!(
+            loader.insns[0].imm(),
+            0,
+            "ld_imm64 must not be patched here"
+        );
     }
-}
 
-fn build_ctx_val(
-    btf: &Arc<Btf>,
-    param_ty: &crate::btf::BtfType,
-    ctx_val: &ProgramValue,
-) -> Context {
-    match ctx_val {
-        ProgramValue::Number(num) => {
-            ctx_val.to_bytes(btf, param_ty);
-            Context::Value(*num as u64)
-        }
-        ProgramValue::Float(f) => {
-            ctx_val.to_bytes(btf, param_ty);
-            Context::Value(f.to_bits())
-        }
-        _ => Context::Buffer(ctx_val.to_bytes(btf, param_ty)),
+    #[test]
+    fn rodata_ref_carries_addr_plus_addend() {
+        // addend set to 8 bytes
+        let mut loader = loader_with(0, ld_imm64(8), &[]);
+
+        let r = loader
+            .resolve_relo(0, R_BPF_64_64, 64, SectionIndex(3), Some(".rodata"))
+            .unwrap();
+
+        assert_eq!(
+            r,
+            Some(Deferred::Data {
+                sec_idx: SectionIndex(3),
+                offset: 72, // 64 + 8
+            })
+        );
     }
-}
 
-#[derive(Debug)]
-pub enum Context {
-    Buffer(Vec<u8>),
-    Value(u64),
+    #[test]
+    fn r_bpf_64_64_against_code_symbol_is_unsupported() {
+        // R_BPF_64_64 relocations are reserved to maps, so we fail
+        // if it lands in a loaded program signature
+        let mut loader = loader_with(0, ld_imm64(0), &[(SectionIndex(1), 16, 2)]);
+
+        let err = loader
+            .resolve_relo(0, R_BPF_64_64, 16, SectionIndex(1), Some(".text"))
+            .unwrap_err();
+
+        assert!(matches!(err, LoaderError::Unsupported(_)));
+    }
+
+    #[test]
+    fn unknown_r_type_is_rejected() {
+        let mut loader = loader_with(0, call(0), &[]);
+
+        let err = loader
+            .resolve_relo(0, 99, 0, SectionIndex(0), None)
+            .unwrap_err();
+
+        assert!(matches!(err, LoaderError::UnsupportedRelocation(99)));
+    }
 }

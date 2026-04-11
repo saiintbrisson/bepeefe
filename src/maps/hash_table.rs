@@ -1,9 +1,16 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "Mutex::lock only fails if poisoned, region/flags indexing is guarded by check_bounds and idx < max_entries"
+)]
+
 use std::{
     alloc::Layout,
     hash::{Hash, Hasher},
-    io::{ErrorKind, Result},
     sync::Mutex,
 };
+
+use crate::error::RuntimeError;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug)]
@@ -28,17 +35,34 @@ pub struct HashTable {
 }
 
 impl HashTable {
-    pub fn new(key_size: u32, value_size: u32, max_entries: u32) -> Self {
+    pub fn new(key_size: u32, value_size: u32, max_entries: u32) -> Result<Self, &'static str> {
+        if max_entries == 0 {
+            return Err("max_entries must be greater than 0");
+        }
+        if key_size == 0 {
+            return Err("key_size must be greater than 0");
+        }
+        if value_size == 0 {
+            return Err("value_size must be greater than 0");
+        }
+
         // The kernel aligns key and value to 8 bytes
         // https://github.com/torvalds/linux/blob/8765f467912ff0d4832eeaf26ae573792da877e7/kernel/bpf/hashtab.c#L516-L521
-        let key_layout = Layout::from_size_align(key_size as usize, 8).unwrap();
-        let value_layout = Layout::from_size_align(value_size as usize, 8).unwrap();
-        let (entry_layout, value_offset) = key_layout.extend(value_layout).unwrap();
+        let key_layout =
+            Layout::from_size_align(key_size as usize, 8).map_err(|_| "invalid key layout")?;
+        let value_layout =
+            Layout::from_size_align(value_size as usize, 8).map_err(|_| "invalid value layout")?;
+        let (entry_layout, value_offset) = key_layout
+            .extend(value_layout)
+            .map_err(|_| "entry layout overflow")?;
         let entry_layout = entry_layout.pad_to_align();
 
-        let total = entry_layout.size() * max_entries as usize;
+        let total = entry_layout
+            .size()
+            .checked_mul(max_entries as usize)
+            .ok_or("map storage size overflow")?;
 
-        Self {
+        Ok(Self {
             flags: Mutex::new(vec![Flag::Vacant; max_entries as usize]),
             region: Mutex::new(vec![0u8; total]),
 
@@ -48,7 +72,7 @@ impl HashTable {
             entry_layout,
             value_layout,
             value_offset,
-        }
+        })
     }
 
     pub fn key_size(&self) -> usize {
@@ -66,12 +90,18 @@ impl HashTable {
             .map(|entry| entry + self.value_offset)
     }
 
-    pub fn update(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn update(&self, key: &[u8], value: &[u8]) -> Result<(), RuntimeError> {
         if key.len() != self.key_layout.size() {
-            return Err(ErrorKind::InvalidInput.into());
+            return Err(RuntimeError::MapWrongKeySize {
+                expected: self.key_layout.size(),
+                got: key.len(),
+            });
         }
         if value.len() != self.value_layout.size() {
-            return Err(ErrorKind::InvalidInput.into());
+            return Err(RuntimeError::MapWrongValueSize {
+                expected: self.value_layout.size(),
+                got: value.len(),
+            });
         }
 
         let mut flags = self.flags.lock().unwrap();
@@ -79,7 +109,7 @@ impl HashTable {
 
         let entry = self
             .find_slot(&mut flags, &data, key)
-            .ok_or(ErrorKind::OutOfMemory)?;
+            .ok_or(RuntimeError::MapFull)?;
         let val_start = entry + self.value_offset;
 
         data[entry..entry + key.len()].copy_from_slice(key);
@@ -88,13 +118,13 @@ impl HashTable {
         Ok(())
     }
 
-    pub fn delete(&self, key: &[u8]) -> Result<()> {
+    pub fn delete(&self, key: &[u8]) -> Result<(), RuntimeError> {
         let mut flags = self.flags.lock().unwrap();
         let data = self.region.lock().unwrap();
 
         let entry = self
             .find_match(&flags, &data, key)
-            .ok_or(ErrorKind::NotFound)?;
+            .ok_or(RuntimeError::MapKeyNotFound)?;
         let idx = entry / self.entry_layout.size();
         flags[idx] = Flag::Deleted;
 
@@ -114,9 +144,9 @@ impl HashTable {
         Some(data[offset..offset + N].try_into().unwrap())
     }
 
-    pub fn write(&self, offset: usize, src: &[u8]) -> Result<()> {
+    pub fn write(&self, offset: usize, src: &[u8]) -> Result<(), RuntimeError> {
         self.check_bounds(offset, src.len())
-            .ok_or(ErrorKind::InvalidInput)?;
+            .ok_or(RuntimeError::MapKeyNotFound)?;
         let mut data = self.region.lock().unwrap();
         data[offset..offset + src.len()].copy_from_slice(src);
         Ok(())
@@ -126,6 +156,22 @@ impl HashTable {
         self.check_bounds(offset, len)?;
         let data = self.region.lock().unwrap();
         Some(data[offset..offset + len].to_vec())
+    }
+
+    pub fn for_each_entry(&self, mut f: impl FnMut(&[u8], &[u8])) {
+        let flags = self.flags.lock().unwrap();
+        let data = self.region.lock().unwrap();
+        let stride = self.entry_layout.size();
+        let key_size = self.key_layout.size();
+        let value_size = self.value_layout.size();
+        for (idx, flag) in flags.iter().enumerate() {
+            if matches!(flag, Flag::Occupied) {
+                let base = idx * stride;
+                let key = &data[base..base + key_size];
+                let value = &data[base + self.value_offset..base + self.value_offset + value_size];
+                f(key, value);
+            }
+        }
     }
 
     /// Ensures the access lands within the value portion of a single entry,
@@ -218,7 +264,10 @@ mod jhash {
     //! map behave like the actual one implemented by the kernel.
     //!
     //! Reference: <https://github.com/torvalds/linux/blob/master/include/linux/jhash.h>``
-    #![allow(dead_code)]
+    #![allow(
+        dead_code,
+        reason = "reference port of the kernel jhash, not yet wired up"
+    )]
 
     const JHASH_INITVAL: u32 = 0xDEADBEEF;
 
@@ -227,11 +276,7 @@ mod jhash {
         let [mut a, mut b, mut c] = [JHASH_INITVAL + (len << 2) + initval; 3];
 
         let mut chunks = k.chunks(3).peekable();
-        loop {
-            let Some(chunk) = chunks.next() else {
-                break;
-            };
-
+        while let Some(chunk) = chunks.next() {
             a += chunk.first().copied().unwrap_or_default();
             b += chunk.get(1).copied().unwrap_or_default();
             c += chunk.get(2).copied().unwrap_or_default();

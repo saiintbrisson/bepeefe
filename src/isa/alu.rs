@@ -51,12 +51,12 @@ macro_rules! alu {
     ($($name:ident, |$dst:tt, $src:tt, $imm:tt| $func:expr;)+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::vm::State, insn: Insn) {
-                let $src = state.registers[insn.src_reg() as usize];
-                let $dst = state.registers[insn.dst_reg() as usize];
+            pub fn $name(state: &mut crate::vm::Cpu, insn: Insn) {
+                let $src = state.reg(insn.src_reg());
+                let $dst = state.reg(insn.dst_reg());
                 let $imm = insn.imm() as u64;
 
-                state.registers[insn.dst_reg() as usize] = $func as u64;
+                state.set_reg(insn.dst_reg(), $func as u64);
             }
         )+
     };
@@ -123,17 +123,19 @@ macro_rules! signed_alu {
     ($($name:ident { $($offset:pat => |$dst:tt, $src:tt, $imm:tt| $func:expr;)+ })+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::vm::State, insn: Insn) {
+            pub fn $name(state: &mut crate::vm::Cpu, insn: Insn) {
                 let offset = insn.offset() & 1;
-                state.registers[insn.dst_reg() as usize] = match offset {
+                let dst_idx = insn.dst_reg();
+                let val = match offset {
                     $($offset => {
-                        let $src = state.registers[insn.src_reg() as usize];
-                        let $dst = state.registers[insn.dst_reg() as usize];
+                        let $src = state.reg(insn.src_reg());
+                        let $dst = state.reg(dst_idx);
                         let $imm = insn.imm() as u64;
                         $func as u64
                     })+
                     _ => unreachable!(),
-                }
+                };
+                state.set_reg(dst_idx, val);
             }
         )+
     };
@@ -175,22 +177,22 @@ macro_rules! mov_src {
     ($($name:ident, $uref:ty, $sref:ty, $mask:expr;)+) => {
         $(
             #[inline(always)]
-            pub fn $name(state: &mut crate::vm::State, insn: Insn) {
+            pub fn $name(state: &mut crate::vm::Cpu, insn: Insn) {
                 /// Offset can be either 0 for mov or 8/16/32 for movsx
                 const MOVSX_OFFSET_MASK: u64 = $mask;
 
-                let src = state.registers[insn.src_reg() as usize];
-                let dst = &mut state.registers[insn.dst_reg() as usize];
+                let src = state.reg(insn.src_reg());
                 let offset = insn.offset() as u64 & MOVSX_OFFSET_MASK;
 
                 // TODO: can I remove this branch
-                if offset == 0 {
-                    *dst = src as $uref as u64;
+                let val = if offset == 0 {
+                    src as $uref as u64
                 } else {
                     let shift = <$sref>::BITS as u64 - offset;
                     // shift to sign extend src value
-                    *dst = ((src as $sref) << shift >> shift) as $uref as u64;
-                }
+                    ((src as $sref) << shift >> shift) as $uref as u64
+                };
+                state.set_reg(insn.dst_reg(), val);
             }
         )+
     };

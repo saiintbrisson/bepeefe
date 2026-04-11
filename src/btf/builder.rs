@@ -1,8 +1,15 @@
 use super::*;
 
-#[derive(Default)]
 pub struct BtfBuilder {
     inner: Btf,
+}
+
+impl Default for BtfBuilder {
+    fn default() -> Self {
+        let mut inner = Btf::default();
+        inner.strings.push(0);
+        Self { inner }
+    }
 }
 
 impl BtfBuilder {
@@ -29,12 +36,8 @@ impl BtfBuilder {
         offset
     }
 
-    fn insert_type(&mut self, name_off: u32, kind: BtfKind) -> BtfTypeId {
-        debug_assert!(
-            name_off == 0 || self.inner.string(name_off).is_some(),
-            "name_off {name_off} not in string table"
-        );
-
+    fn insert_type(&mut self, name: &str, kind: BtfKind) -> BtfTypeId {
+        let name_off = self.add_string(name);
         let btf_id = self.next_type_id();
         self.inner.types.insert(
             btf_id,
@@ -48,9 +51,8 @@ impl BtfBuilder {
     }
 
     pub fn add_int(&mut self, name: &str, size: u32, encoding: u8) -> BtfTypeId {
-        let name_off = self.add_string(name);
         self.insert_type(
-            name_off,
+            name,
             BtfKind::Int(Int {
                 size,
                 encoding,
@@ -61,12 +63,18 @@ impl BtfBuilder {
     }
 
     pub fn add_ptr(&mut self, pointee: BtfTypeId) -> BtfTypeId {
-        self.insert_type(0, BtfKind::Ptr(pointee))
+        self.insert_type("", BtfKind::Ptr(pointee))
     }
 
-    pub fn add_array(&mut self, elem: BtfTypeId, index: BtfTypeId, len: u32) -> BtfTypeId {
+    pub fn add_array(
+        &mut self,
+        name: &str,
+        elem: BtfTypeId,
+        index: BtfTypeId,
+        len: u32,
+    ) -> BtfTypeId {
         self.insert_type(
-            0,
+            name,
             BtfKind::Array(Array {
                 r#type: elem,
                 index_type: index,
@@ -76,31 +84,28 @@ impl BtfBuilder {
     }
 
     pub fn add_typedef(&mut self, name: &str, target: BtfTypeId) -> BtfTypeId {
-        let name_off = self.add_string(name);
-        self.insert_type(name_off, BtfKind::Typedef(target))
+        self.insert_type(name, BtfKind::Typedef(target))
     }
 
     pub fn add_const(&mut self, target: BtfTypeId) -> BtfTypeId {
-        self.insert_type(0, BtfKind::Const(target))
+        self.insert_type("", BtfKind::Const(target))
     }
 
     pub fn add_volatile(&mut self, target: BtfTypeId) -> BtfTypeId {
-        self.insert_type(0, BtfKind::Volatile(target))
+        self.insert_type("", BtfKind::Volatile(target))
     }
 
     pub fn add_restrict(&mut self, target: BtfTypeId) -> BtfTypeId {
-        self.insert_type(0, BtfKind::Restrict(target))
+        self.insert_type("", BtfKind::Restrict(target))
     }
 
     pub fn add_float(&mut self, name: &str, size: u32) -> BtfTypeId {
-        let name_off = self.add_string(name);
-        self.insert_type(name_off, BtfKind::Float(Float { size }))
+        self.insert_type(name, BtfKind::Float(Float { size }))
     }
 
     pub fn add_fwd(&mut self, name: &str, is_union: bool) -> BtfTypeId {
-        let name_off = self.add_string(name);
         self.insert_type(
-            name_off,
+            name,
             BtfKind::Fwd(Fwd {
                 kind_flag: is_union,
             }),
@@ -108,9 +113,8 @@ impl BtfBuilder {
     }
 
     pub fn add_func(&mut self, name: &str, proto: BtfTypeId, linkage: FuncLinkage) -> BtfTypeId {
-        let name_off = self.add_string(name);
         self.insert_type(
-            name_off,
+            name,
             BtfKind::Func(Func {
                 func_proto: proto,
                 linkage,
@@ -119,9 +123,8 @@ impl BtfBuilder {
     }
 
     pub fn add_var(&mut self, name: &str, ty: BtfTypeId, linkage: VariableLinkage) -> BtfTypeId {
-        let name_off = self.add_string(name);
         self.insert_type(
-            name_off,
+            name,
             BtfKind::Var(Var {
                 ty,
                 variable: Variable { linkage },
@@ -147,8 +150,7 @@ impl BtfBuilder {
             })
             .collect();
 
-        let name_off = self.add_string(name);
-        self.insert_type(name_off, BtfKind::Struct(Struct { members, size }))
+        self.insert_type(name, BtfKind::Struct(Struct { members, size }))
     }
 
     pub fn make_union<F>(&mut self, name: &str, size: u32, f: F) -> BtfTypeId
@@ -169,8 +171,7 @@ impl BtfBuilder {
             })
             .collect();
 
-        let name_off = self.add_string(name);
-        self.insert_type(name_off, BtfKind::Union(Union { members, size }))
+        self.insert_type(name, BtfKind::Union(Union { members, size }))
     }
 
     pub fn make_enum<F>(&mut self, name: &str, size: u32, signed: bool, f: F) -> BtfTypeId
@@ -189,9 +190,8 @@ impl BtfBuilder {
             })
             .collect();
 
-        let name_off = self.add_string(name);
         self.insert_type(
-            name_off,
+            name,
             BtfKind::Enum(Enum {
                 signed,
                 size,
@@ -217,9 +217,8 @@ impl BtfBuilder {
             })
             .collect();
 
-        let name_off = self.add_string(name);
         self.insert_type(
-            name_off,
+            name,
             BtfKind::Enum64(Enum64 {
                 signed,
                 size,
@@ -245,7 +244,7 @@ impl BtfBuilder {
             .collect();
 
         self.insert_type(
-            0,
+            "",
             BtfKind::FuncProto(FuncProto {
                 params,
                 return_type,
@@ -270,9 +269,8 @@ impl BtfBuilder {
             })
             .collect();
 
-        let name_off = self.add_string(name);
         self.insert_type(
-            name_off,
+            name,
             BtfKind::Datasec(Datasec {
                 secinfos,
                 size,

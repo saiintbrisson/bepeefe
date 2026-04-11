@@ -19,7 +19,7 @@ struct PacketStats {
 #[cfg(target_arch = "bpf")]
 mod program {
     use core::ffi::c_void;
-    use guest::{BPF_MAP_TYPE_HASH, bpf_map_lookup_elem, bpf_map_update_elem, decl_map};
+    use rust_examples::{BPF_MAP_TYPE_HASH, bpf_map_lookup_elem, bpf_map_update_elem, decl_map};
 
     use super::{Ctx, PacketStats};
 
@@ -31,13 +31,13 @@ mod program {
     });
 
     #[unsafe(no_mangle)]
-    unsafe fn entry(ctx: &Ctx) -> u64 {
+    fn entry(ctx: &Ctx) -> u64 {
         let map = &counters as *const _ as *const c_void;
         let key_ptr = &ctx.id as *const _ as *const c_void;
 
-        let val = bpf_map_lookup_elem(map, key_ptr);
+        let val = unsafe { bpf_map_lookup_elem(map, key_ptr) };
         if !val.is_null() {
-            let stats = &mut *(val as *mut PacketStats);
+            let stats = unsafe { &mut *(val as *mut PacketStats) };
             stats.tx_bytes += ctx.tx_bytes;
             stats.rx_bytes += ctx.rx_bytes;
         } else {
@@ -45,7 +45,9 @@ mod program {
                 tx_bytes: ctx.tx_bytes,
                 rx_bytes: ctx.rx_bytes,
             };
-            bpf_map_update_elem(map, key_ptr, &new as *const _ as *const c_void, 0);
+            unsafe {
+                bpf_map_update_elem(map, key_ptr, &new as *const _ as *const c_void, 0);
+            }
         }
 
         0
@@ -54,7 +56,11 @@ mod program {
 
 #[cfg(not(target_arch = "bpf"))]
 fn main() {
-    use bepeefe::{EbpfObject, Vm, vm::MapReuseStrategy};
+    use bepeefe::{
+        EbpfObject, Vm,
+        verifier::VerifierConfig,
+        vm::{HostEnv, MapReuseStrategy},
+    };
     use std::thread;
 
     const PROGRAM: &[u8] =
@@ -64,19 +70,27 @@ fn main() {
     let prog = obj.load_prog("entry").unwrap();
 
     let vm = Vm::new();
-    let handle = vm.prepare(prog, MapReuseStrategy::MatchByName);
+    let handle = vm
+        .prepare(
+            prog,
+            MapReuseStrategy::MatchByName,
+            &VerifierConfig::default(),
+        )
+        .unwrap();
 
     let threads: Vec<_> = (0..4u32)
         .map(|t| {
             let handle = handle.clone();
             thread::spawn(move || {
                 for id in 1..=16u32 {
-                    let ctx = handle.build_ctx(&[Ctx {
-                        id,
-                        tx_bytes: (t as u64 + 1) * 10,
-                        rx_bytes: (t as u64 + 1) * 20,
-                    }]);
-                    handle.run(&ctx);
+                    let image = handle
+                        .build_image(&[Ctx {
+                            id,
+                            tx_bytes: (t as u64 + 1) * 10,
+                            rx_bytes: (t as u64 + 1) * 20,
+                        }])
+                        .unwrap();
+                    handle.run(image, HostEnv::default(), None);
                 }
             })
         })
@@ -86,8 +100,9 @@ fn main() {
         t.join().unwrap();
     }
 
+    let counters = vm.map("counters").unwrap();
     for id in 1u32..=16 {
-        let stats: PacketStats = vm.map("counters").lookup(&id).unwrap();
+        let stats: PacketStats = counters.lookup(&id).unwrap().unwrap();
         assert_eq!(stats.tx_bytes, 100, "id {id} tx mismatch");
         assert_eq!(stats.rx_bytes, 200, "id {id} rx mismatch");
         eprintln!("counters[{id}] = {stats:?}");

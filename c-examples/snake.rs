@@ -1,12 +1,16 @@
 use std::io::{Write, stdout};
 use std::time::Duration;
 
-use bepeefe::{EbpfObject, ProgramValue, Vm, vm::MapReuseStrategy};
+use bepeefe::{
+    EbpfObject, Value, Vm,
+    verifier::VerifierConfig,
+    vm::{HostEnv, MapReuseStrategy},
+};
 use crossterm::{
     ExecutableCommand, cursor, event,
     terminal::{self, ClearType},
 };
-use rand::Rng;
+use rand::RngExt;
 
 const GRID_W: usize = 64;
 const GRID_H: usize = 16;
@@ -19,7 +23,9 @@ fn main() {
     let prog = obj.load_prog("on_tick").unwrap();
 
     let vm = Vm::new();
-    let prog = vm.prepare(prog, MapReuseStrategy::None);
+    let prog = vm
+        .prepare(prog, MapReuseStrategy::None, &VerifierConfig::default())
+        .unwrap();
 
     let mut grid = [[' '; GRID_W]; GRID_H];
     let mut dir = Direction::Right;
@@ -47,18 +53,17 @@ fn main() {
             }
         }
 
-        let ctx = prog.build_ctx(&[ProgramValue::from([
-            ("dir", ProgramValue::Number(dir as u8 as i64)),
-            (
-                "rand",
-                ProgramValue::Number(rand::rng().random::<i32>() as _),
-            ),
-        ])]);
-        let r0 = prog.run(&ctx);
+        let image = prog
+            .build_image(&[Value::from([
+                ("dir", Value::Number(dir as u8 as i64)),
+                ("rand", Value::Number(rand::rng().random::<i32>() as _)),
+            ])])
+            .unwrap();
+        let r0 = prog.run(image, HostEnv::default(), None);
 
-        let mut map = vm.map("render_events");
-        while let Some(ProgramValue::Map(ev)) = map.pop::<ProgramValue>() {
-            let (&ProgramValue::Number(color), &ProgramValue::Number(x), &ProgramValue::Number(y)) = (
+        let mut map = vm.map("render_events").unwrap();
+        while let Some(Value::Map(ev)) = map.pop::<Value>().unwrap() {
+            let (&Value::Number(color), &Value::Number(x), &Value::Number(y)) = (
                 ev.get("color").unwrap(),
                 ev.get("x").unwrap(),
                 ev.get("y").unwrap(),

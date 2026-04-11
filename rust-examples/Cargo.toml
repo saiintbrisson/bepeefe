@@ -1,0 +1,25 @@
+[package]
+name = "rust-examples"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[lib]
+path = "lib.rs"
+
+[target.'cfg(not(target_arch = "bpf"))'.dependencies]
+bepeefe.workspace = true
+crossterm.workspace = true
+serde.workspace = true
+
+[[example]]
+name = "snake"
+path = "snake.rs"
+
+[[example]]
+name = "hash_map"
+path = "hash_map.rs"
+
+[[example]]
+name = "tcpstates"
+path = "tcpstates.rs"

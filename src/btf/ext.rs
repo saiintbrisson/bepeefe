@@ -62,30 +62,48 @@ mod parser {
     use super::{super::parser::BTF_MAGIC, *};
     use byteorder::{LittleEndian, ReadBytesExt};
 
+    fn invalid<T: Into<String>>(msg: T) -> Error {
+        Error::new(ErrorKind::InvalidData, msg.into())
+    }
+
+    fn slice<'a, I>(data: &'a [u8], idx: I, what: &str) -> Result<&'a [u8]>
+    where
+        I: std::slice::SliceIndex<[u8], Output = [u8]>,
+    {
+        data.get(idx)
+            .ok_or_else(|| invalid(format!("BTF.ext {what} out of bounds")))
+    }
+
     #[derive(Clone, Debug)]
+    #[allow(dead_code, reason = "fields kept for wire-format parity")]
     struct BtfExtHeader {
-        #[allow(dead_code)]
         version: u8,
-        #[allow(dead_code)]
         flags: u8,
         hdr_len: u32,
 
-        /* All offsets are in bytes relative to the end of this header */
+        // All offsets are in bytes relative to the end of this header
         func_info_off: u32,
         func_info_len: u32,
         line_info_off: u32,
         line_info_len: u32,
 
-        /* optional part of .BTF.ext header */
+        // optional part of .BTF.ext header
         core_relo_off: u32,
         core_relo_len: u32,
     }
 
     impl BtfExt {
         pub fn from_bytes(data: &[u8]) -> Result<BtfExt> {
-            assert_eq!(data[..2], BTF_MAGIC);
+            let magic = data
+                .get(..2)
+                .ok_or_else(|| invalid("BTF.ext section is shorter than 2 bytes"))?;
+            if magic != BTF_MAGIC {
+                return Err(invalid("BTF.ext magic bytes do not match"));
+            }
 
-            let header_data = &mut &data[2..];
+            let header_data = &mut data
+                .get(2..)
+                .ok_or_else(|| invalid("BTF.ext section truncated after magic"))?;
             let header = BtfExtHeader {
                 version: header_data.read_u8()?,
                 flags: header_data.read_u8()?,
@@ -101,18 +119,27 @@ mod parser {
             let mut btf_ext = BtfExt::default();
 
             let func_info_off = (header.hdr_len + header.func_info_off) as usize;
-            let mut func_info_data =
-                &data[func_info_off..func_info_off + header.func_info_len as usize];
+            let mut func_info_data = slice(
+                data,
+                func_info_off..func_info_off + header.func_info_len as usize,
+                "func_info section",
+            )?;
             btf_ext.func_info = read_sec_info(&mut func_info_data)?;
 
             let line_info_off = (header.hdr_len + header.line_info_off) as usize;
-            let mut line_info_data =
-                &data[line_info_off..line_info_off + header.line_info_len as usize];
+            let mut line_info_data = slice(
+                data,
+                line_info_off..line_info_off + header.line_info_len as usize,
+                "line_info section",
+            )?;
             btf_ext.line_info = read_sec_info(&mut line_info_data)?;
 
             let core_relo_off = (header.hdr_len + header.core_relo_off) as usize;
-            let mut core_relo_data =
-                &data[core_relo_off..core_relo_off + header.core_relo_len as usize];
+            let mut core_relo_data = slice(
+                data,
+                core_relo_off..core_relo_off + header.core_relo_len as usize,
+                "core_relo section",
+            )?;
             btf_ext.core_relo = read_sec_info(&mut core_relo_data)?;
 
             Ok(btf_ext)
@@ -136,11 +163,11 @@ mod parser {
             let num_info = data.read_u32::<LittleEndian>()? as usize;
 
             let len = record_size * num_info;
-            let rec_data = &mut &data[..len];
+            let mut rec_data = slice(data, 0..len, "sec_info record block")?;
 
             let mut records = Vec::with_capacity(num_info);
             for _ in 0..num_info {
-                records.push(R::read_record(rec_data)?);
+                records.push(R::read_record(&mut rec_data)?);
             }
 
             info_vec.push(InfoSec {
@@ -148,7 +175,7 @@ mod parser {
                 data: records,
             });
 
-            *data = &data[len..];
+            *data = slice(data, len.., "sec_info trailing data")?;
         }
 
         Ok(info_vec)

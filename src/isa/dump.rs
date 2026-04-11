@@ -23,7 +23,7 @@ pub enum InsnKind {
 }
 
 pub fn describe(opcode: u8) -> InsnKind {
-    match crate::isa::INSTRUCTION_NAME_TABLE[opcode as usize] {
+    match crate::isa::opcode_name(opcode) {
         "add_src_32" | "add_src_64" => InsnKind::AluSrc("+"),
         "sub_src_32" | "sub_src_64" => InsnKind::AluSrc("-"),
         "mul_src_32" | "mul_src_64" => InsnKind::AluSrc("*"),
@@ -169,10 +169,19 @@ pub fn disasm(insn: Insn, next: Option<Insn>) -> String {
         InsnKind::Ja32 => fmt_goto_imm(imm),
         InsnKind::Ja16 => fmt_goto(off),
         InsnKind::Call => match src {
-            0 => format!("call {}", imm),
-            1 if imm >= 0 => format!("call +{}", imm),
-            1 => format!("call {}", imm),
-            _ => format!("call ?{}", imm),
+            0 => {
+                format!(
+                    "call {}",
+                    if let Some(helper) = crate::vm::helpers::lookup(imm) {
+                        format!("{}#{imm}", helper.name())
+                    } else {
+                        imm.to_string()
+                    }
+                )
+            }
+            1 if imm >= 0 => format!("call +{imm}"),
+            1 => format!("call {imm}"),
+            _ => format!("call ?{imm}"),
         },
         InsnKind::Exit => "exit".into(),
         InsnKind::Unknown => String::new(),
@@ -217,14 +226,14 @@ pub fn disasm_brief(insn: Insn, next: Option<Insn>) -> String {
     }
 }
 
-pub fn debugger(state: &super::State, insn: Insn) -> String {
+pub fn debugger(state: &crate::vm::Cpu, insn: Insn) -> String {
     let dst = insn.dst_reg();
     let src = insn.src_reg();
     let imm = insn.imm();
     let off = insn.offset();
-    let dst_val = state.registers[dst as usize];
-    let src_val = state.registers[src as usize];
-    let next = state.prog.insns.get(state.pc).copied();
+    let dst_val = state.reg(dst);
+    let src_val = state.reg(src);
+    let next = state.insn_at(state.pc());
 
     let brief = disasm_brief(insn, next);
     let ann = if brief.is_empty() {

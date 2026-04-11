@@ -21,6 +21,7 @@ pub const BPF_JMP32: u8 = 0x06;
 pub const BPF_ALU64: u8 = 0x07;
 
 pub mod alu;
+pub mod dump;
 pub mod jmp;
 pub mod load;
 
@@ -78,16 +79,37 @@ impl Insn {
     }
 }
 
-fn noop(_: &mut crate::vm::State, _: Insn) {}
+fn noop(_: &mut crate::vm::Cpu, _: Insn) {}
+
+/// Looks up the instruction handler for `insn`'s opcode.
+#[inline]
+#[expect(clippy::indexing_slicing, reason = "table is [_; 256] indexed by u8")]
+pub fn insn_handler(insn: Insn) -> fn(&mut crate::vm::Cpu, Insn) {
+    INSTRUCTION_TABLE[insn.opcode() as usize]
+}
+
+/// Looks up the symbolic name for `insn`'s opcode.
+pub fn insn_name(insn: Insn) -> &'static str {
+    opcode_name(insn.opcode())
+}
+
+/// Looks up the symbolic name for an opcode byte.
+#[inline]
+#[expect(clippy::indexing_slicing, reason = "table is [_; 256] indexed by u8")]
+pub fn opcode_name(opcode: u8) -> &'static str {
+    INSTRUCTION_NAME_TABLE[opcode as usize]
+}
 
 macro_rules! instruction_table {
     ($($opcode:expr => $name:ident;)+) => {
-        pub const INSTRUCTION_TABLE: [fn(&mut crate::vm::State, Insn); const {u8::MAX as usize + 1}] = {
-            let mut table: [fn(&mut crate::vm::State, Insn); const {u8::MAX as usize + 1}] = [noop; const {u8::MAX as usize + 1}];
+        #[allow(clippy::indexing_slicing, reason = "every $id is a lit under 256")]
+        pub const INSTRUCTION_TABLE: [fn(&mut crate::vm::Cpu, Insn); const {u8::MAX as usize + 1}] = {
+            let mut table: [fn(&mut crate::vm::Cpu, Insn); const {u8::MAX as usize + 1}] = [noop; const {u8::MAX as usize + 1}];
             $(table[$opcode as usize] = $name;)+
             table
         };
 
+        #[allow(clippy::indexing_slicing, reason = "every $id is a lit under 256")]
         pub const INSTRUCTION_NAME_TABLE: [&str; const {u8::MAX as usize + 1}] = {
             let mut table: [&str; const {u8::MAX as usize + 1}] = ["unknown";  const {u8::MAX as usize + 1}];
             $(table[$opcode as usize] = stringify!($name);)+

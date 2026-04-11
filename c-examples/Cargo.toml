@@ -1,0 +1,27 @@
+[package]
+name = "c-examples"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[dev-dependencies]
+bepeefe.workspace = true
+crossterm.workspace = true
+rand.workspace = true
+
+[[example]]
+name = "map_array"
+path = "map_array.rs"
+
+[[example]]
+name = "map_hash"
+path = "map_hash.rs"
+
+[[example]]
+name = "snake"
+path = "snake.rs"
+
+[lints]
+workspace = true

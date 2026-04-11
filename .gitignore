@@ -1,7 +1,8 @@
-/examples/**/target
-/target
-
-# sshfs files
-._*
-
+target/
 *.o
+!c-examples/*.o
+
+.DS_Store
+.direnv/
+.envrc
+

@@ -1,0 +1,5 @@
+disallowed-macros = [
+  { path = "std::assert", reason = "assert! panics at runtime, return an error from the surrounding fn instead. Allowed in tests." },
+  { path = "std::assert_eq", reason = "assert_eq! panics at runtime, return an error from the surrounding fn instead. Allowed in tests." },
+  { path = "std::assert_ne", reason = "assert_ne! panics at runtime, return an error from the surrounding fn instead. Allowed in tests." },
+]

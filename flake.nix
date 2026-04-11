@@ -22,14 +22,13 @@
             rust
             pkg-config
             just
-            git
 
-            libllvm
-            libclang
+            llvmPackages_22.libllvm
+            llvmPackages_22.libcxxClang
           ];
 
           shellHook = ''
-            export PATH="${pkgs.libllvm}/bin:$PATH"
+            export PATH="${pkgs.llvmPackages_22.libllvm}/bin:$PATH"
             echo "Using clang version: $(clang --version | head -n1)"
           '';
         };

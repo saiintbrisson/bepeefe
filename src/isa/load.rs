@@ -9,7 +9,7 @@
 //! From: <https://github.com/torvalds/linux/blob/master/Documentation/bpf/classic_vs_extended.rst>
 #![allow(dead_code)]
 
-use crate::isa::Insn;
+use crate::{isa::Insn, vm::ptr::TaggedPtr};
 
 /// Store instructions MODE mask
 pub const LOAD_MODE_MASK: u8 = 0b11100000;
@@ -41,24 +41,18 @@ pub const SIZE_DW: u8 = 3 << 3;
 macro_rules! mem_insns {
     ($($ld:ident, $st:ident, $size:ident;)+) => {
         $(
-            pub fn $ld(state: &mut crate::vm::State, insn: Insn) {
+            pub fn $ld(state: &mut crate::vm::Cpu, insn: Insn) {
                 const SIZE: usize = ($size::BITS / 8) as usize;
 
-                let src = insn.src_reg() as usize;
-                let dst = insn.dst_reg() as usize;
-
-                let ptr = state.registers[src as usize].saturating_add_signed(insn.offset() as i64);
+                let ptr = state.reg(insn.src_reg()).saturating_add_signed(insn.offset() as i64);
                 let val: [_; SIZE] = state.read(ptr);
 
-                state.registers[dst as usize] = $size::from_ne_bytes(val) as u64;
+                state.set_reg(insn.dst_reg(), $size::from_ne_bytes(val) as u64);
             }
 
-            pub fn $st(state: &mut crate::vm::State, insn: Insn) {
-                let src = insn.src_reg() as usize;
-                let dst = insn.dst_reg() as usize;
-
-                let ptr = state.registers[dst as usize].saturating_add_signed(insn.offset() as i64);
-                let val = state.registers[src as usize] as $size;
+            pub fn $st(state: &mut crate::vm::Cpu, insn: Insn) {
+                let ptr = state.reg(insn.dst_reg()).saturating_add_signed(insn.offset() as i64);
+                let val = state.reg(insn.src_reg()) as $size;
 
                 state.write(ptr, &val.to_ne_bytes());
             }
@@ -93,7 +87,8 @@ pub const BPF_PSEUDO_MAP_VALUE: u8 = 2;
 /// From the kernel documentation:
 ///
 /// > eBPF has one 16-byte instruction: BPF_LD | BPF_DW | BPF_IMM which consists
-/// > of two consecutive 'struct bpf_insn' 8-byte blocks and interpreted as single
+/// > of two consecutive 'struct bpf_insn' 8-byte blocks and interpreted as
+/// > single
 /// > instruction that loads 64-bit immediate value into a dst_reg.
 /// > Classic BPF has similar instruction: BPF_LD | BPF_W | BPF_IMM which loads
 /// > 32-bit immediate value into a register.
@@ -102,33 +97,35 @@ pub const BPF_PSEUDO_MAP_VALUE: u8 = 2;
 /// Ref: <https://www.rfc-editor.org/rfc/rfc9669.html#name-64-bit-immediate-instructio>
 /// Ref: <https://github.com/torvalds/linux/blob/7ea30958b3054f5e488fa0b33c352723f7ab3a2a/kernel/bpf/verifier.c#L20519>
 /// Ref: <https://mechpen.github.io/posts/2019-08-03-bpf-map/>
-pub fn ld_imm64(state: &mut crate::vm::State, insn: Insn) {
-    let dst = insn.dst_reg() as usize;
+pub fn ld_imm64(state: &mut crate::vm::Cpu, insn: Insn) {
+    let dst = insn.dst_reg();
     let imm = insn.imm();
 
-    let next_imm = (state.prog.insns[state.pc].imm() as u64) << 32;
-    state.pc += 1;
+    let Some(next_insn) = state.insn_at(state.pc()) else {
+        return;
+    };
+
+    let next_imm = (next_insn.imm() as u64) << 32;
+    state.advance_pc();
 
     match insn.src_reg() {
-        0 => state.registers[dst] = next_imm | imm as u64,
-        BPF_PSEUDO_MAP_FD => state.registers[dst] = imm as u64,
+        0 => state.set_reg(dst, next_imm | imm as u64),
+        BPF_PSEUDO_MAP_FD => state.set_reg(dst, imm as u64),
         BPF_PSEUDO_MAP_VALUE => {
-            let map = state
-                .prog
-                .vm
-                .find_map(imm as u16)
-                .expect("PSEUDO_MAP_VALUE: invalid map fd");
-            let base = map
-                .repr
-                .lookup(&0u32.to_ne_bytes())
-                .expect("PSEUDO_MAP_VALUE: entry 0 not found");
-            state.registers[dst] = base as u64 + (next_imm >> 32);
+            let map = state.get_map(imm as u16);
+            let Some(base) = map.repr.lookup(&0u32.to_ne_bytes()) else {
+                return;
+            };
+            state.set_reg(
+                dst,
+                TaggedPtr::map(map.fd as u16, base as u32 + (next_imm >> 32) as u32),
+            );
         }
         // 3 => dst = var_addr(imm)                       imm: variable id dst: data address
         // 4 => dst = code_addr(imm)                      imm: integer     dst: code address
         // 5 => dst = map_by_idx(imm)                     imm: map index   dst: map
         // 6 => dst = map_val(map_by_idx(imm)) + next_imm imm: map index   dst: data address
-        _ => unreachable!("unimplemented src reg for imm64 load: {}", insn.src_reg()),
+        _ => {}
     }
 }
 
@@ -144,33 +141,33 @@ pub const ATOMIC_XCHG: u8 = 0xE0 | ATOMIC_FETCH;
 /// Atomic compare and exchange
 pub const ATOMIC_CMPXCHG: u8 = 0xF0;
 
-pub fn stx_atomic_dw(state: &mut crate::vm::State, insn: Insn) {
-    let src = insn.src_reg() as usize;
-    let dst = insn.dst_reg() as usize;
+pub fn stx_atomic_dw(state: &mut crate::vm::Cpu, insn: Insn) {
+    let src = insn.src_reg();
+    let dst = insn.dst_reg();
     let imm = insn.imm();
 
-    let ptr = state.registers[dst as usize].saturating_add_signed(insn.offset() as i64);
+    let ptr = state.reg(dst).saturating_add_signed(insn.offset() as i64);
 
     match imm as u8 & 0xF0 {
         ATOMIC_ADD => {
             let val = u64::from_ne_bytes(state.read(ptr));
-            let new_val = val + state.registers[src];
+            let new_val = val + state.reg(src);
             state.write(ptr, &new_val.to_ne_bytes());
             if imm as u8 & ATOMIC_FETCH != 0 {
-                state.registers[src] = val;
+                state.set_reg(src, val);
             }
         }
         ATOMIC_CMPXCHG if imm as u8 & ATOMIC_FETCH > 0 => {
-            let expected = state.registers[0];
-            let new_val = state.registers[src];
+            let expected = state.reg(0);
+            let new_val = state.reg(src);
             let old_val = u64::from_ne_bytes(state.read(ptr));
 
             if expected == old_val {
                 state.write(ptr, &new_val.to_ne_bytes());
             }
 
-            state.registers[0] = old_val;
+            state.set_reg(0, old_val);
         }
-        _ => todo!(),
+        _ => {}
     }
 }
