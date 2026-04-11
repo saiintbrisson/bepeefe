@@ -1,0 +1,8 @@
+[package]
+name = "bepeefe-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bepeefe.workspace = true
+clap.workspace = true
