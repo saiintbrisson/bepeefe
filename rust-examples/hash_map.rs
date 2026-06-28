@@ -56,11 +56,7 @@ mod program {
 
 #[cfg(not(target_arch = "bpf"))]
 fn main() {
-    use bepeefe::{
-        EbpfObject, Vm,
-        verifier::VerifierConfig,
-        vm::{HostEnv, MapReuseStrategy},
-    };
+    use bepeefe::{EbpfObject, Vm, verifier::VerifierConfig, vm::MapReuseStrategy};
     use std::thread;
 
     const PROGRAM: &[u8] =
@@ -90,7 +86,7 @@ fn main() {
                             rx_bytes: (t as u64 + 1) * 20,
                         }])
                         .unwrap();
-                    handle.run(image, HostEnv::default(), None);
+                    handle.run(image, None);
                 }
             })
         })

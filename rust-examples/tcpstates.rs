@@ -167,7 +167,7 @@ fn main() {
         EbpfObject, Vm,
         capture::{Capture, Event as CapEvent},
         verifier::VerifierConfig,
-        vm::{HostEnv, MapReuseStrategy},
+        vm::{MapReuseStrategy, Task},
     };
     use std::sync::{Arc, Mutex};
 
@@ -218,15 +218,10 @@ fn main() {
             saddr_v6: [0; 16],
             daddr_v6: [0; 16],
         };
-        let env = HostEnv {
-            ktime_ns: base_ktime + delta,
-            pid: 1337,
-            tgid: 7331,
-            comm: Arc::from("curl"),
-            ..HostEnv::default()
-        };
-        let image = prog.build_image(&[ctx]).unwrap();
-        prog.run(image, env, Some(sink.clone()));
+        vm.world().ktime_ns = base_ktime + delta;
+        let task = Task::new(1337, 7331, "curl").unwrap();
+        let image = prog.build_image(&[ctx]).unwrap().from_task(task);
+        prog.run(image, Some(sink.clone()));
     }
 
     for evt in sink.0.lock().unwrap().iter() {

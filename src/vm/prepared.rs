@@ -3,8 +3,8 @@ use std::{ops::Deref, sync::Arc};
 use super::{
     Vm,
     cpu::{Cpu, CtxImage},
-    env::HostEnv,
     ptr::TaggedPtr,
+    task::Task,
 };
 use crate::{
     Value, btf::BtfKind, capture::Capture, error::RuntimeError, object::EbpfProgram,
@@ -51,14 +51,14 @@ impl PreparedProgram {
         })
     }
 
-    pub fn run(&self, image: CtxImage, env: HostEnv, capture: Option<Arc<dyn Capture>>) -> u64 {
-        let mut state = self.start(image, env, capture);
+    pub fn run(&self, image: CtxImage, capture: Option<Arc<dyn Capture>>) -> u64 {
+        let mut state = self.start(image, capture);
         while !state.step() {}
         state.return_val()
     }
 
-    pub fn start(&self, image: CtxImage, env: HostEnv, capture: Option<Arc<dyn Capture>>) -> Cpu {
-        Cpu::new(env, capture, image)
+    pub fn start(&self, image: CtxImage, capture: Option<Arc<dyn Capture>>) -> Cpu {
+        Cpu::new(capture, image)
     }
 
     /// Given a function name, we search for a matching BTF function entry. The
@@ -75,7 +75,7 @@ impl PreparedProgram {
     /// ```no_run
     /// # use bepeefe::{
     /// #     EbpfObject, Value,
-    /// #     vm::{HostEnv, MapReuseStrategy, Vm},
+    /// #     vm::{MapReuseStrategy, Vm},
     /// #     verifier::VerifierConfig,
     /// # };
     /// # let file = std::fs::read("./c-examples/map_array.o").unwrap();
@@ -91,7 +91,7 @@ impl PreparedProgram {
     ///         ("len", Value::Number(64)),
     ///     ])])
     ///     .unwrap();
-    /// prepared.run(image, HostEnv::default(), None);
+    /// prepared.run(image, None);
     /// ```
     ///
     /// The resulting context will be a zeroed buffer of the size of the
@@ -142,6 +142,7 @@ impl PreparedProgram {
             prog: self.clone(),
             ctx_buf,
             arg_regs,
+            task: Task::default(),
         })
     }
 }

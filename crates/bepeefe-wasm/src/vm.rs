@@ -5,7 +5,7 @@ use wasm_bindgen::prelude::*;
 use bepeefe::{
     btf::value::Value,
     verifier::VerifierConfig,
-    vm::{Cpu, CtxImage, HostEnv, MapHandle, MapReuseStrategy, PreparedProgram, Vm},
+    vm::{Cpu, CtxImage, MapHandle, MapReuseStrategy, PreparedProgram, Task, Vm, World},
 };
 
 use crate::{capture::WasmCapture, disasm, js_err, object::WasmObject};
@@ -21,6 +21,14 @@ impl WasmVm {
     #[allow(clippy::new_without_default)]
     pub fn new() -> WasmVm {
         WasmVm { inner: Vm::new() }
+    }
+
+    /// Replaces the shared world (clock, probe memory, CPU, RNG seed).
+    /// Call between runs to advance the emulated machine.
+    pub fn set_world(&self, world_json: &str) -> Result<(), JsError> {
+        let world: World = serde_json::from_str(world_json).map_err(js_err)?;
+        *self.inner.world() = world;
+        Ok(())
     }
 
     pub fn load(
@@ -131,24 +139,26 @@ impl WasmProgram {
     pub fn start(
         &self,
         ctx_json: &str,
-        env_json: &str,
+        task_json: &str,
         capture: Option<WasmCapture>,
     ) -> Result<WasmSession, JsError> {
-        let image = self.build_image(ctx_json)?;
-        let env = parse_env(env_json)?;
-        let inner = self.prepared.start(image, env, capture.map(|c| c.inner));
+        let image = self
+            .build_image(ctx_json)?
+            .from_task(parse_task(task_json)?);
+        let inner = self.prepared.start(image, capture.map(|c| c.inner));
         Ok(WasmSession { inner })
     }
 
     pub fn run(
         &self,
         ctx_json: &str,
-        env_json: &str,
+        task_json: &str,
         capture: Option<WasmCapture>,
     ) -> Result<u64, JsError> {
-        let image = self.build_image(ctx_json)?;
-        let env = parse_env(env_json)?;
-        Ok(self.prepared.run(image, env, capture.map(|c| c.inner)))
+        let image = self
+            .build_image(ctx_json)?
+            .from_task(parse_task(task_json)?);
+        Ok(self.prepared.run(image, capture.map(|c| c.inner)))
     }
 
     pub fn disasm(&self) -> Result<String, JsError> {
@@ -195,10 +205,10 @@ impl WasmSession {
     }
 }
 
-fn parse_env(env_json: &str) -> Result<HostEnv, JsError> {
-    let trimmed = env_json.trim();
+fn parse_task(task_json: &str) -> Result<Task, JsError> {
+    let trimmed = task_json.trim();
     if trimmed.is_empty() || trimmed == "null" {
-        return Ok(HostEnv::default());
+        return Ok(Task::default());
     }
     serde_json::from_str(trimmed).map_err(js_err)
 }

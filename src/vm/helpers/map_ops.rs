@@ -74,7 +74,7 @@ pub(crate) fn perf_event_output(
     size: u32,
 ) -> Result<(), RuntimeError> {
     let index = match flags & BPF_F_INDEX_MASK {
-        BPF_F_CURRENT_CPU => state.env().cpu,
+        BPF_F_CURRENT_CPU => state.cpu(),
         i => i as u32,
     };
     let map = state.get_map(map_fd);

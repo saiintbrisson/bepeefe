@@ -1,8 +1,4 @@
-use bepeefe::{
-    EbpfObject, Value, Vm,
-    verifier::VerifierConfig,
-    vm::{HostEnv, MapReuseStrategy},
-};
+use bepeefe::{EbpfObject, Value, Vm, verifier::VerifierConfig, vm::MapReuseStrategy};
 
 fn main() {
     const FILE: &[u8] = include_bytes!("map_hash.o");
@@ -24,7 +20,7 @@ fn main() {
                 ])])
                 .unwrap();
 
-            r0 = prog.run(image, HostEnv::default(), None);
+            r0 = prog.run(image, None);
         }
     }
 

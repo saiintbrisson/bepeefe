@@ -1,8 +1,4 @@
-use bepeefe::{
-    EbpfObject, Value, Vm,
-    verifier::VerifierConfig,
-    vm::{HostEnv, MapReuseStrategy},
-};
+use bepeefe::{EbpfObject, Value, Vm, verifier::VerifierConfig, vm::MapReuseStrategy};
 
 fn main() {
     const FILE: &[u8] = include_bytes!("map_array.o");
@@ -26,7 +22,7 @@ fn main() {
             ("len", Value::Number(3)),
         ])])
         .unwrap();
-    let r0 = prog.run(image, HostEnv::default(), None);
+    let r0 = prog.run(image, None);
 
     eprintln!("result = {}", r0 as i32);
 }

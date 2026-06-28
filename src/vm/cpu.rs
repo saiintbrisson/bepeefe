@@ -1,17 +1,26 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, ops::DerefMut, sync::Arc};
 
-use super::{PreparedProgram, STACK_SIZE, env::HostEnv, ptr::TaggedPtr};
+use super::{PreparedProgram, STACK_SIZE, Task, World, ptr::TaggedPtr};
 use crate::{capture::Capture, isa::Insn, maps::BpfMap};
 
 /// Initial entry-point state laid out by `PreparedProgram::build_image`.
 ///
-/// The image is bound to the `PreparedProgram` it was built against; a
-/// `Cpu` can only be constructed from an image that matches its
-/// program.
+/// The image is bound to the `PreparedProgram` it was built against, so a
+/// `Cpu` can only be constructed from an image that matches its program.
 pub struct CtxImage {
     pub(super) prog: Arc<PreparedProgram>,
     pub(super) ctx_buf: Vec<u8>,
     pub(super) arg_regs: Vec<(u8, u64)>,
+    pub(super) task: Task,
+}
+
+impl CtxImage {
+    /// Sets the task the `bpf_get_current_*` helpers report for this run.
+    /// Left unset, the run reports an anonymous task.
+    pub fn from_task(mut self, task: Task) -> Self {
+        self.task = task;
+        self
+    }
 }
 
 pub(crate) struct StackFrame {
@@ -26,17 +35,22 @@ pub struct Cpu {
     registers: [u64; 11],
     exit: bool,
     call_stack: Vec<StackFrame>,
-    env: HostEnv,
+    task: Task,
     capture: Option<Arc<dyn Capture>>,
 }
 
 impl Cpu {
-    pub(super) fn new(env: HostEnv, capture: Option<Arc<dyn Capture>>, image: CtxImage) -> Self {
-        let prog = image.prog;
+    pub(super) fn new(capture: Option<Arc<dyn Capture>>, image: CtxImage) -> Self {
+        let CtxImage {
+            prog,
+            ctx_buf,
+            arg_regs,
+            task,
+        } = image;
         let call_frames = (1 + prog.max_call_depth).max(1);
-        let buf_len = image.ctx_buf.len() + STACK_SIZE * call_frames;
+        let buf_len = ctx_buf.len() + STACK_SIZE * call_frames;
 
-        let mut buf = image.ctx_buf;
+        let mut buf = ctx_buf;
         buf.resize(buf_len, 0);
 
         let mut state = Self {
@@ -46,11 +60,11 @@ impl Cpu {
             registers: [0; 11],
             exit: false,
             call_stack: Vec::with_capacity(call_frames.saturating_sub(1)),
-            env,
+            task,
             capture,
         };
         state.set_reg(10, TaggedPtr::local(buf_len as u32 - 1));
-        for (idx, val) in image.arg_regs {
+        for (idx, val) in arg_regs {
             state.set_reg(idx, val);
         }
         state
@@ -95,8 +109,20 @@ impl Cpu {
         self.exit = true;
     }
 
-    pub fn env(&self) -> &HostEnv {
-        &self.env
+    pub fn task(&self) -> &Task {
+        &self.task
+    }
+
+    pub fn world(&self) -> impl DerefMut<Target = World> + '_ {
+        self.prog.vm.world()
+    }
+
+    pub fn ktime_ns(&self) -> u64 {
+        self.world().ktime_ns
+    }
+
+    pub fn cpu(&self) -> u32 {
+        self.world().cpu
     }
 
     pub fn capture(&self) -> Option<&Arc<dyn Capture>> {
@@ -112,7 +138,7 @@ impl Cpu {
     }
 
     pub fn prandom_u32(&self) -> u32 {
-        self.prog.vm.prandom_u32()
+        self.world().prandom_u32()
     }
 
     /// # Panics

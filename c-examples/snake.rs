@@ -1,11 +1,7 @@
 use std::io::{Write, stdout};
 use std::time::Duration;
 
-use bepeefe::{
-    EbpfObject, Value, Vm,
-    verifier::VerifierConfig,
-    vm::{HostEnv, MapReuseStrategy},
-};
+use bepeefe::{EbpfObject, Value, Vm, verifier::VerifierConfig, vm::MapReuseStrategy};
 use crossterm::{
     ExecutableCommand, cursor, event,
     terminal::{self, ClearType},
@@ -59,7 +55,7 @@ fn main() {
                 ("rand", Value::Number(rand::rng().random::<i32>() as _)),
             ])])
             .unwrap();
-        let r0 = prog.run(image, HostEnv::default(), None);
+        let r0 = prog.run(image, None);
 
         let mut map = vm.map("render_events").unwrap();
         while let Some(Value::Map(ev)) = map.pop::<Value>().unwrap() {

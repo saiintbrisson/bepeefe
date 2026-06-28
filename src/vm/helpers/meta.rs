@@ -14,7 +14,7 @@ impl BpfHelper for KtimeGetNs {
     }
 
     fn exec(&self, state: &mut Cpu, _: Insn) {
-        state.set_reg(0, state.env().ktime_ns);
+        state.set_reg(0, state.ktime_ns());
     }
 
     fn retval(
@@ -68,7 +68,7 @@ impl BpfHelper for GetSmpProcessorId {
     }
 
     fn exec(&self, state: &mut Cpu, _: Insn) {
-        state.set_reg(0, state.env().cpu as u64);
+        state.set_reg(0, state.cpu() as u64);
     }
 
     fn retval(
@@ -95,7 +95,7 @@ impl BpfHelper for GetCurrentPidTgid {
     }
 
     fn exec(&self, state: &mut Cpu, _: Insn) {
-        state.set_reg(0, state.env().pid_tgid());
+        state.set_reg(0, state.task().pid_tgid());
     }
 
     fn retval(
@@ -132,7 +132,7 @@ impl BpfHelper for GetCurrentComm {
             state.set_reg(0, -22i64 as u64); // EINVAL
             return;
         }
-        let comm = state.env().comm.as_bytes();
+        let comm = state.task().comm();
         let mut out = Vec::with_capacity(size);
         out.extend(comm.iter().copied().take(size - 1));
         out.resize(size, 0);

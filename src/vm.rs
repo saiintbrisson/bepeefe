@@ -1,35 +1,41 @@
 #![allow(clippy::unwrap_used, reason = "Mutex::lock only fails if poisoned")]
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU32, Ordering},
+use std::{
+    ops::DerefMut,
+    sync::{Arc, Mutex},
 };
 
 use crate::maps::BpfMap;
 
 mod cpu;
-pub mod env;
 pub(crate) mod helpers;
 mod map_handle;
 mod prepare;
 mod prepared;
 pub(crate) mod ptr;
+mod task;
+mod world;
 
 pub use cpu::{Cpu, CtxImage};
-pub use env::HostEnv;
 pub use map_handle::MapHandle;
 pub use prepared::PreparedProgram;
+pub use task::{Task, TaskError};
+pub use world::World;
 
 pub struct Vm {
     pub(super) maps: Mutex<Vec<Arc<BpfMap>>>,
-    rng_state: AtomicU32,
+    world: Mutex<World>,
 }
 
 impl Vm {
     pub fn new() -> Arc<Self> {
+        Self::with_world(World::default())
+    }
+
+    pub fn with_world(world: World) -> Arc<Self> {
         Arc::new(Self {
             maps: Default::default(),
-            rng_state: AtomicU32::new(0xDEAD_BEEF),
+            world: Mutex::new(world),
         })
     }
 
@@ -50,25 +56,9 @@ impl Vm {
         self.maps.lock().unwrap().get(fd as usize).is_some()
     }
 
-    pub fn set_rng_seed(&self, seed: u32) {
-        self.rng_state.store(seed, Ordering::Release);
-    }
-
-    /// Returns a random u32 and updates the RNG
-    /// state applying a xorshift.
-    // TODO: move to host env
-    pub(crate) fn prandom_u32(&self) -> u32 {
-        let mut rand = 0;
-        let _ = self
-            .rng_state
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |mut s| {
-                s ^= s << 13;
-                s ^= s >> 17;
-                s ^= s << 5;
-                rand = s;
-                Some(s)
-            });
-        rand
+    /// The mutable state shared across invocations.
+    pub fn world(&self) -> impl DerefMut<Target = World> + '_ {
+        self.world.lock().unwrap()
     }
 
     /// Looks up a typed map by name. Returns `None` for untyped

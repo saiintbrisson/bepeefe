@@ -223,11 +223,7 @@ fn main() {
     use std::io::{Write, stdout};
     use std::time::Duration;
 
-    use bepeefe::{
-        EbpfObject, Vm,
-        verifier::VerifierConfig,
-        vm::{HostEnv, MapReuseStrategy},
-    };
+    use bepeefe::{EbpfObject, Vm, verifier::VerifierConfig, vm::MapReuseStrategy};
     use crossterm::{
         ExecutableCommand, cursor, event,
         terminal::{self, ClearType},
@@ -271,7 +267,7 @@ fn main() {
         }
 
         let image = prog.build_image(&[TickCtx { dir }]).unwrap();
-        let new_score = prog.run(image, HostEnv::default(), None) as i64;
+        let new_score = prog.run(image, None) as i64;
 
         let mut map = vm.map("render_events").unwrap();
         while let Some(ev) = map.pop::<RenderEvent>().unwrap() {

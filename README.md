@@ -100,17 +100,14 @@ for &(old, new, time) in transitions {
         family: AF_INET, protocol: IPPROTO_TCP,
         /* ... */
     };
-    let image = prog.build_image(&[ctx])?;
+    // The task that triggered this invocation rides along with the
+    // context. The clock, RNG, and probe memory live on the VM instead,
+    // so we advance the world between runs.
+    vm.world().ktime_ns = time;
+    let task = Task::new(1234, 4321, "curl").unwrap();
+    let image = prog.build_image(&[ctx])?.from_task(task);
 
-    // HostEnv replaces what a real kernel would feed BPF helpers
-    // (ktime, pid/tgid, comm, kernel/user memory regions).
-    let env = HostEnv {
-        ktime_ns: time, pid: 1234, tgid: 4321,
-        comm: Arc::from("curl"),
-        ..HostEnv::default()
-    };
-
-    let _r0 = prog.run(image, env, Some(sink.clone()));
+    let _r0 = prog.run(image, Some(sink.clone()));
 }
 ```
 
@@ -118,7 +115,7 @@ A lot is happening here. The first few lines declare an event sink to capture ev
 
 In this example, we emulate a scenario where a socket goes through 4 state transitions. The for loop initializes an `InetSockSetState`, equivalent to `struct trace_event_raw_inet_sock_set_state`, we use it to build an image for the program to execute on. Types can implement `Serialize`, and the engine uses BTF information to encode the binary representation expected by the program. Up to 5 parameters can be provided to a function, though most eBPF programs only use one.
 
-Finally, a `HostEnv` carries information that a kernel would naturally provide to helpers. It carries ktime, pid, cpu, plus the user and kernel memory regions accessed by `bpf_probe_read_*` operations.
+The values a kernel would naturally provide to helpers split in two. The triggering task (pid, tgid, comm) belongs to a single invocation, so it attaches to the image with `from_task`. The clock, the current CPU, the RNG, and the kernel and user memory regions read by `bpf_probe_read_*` belong to the machine, so they live in the VM's `World` and persist across runs. You reach the world through `vm.world()` and mutate it in place between invocations, which is how the RNG keeps advancing and the clock keeps the time you last set.
 
 `PreparedProgram::run` creates a new CPU and runs it to completion, returning the r0 value when `exit` is called.
 
@@ -222,7 +219,7 @@ For anon fields in a struct or union, the field name is `_anon_<idx>`, where `id
 
 ### VM
 
-The memory is not flat. The VM does not hold a single memory slice accessed by all programs, instead, different memory regions exist. Maps manage their own memory, each program execution (through [`Cpu`](./src/vm/cpu.rs)) owns its own stack allocation, user and kernel memories are nothing but an `Arc<[u8]>` in `HostEnv`. What we do instead is tag the pointers when initializing the registers (see [`TaggedPtr`](./src/vm/ptr.rs)), and the CPU is responsible for decoding the register and routing the read/write to the correct place.
+The memory is not flat. The VM does not hold a single memory slice accessed by all programs, instead, different memory regions exist. Maps manage their own memory, each program execution (through [`Cpu`](./src/vm/cpu.rs)) owns its own stack allocation, user and kernel memories are nothing but an `Arc<[u8]>` in the VM's [`World`](./src/vm/world.rs). What we do instead is tag the pointers when initializing the registers (see [`TaggedPtr`](./src/vm/ptr.rs)), and the CPU is responsible for decoding the register and routing the read/write to the correct place.
 
 All events emitted by the program are piped through the `Capture` trait in the [practical example](#in-practice). Those are prints (via the `printk` helper), perf output events (which carry an FD attached to the event, corresponding to the FD in the `PERF_EVENT_ARRAY` map), and verifier warnings and trace, useful for understanding how the verifier sees your program.
 
@@ -236,7 +233,7 @@ Then the verifier runs. Once that's done, a `PreparedProgram` is created, linked
 
 #### Helpers
 
-Helpers are implemented through a [`BpfHelper`](./src/vm/helpers.rs) trait, responsible for both the runtime execution and the verifier rules. Helpers relying on kernel variables source them from the [`HostEnv`](./src/vm/env.rs) struct.
+Helpers are implemented through a [`BpfHelper`](./src/vm/helpers.rs) trait, responsible for both the runtime execution and the verifier rules. Helpers read per-invocation identity from the [`Task`](./src/vm/task.rs) on the image and machine state (clock, CPU, RNG, probe memory) from the VM's [`World`](./src/vm/world.rs).
 
 KFuncs are not supported yet.
 
