@@ -6,6 +6,9 @@ pub use builder::BtfBuilder;
 pub mod ext;
 pub use ext::*;
 
+pub mod access;
+pub use access::{Access, AccessError, Hop};
+
 pub mod value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]

@@ -58,6 +58,50 @@ pub enum CoreReloKind {
     TypeMatches = 12,    /* type match in target kernel */
 }
 
+impl CoreReloKind {
+    /// libbpf-style name of the relocation kind, e.g. `field_byte_offset`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            CoreReloKind::FieldByteOffset => "field_byte_offset",
+            CoreReloKind::FieldByteSize => "field_byte_size",
+            CoreReloKind::FieldExists => "field_exists",
+            CoreReloKind::FieldSigned => "field_signed",
+            CoreReloKind::FieldLShiftU64 => "field_lshift_u64",
+            CoreReloKind::FieldRShiftU64 => "field_rshift_u64",
+            CoreReloKind::TypeIdLocal => "type_id_local",
+            CoreReloKind::TypeIdTarget => "type_id_target",
+            CoreReloKind::TypeExists => "type_exists",
+            CoreReloKind::TypeSize => "type_size",
+            CoreReloKind::EnumvalExists => "enumval_exists",
+            CoreReloKind::EnumvalValue => "enumval_value",
+            CoreReloKind::TypeMatches => "type_matches",
+        }
+    }
+
+    /// Whether the relocation targets a struct or union field, meaning its
+    /// access spec resolves to a member path rather than a whole type or an
+    /// enum variant.
+    pub fn is_field(&self) -> bool {
+        matches!(
+            self,
+            CoreReloKind::FieldByteOffset
+                | CoreReloKind::FieldByteSize
+                | CoreReloKind::FieldExists
+                | CoreReloKind::FieldSigned
+                | CoreReloKind::FieldLShiftU64
+                | CoreReloKind::FieldRShiftU64
+        )
+    }
+
+    /// Whether the relocation targets an enum value.
+    pub fn is_enum(&self) -> bool {
+        matches!(
+            self,
+            CoreReloKind::EnumvalExists | CoreReloKind::EnumvalValue
+        )
+    }
+}
+
 mod parser {
     use super::{super::parser::BTF_MAGIC, *};
     use byteorder::{LittleEndian, ReadBytesExt};

@@ -6,3 +6,4 @@ edition.workspace = true
 [dependencies]
 bepeefe.workspace = true
 clap.workspace = true
+tabled.workspace = true

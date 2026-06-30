@@ -27,8 +27,6 @@ pub enum ValueError {
     UnknownEnumVariant(BtfTypeId, i64),
     #[error("array is larger than allowed: {0} > {1}")]
     ArrayOutOfBounds(usize, usize),
-    #[error("struct {container:?} has a member with unresolvable name at offset {name_off}")]
-    MissingMemberName { container: BtfTypeId, name_off: u32 },
     #[error("field {0:?} does not exist in target struct")]
     UnknownField(String),
     #[error("from_bytes is not implemented for btf kind {0:?} ({1:?})")]
@@ -278,29 +276,18 @@ mod to {
         let mut buf = Vec::with_capacity(ty.size() as usize);
         for (idx, member) in s.members.iter().enumerate() {
             let member_ty = ty.btf().resolve_must(member.r#type);
-            let name = ty
-                .btf()
-                .string(member.name_off)
-                .ok_or(ValueError::MissingMemberName {
-                    container: ty.id(),
-                    name_off: member.name_off,
-                })?;
             let member_size = member_ty.size() as usize;
             let byte_offset = (member.offset / 8) as usize;
             buf.resize(byte_offset, 0);
 
-            let key: String = if name.is_empty() {
-                format!("_anon_{idx}")
-            } else {
-                name.into_owned()
-            };
-            let Some(member_val) = map.get(&key) else {
+            let key = ty.btf().member_name(member, idx);
+            let Some(member_val) = map.get(key.as_ref()) else {
                 buf.resize(buf.len() + member_size, 0);
                 continue;
             };
 
             buf.extend(member_val.to_bytes(member_ty)?);
-            used.push(key);
+            used.push(key.into_owned());
         }
 
         for field in map.keys() {
@@ -319,7 +306,7 @@ mod to {
     /// For anon types in the union, we use a placeholder name `_anon_<idx>`
     /// where `idx` is the index in the union declaration.
     fn union(map: &BTreeMap<String, Value>, ty: BtfRef<'_>) -> Result<Vec<u8>, ValueError> {
-        let BtfKind::Union(u) = ty.kind() else {
+        let BtfKind::Union(_) = ty.kind() else {
             return Err(ValueError::IncompatibleTypes {
                 expected: &[BtfKindDiscriminants::Union],
                 got: ty.kind().into(),
@@ -331,18 +318,7 @@ mod to {
             return Ok(vec![0; size]);
         };
 
-        let Some((_, member)) = u.members.iter().enumerate().find(|(idx, m)| {
-            let nm = ty
-                .btf()
-                .string(m.name_off)
-                .map(|s| s.into_owned())
-                .unwrap_or_default();
-            if nm.is_empty() {
-                key.as_str() == format!("_anon_{idx}")
-            } else {
-                key.as_str() == nm.as_str()
-            }
-        }) else {
+        let Some((_, member)) = ty.btf().member_by_name(ty.id(), key) else {
             return Err(ValueError::UnknownField(key.clone()));
         };
 
@@ -435,15 +411,8 @@ mod from {
 
     pub(super) fn strct(s: &Struct, ty: BtfRef<'_>, bytes: &[u8]) -> Result<Value, ValueError> {
         let mut map = BTreeMap::new();
-        for member in &s.members {
+        for (idx, member) in s.members.iter().enumerate() {
             let member_ty = ty.btf().resolve_must(member.r#type);
-            let name = ty
-                .btf()
-                .string(member.name_off)
-                .ok_or(ValueError::MissingMemberName {
-                    container: ty.id(),
-                    name_off: member.name_off,
-                })?;
             let byte_offset = (member.offset / 8) as usize;
             let member_size = member_ty.size() as usize;
             let chunk = bytes.get(byte_offset..byte_offset + member_size).ok_or(
@@ -454,7 +423,7 @@ mod from {
                 },
             )?;
             let val = Value::from_bytes(member_ty, chunk)?;
-            map.insert(name.to_string(), val);
+            map.insert(ty.btf().member_name(member, idx).into_owned(), val);
         }
         Ok(Value::Map(map))
     }
@@ -1478,6 +1447,27 @@ mod tests {
         expected.extend(&0x11i64.to_ne_bytes()[..4]);
         expected.extend(&0x22i64.to_ne_bytes()[..4]);
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn struct_from_bytes_keys_anon_field_by_index() {
+        let mut b = BtfBuilder::default();
+        let u32_ty = b.add_int("u32", 4, 0);
+        let s_ty = b.make_struct("s", 8, |s| {
+            s.field("a", u32_ty, 0);
+            s.field("", u32_ty, 32);
+        });
+        let btf = b.build();
+
+        let bytes = [0x11, 0, 0, 0, 0x22, 0, 0, 0];
+        let val = Value::from_bytes(btf.resolve_must(s_ty), &bytes).unwrap();
+        let Value::Map(map) = &val else {
+            panic!("expected map, got {val:?}");
+        };
+        assert!(map.contains_key("_anon_1"));
+
+        let round = val.to_bytes(btf.resolve_must(s_ty)).unwrap();
+        assert_eq!(round, bytes);
     }
 
     #[test]
