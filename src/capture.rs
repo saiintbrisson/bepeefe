@@ -67,10 +67,39 @@ pub enum VerifierEvent<'a> {
         /// become uninit after a call, that is left implicit.
         r0: RegisterState,
     },
+
+    /// The verifier's static view of a `bpf_perf_event_output` payload.
+    ///
+    /// Only describes the stack boundaries known to the verifier, not types.
+    ///
+    /// [`Insn`]: VerifierEvent::Insn
+    PerfEventLayout {
+        depth: usize,
+        /// pc of the emitting call. Joins this layout to the runtime
+        /// [`Event::PerfEventOutput`] payloads and the call's `Insn` event.
+        pc: usize,
+        map_fd: u16,
+        /// Payload byte length when known at verification time.
+        size: Option<u32>,
+        /// Slots fully inside the payload region. Bytes covered by no slot
+        /// were never written on this path. Empty when the data pointer is
+        /// not an exact stack pointer or the length is unknown.
+        slots: &'a [PayloadSlot],
+    },
     Warning {
         pc: usize,
         message: Cow<'a, str>,
     },
+}
+
+/// A stack slot inside a perf event payload, as the verifier saw it
+/// written.
+#[derive(Clone, Copy, serde::Serialize)]
+pub struct PayloadSlot {
+    /// Byte offset within the payload.
+    pub offset: u32,
+    pub size: u32,
+    pub state: RegisterState,
 }
 
 pub trait Capture {

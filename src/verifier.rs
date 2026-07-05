@@ -7,7 +7,7 @@ use branch::{ExprRange, ExprVal, decide_branch, scalar_reg};
 
 use crate::{
     btf::{Btf, BtfKind, BtfTypeId},
-    capture::{Capture, Event, VerifierEvent},
+    capture::{Capture, Event, PayloadSlot, VerifierEvent},
     hook::ProgType,
     isa::{alu::*, jmp::*, load::*, *},
     object::EbpfProgram,
@@ -619,7 +619,6 @@ pub fn static_reads(insn: &Insn) -> RegMask {
 /// How a walker came to exist.
 #[derive(Clone, Copy)]
 enum WalkerKind {
-    Root,
     Branch {
         decision: BranchDecision,
         refined: Option<(u8, RegisterState)>,
@@ -689,7 +688,7 @@ impl<'a> Verifier<'a> {
             max_call_depth: 0,
             expected_return,
             next_pkt_id: 0,
-            kind: WalkerKind::Root,
+            kind: WalkerKind::Call,
             insn_reads: Cell::new(RegMask::empty()),
             insn_writes: RegMask::empty(),
         })
@@ -894,7 +893,6 @@ impl<'a> Verifier<'a> {
     /// paired with [`Self::record_walk_exit`].
     fn record_walk_enter(&self) {
         match self.kind {
-            WalkerKind::Root => {}
             WalkerKind::Branch { decision, refined } => self.record(VerifierEvent::BranchEnter {
                 depth: self.depth,
                 target_pc: self.pc as usize,
@@ -916,7 +914,6 @@ impl<'a> Verifier<'a> {
 
     fn record_walk_exit(&self) {
         match self.kind {
-            WalkerKind::Root => {}
             WalkerKind::Branch { .. } => {
                 self.record(VerifierEvent::BranchExit { depth: self.depth })
             }
@@ -948,6 +945,58 @@ impl<'a> Verifier<'a> {
             pc,
             read: self.insn_reads.get() | static_reads(insn),
             written: written.get(..count).unwrap_or_default(),
+        });
+    }
+
+    /// Emits the static view of a `bpf_perf_event_output` payload. The
+    /// written stack slots inside the region the data pointer covers, the
+    /// payload type never appears in BTF, so this is the only structural
+    /// information a consumer can get about it, field boundaries without
+    /// types.
+    fn record_perf_event_layout(&self) {
+        if self.config.capture.is_none() {
+            return;
+        }
+
+        let RegisterState::PtrToMap { map_fd } = self.reg(2) else {
+            return;
+        };
+
+        let size = match self.reg(5) {
+            RegisterState::Scalar(Scalar::U32(r)) => r.single_val(),
+            RegisterState::Scalar(Scalar::U64(r)) => {
+                r.single_val().and_then(|v| u32::try_from(v).ok())
+            }
+            _ => None,
+        };
+
+        let region = match (self.reg(4), size) {
+            (RegisterState::PtrToStack { offset }, Some(len)) => offset
+                .single_val()
+                .map(|base| (base, base.saturating_add(len))),
+            _ => None,
+        };
+
+        let slots: Vec<PayloadSlot> = region
+            .map(|(base, end)| {
+                self.stack_objects
+                    .range(base..end)
+                    .filter(|&(&addr, &(size, _))| addr.saturating_add(size) <= end)
+                    .map(|(&addr, &(size, state))| PayloadSlot {
+                        offset: addr - base,
+                        size,
+                        state,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        self.record(VerifierEvent::PerfEventLayout {
+            depth: self.depth,
+            pc: (self.pc - 1).max(0) as usize,
+            map_fd,
+            size,
+            slots: &slots,
         });
     }
 
@@ -1973,6 +2022,10 @@ impl<'a> Verifier<'a> {
                 helper
                     .params(self.vm, self.regs(), *insn)
                     .map_err(|_| self.err("helper parameter validation failed"))?;
+
+                if insn.imm() == helpers::PerfEventOutput::ID {
+                    self.record_perf_event_layout();
+                }
 
                 let retval = helper
                     .retval(self.vm, self.regs(), *insn)

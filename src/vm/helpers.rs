@@ -8,6 +8,8 @@ mod printk;
 mod probe_ops;
 mod probes;
 
+pub(crate) use maps::PerfEventOutput;
+
 /// BPF helper functions and dispatch.
 ///
 /// Each helper is a unit struct implementing [`BpfHelper`]. The

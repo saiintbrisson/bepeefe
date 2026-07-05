@@ -98,6 +98,7 @@ export type VerifierEvent =
   | { BranchExit: { depth: number } }
   | { CallEnter: CallEnterEvent }
   | { CallExit: CallExitEvent }
+  | { PerfEventLayout: PerfEventLayoutEvent }
   | { Warning: { pc: number; message: string } };
 
 export interface InsnEvent {
@@ -141,6 +142,33 @@ export interface CallExitEvent {
   /** State the call returns in r0. The caller's r1 through r5 always
    *  become "Uninit" after a call, that is left implicit. */
   r0: RegisterState;
+}
+
+/** The verifier's static view of a bpf_perf_event_output payload: the
+ *  stack slots known for the region the data pointer covers. Field
+ *  boundaries without types. Recorded while the call is checked, so it
+ *  precedes the call's own Insn event. */
+export interface PerfEventLayoutEvent {
+  depth: number;
+  /** pc of the emitting call. Joins this layout to the runtime
+   *  PerfEventOutput payloads and the call's Insn event. */
+  pc: number;
+  map_fd: number;
+  /** Payload byte length when known at verification time. */
+  size: number | null;
+  /** Slots fully inside the payload region. Bytes covered by no slot were
+   *  never written on this path. Empty when the data pointer is not an
+   *  exact stack pointer or the length is unknown. */
+  slots: PayloadSlot[];
+}
+
+/** A stack slot inside a perf event payload, as the verifier saw it
+ *  written. */
+export interface PayloadSlot {
+  /** Byte offset within the payload. */
+  offset: number;
+  size: number;
+  state: RegisterState;
 }
 
 /** Verifier view of a register. */
