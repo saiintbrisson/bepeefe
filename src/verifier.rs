@@ -1,4 +1,9 @@
-use std::{borrow::Cow, collections::BTreeMap, ops::Range, sync::Arc};
+mod branch;
+
+use std::{borrow::Cow, cell::Cell, collections::BTreeMap, ops::Range, sync::Arc};
+
+pub use branch::BranchDecision;
+use branch::{ExprRange, ExprVal, decide_branch, scalar_reg};
 
 use crate::{
     btf::{Btf, BtfKind, BtfTypeId},
@@ -111,7 +116,7 @@ macro_rules! guard {
     };
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub enum RegisterState {
     #[default]
     Uninit,
@@ -211,7 +216,7 @@ pub enum RegisterState {
 /// The stride is a simple alternative to the Kernel's tnum structure, which
 /// tracks what bits can be set. It's not complete and only validates a subset
 /// of programs tnum does.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct ScalarRange<T: Copy> {
     pub min: T,
     pub max: T,
@@ -253,7 +258,7 @@ impl<T: Copy + From<u8>> ScalarRange<T> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Scalar {
     U32(ScalarRange<u32>),
     U64(ScalarRange<u64>),
@@ -550,6 +555,78 @@ pub struct VerificationOutput {
     pub r0: RegisterState,
 }
 
+bitflags::bitflags! {
+    /// Set of eBPF registers, one bit per register r0 to r10.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct RegMask: u16 {
+        const R0 = 1 << 0;
+        const R1 = 1 << 1;
+        const R2 = 1 << 2;
+        const R3 = 1 << 3;
+        const R4 = 1 << 4;
+        const R5 = 1 << 5;
+        const R6 = 1 << 6;
+        const R7 = 1 << 7;
+        const R8 = 1 << 8;
+        const R9 = 1 << 9;
+        const R10 = 1 << 10;
+    }
+}
+
+impl RegMask {
+    /// Mask with only register `idx` set. Out-of-range indices produce an
+    /// empty mask.
+    pub fn single(idx: u8) -> Self {
+        Self::from_bits_truncate(1u16.checked_shl(idx as u32).unwrap_or(0))
+    }
+}
+
+/// Serializes as the list of set register indices, so `r1 | r2` becomes
+/// `[1, 2]`, in line with the register arrays used elsewhere in the stream.
+impl serde::Serialize for RegMask {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.iter().map(|flag| flag.bits().trailing_zeros() as u8))
+    }
+}
+
+/// Registers `insn` reads, judged from the opcode alone.
+///
+/// Insn events prefer the state-based accounting gathered while an
+/// instruction is checked, which knows, for example, that a MOV destination
+/// is never read. This covers the cases that accounting cannot see: events
+/// recorded before their check runs (walk-spawning jumps) and calls, whose
+/// parameter reads flow through the full register array rather than the
+/// tracked accessors. Calls over-approximate to r1 through r5.
+pub fn static_reads(insn: &Insn) -> RegMask {
+    if !matches!(insn.class(), BPF_JMP | BPF_JMP32) {
+        return RegMask::empty();
+    }
+
+    match insn.opcode() & JMP_OP_MASK {
+        BPF_CALL => RegMask::R1 | RegMask::R2 | RegMask::R3 | RegMask::R4 | RegMask::R5,
+        BPF_EXIT => RegMask::R0,
+        BPF_JA => RegMask::empty(),
+        _ => {
+            let mut mask = RegMask::single(insn.dst_reg());
+            if insn.opcode() & BPF_X == BPF_X {
+                mask |= RegMask::single(insn.src_reg());
+            }
+            mask
+        }
+    }
+}
+
+/// How a walker came to exist.
+#[derive(Clone, Copy)]
+enum WalkerKind {
+    Root,
+    Branch {
+        decision: BranchDecision,
+        refined: Option<(u8, RegisterState)>,
+    },
+    Call,
+}
+
 #[derive(Clone)]
 pub struct Verifier<'a> {
     vm: &'a Vm,
@@ -569,6 +646,14 @@ pub struct Verifier<'a> {
     expected_return: Option<BtfTypeId>,
     /// Monotonic id assigned to new packet-pointer registers.
     next_pkt_id: u32,
+    kind: WalkerKind,
+    /// Registers the current instruction consulted, gathered through
+    /// [`Self::reg`] and reset before each check. In a Cell because reads
+    /// happen behind shared borrows.
+    insn_reads: Cell<RegMask>,
+    /// Registers the current instruction wrote, gathered through
+    /// [`Self::set_reg`] and reset before each check.
+    insn_writes: RegMask,
 }
 
 impl<'a> Verifier<'a> {
@@ -604,6 +689,9 @@ impl<'a> Verifier<'a> {
             max_call_depth: 0,
             expected_return,
             next_pkt_id: 0,
+            kind: WalkerKind::Root,
+            insn_reads: Cell::new(RegMask::empty()),
+            insn_writes: RegMask::empty(),
         })
     }
 
@@ -616,6 +704,8 @@ impl<'a> Verifier<'a> {
         reason = "register index is caller-validated to be < 11"
     )]
     fn reg(&self, idx: u8) -> RegisterState {
+        self.insn_reads
+            .set(self.insn_reads.get() | RegMask::single(idx));
         self.registers[idx as usize]
     }
 
@@ -628,6 +718,7 @@ impl<'a> Verifier<'a> {
         reason = "register index is caller-validated to be < 11"
     )]
     fn set_reg(&mut self, idx: u8, val: RegisterState) {
+        self.insn_writes |= RegMask::single(idx);
         self.registers[idx as usize] = val;
     }
 
@@ -724,21 +815,53 @@ impl<'a> Verifier<'a> {
     }
 
     /// Fork a sibling verifier that continues from `pc` in the same function
-    /// frame. Used for conditional branches and unconditional jumps, the fork
-    /// inherits everything from the parent, then gets a fresh walk state.
-    fn fork_at(&self, pc: isize) -> Self {
+    /// frame, with `refined` applied to its registers. Used for conditional
+    /// branches and unconditional jumps, the fork inherits everything from
+    /// the parent, then gets a fresh walk state.
+    fn fork_at(
+        &self,
+        pc: isize,
+        decision: BranchDecision,
+        refined: Option<(u8, RegisterState)>,
+    ) -> Self {
         let mut fork = self.clone();
         fork.pc = pc;
         fork.depth = self.depth + 1;
         fork.skip = 0;
         fork.exit = false;
         fork.max_call_depth = 0;
+        if let Some((idx, state)) = refined {
+            fork.set_reg(idx, state);
+        }
+        fork.kind = WalkerKind::Branch { decision, refined };
         fork
     }
 
+    /// Run a fork to completion and absorb its outputs. The fork walks its
+    /// path to an exit, so its r0 becomes this walker's r0. Callers stop
+    /// walking after delegating to forks, which keeps the adopted r0 the one
+    /// a real exit produced.
     fn run_fork(&mut self, fork: Self) -> Result<(), VerifierError> {
         let out = fork.run()?;
         self.max_call_depth = self.max_call_depth.max(out.max_call_depth);
+        self.set_reg(0, out.r0);
+        Ok(())
+    }
+
+    /// Walk both arms of a conditional jump as sibling forks and end this
+    /// walker. Forking the fallthrough as well gives both arms the same
+    /// BranchEnter and BranchExit framing in the event stream.
+    fn run_both_arms(
+        &mut self,
+        target_pc: isize,
+        branch_refined: Option<(u8, RegisterState)>,
+        fallthrough_refined: Option<(u8, RegisterState)>,
+    ) -> Result<(), VerifierError> {
+        let branch_vm = self.fork_at(target_pc, BranchDecision::Both, branch_refined);
+        let fallthrough_vm = self.fork_at(self.pc, BranchDecision::Both, fallthrough_refined);
+        self.run_fork(branch_vm)?;
+        self.run_fork(fallthrough_vm)?;
+        self.exit = true;
         Ok(())
     }
 
@@ -763,18 +886,104 @@ impl<'a> Verifier<'a> {
         sub.call_stack.push(target_pc);
         sub.max_call_depth = 0;
         sub.expected_return = expected_return;
+        sub.kind = WalkerKind::Call;
         sub
     }
 
+    /// Frames the walk in the event stream according to this walker's kind,
+    /// paired with [`Self::record_walk_exit`].
+    fn record_walk_enter(&self) {
+        match self.kind {
+            WalkerKind::Root => {}
+            WalkerKind::Branch { decision, refined } => self.record(VerifierEvent::BranchEnter {
+                depth: self.depth,
+                target_pc: self.pc as usize,
+                decision,
+                refined,
+            }),
+            WalkerKind::Call => {
+                let sig = self.prog.subprogs.get(&(self.pc as usize));
+                self.record(VerifierEvent::CallEnter {
+                    depth: self.depth,
+                    target_pc: self.pc as usize,
+                    name: sig.map(|s| Cow::from(s.name.as_str())).unwrap_or_default(),
+                    btf_id: sig.and_then(|s| s.btf_id),
+                    registers: self.regs(),
+                });
+            }
+        }
+    }
+
+    fn record_walk_exit(&self) {
+        match self.kind {
+            WalkerKind::Root => {}
+            WalkerKind::Branch { .. } => {
+                self.record(VerifierEvent::BranchExit { depth: self.depth })
+            }
+            WalkerKind::Call => self.record(VerifierEvent::CallExit {
+                depth: self.depth,
+                r0: self.reg(0),
+            }),
+        }
+    }
+
+    fn record_insn(&self, pc: usize, insn: &Insn) {
+        if self.config.capture.is_none() {
+            return;
+        }
+
+        let mut written = [(0u8, RegisterState::Uninit); 11];
+        let mut count = 0;
+        for (idx, state) in self.registers.iter().enumerate() {
+            if self.insn_writes.contains(RegMask::single(idx as u8))
+                && let Some(slot) = written.get_mut(count)
+            {
+                *slot = (idx as u8, *state);
+                count += 1;
+            }
+        }
+
+        self.record(VerifierEvent::Insn {
+            depth: self.depth,
+            pc,
+            read: self.insn_reads.get() | static_reads(insn),
+            written: written.get(..count).unwrap_or_default(),
+        });
+    }
+
+    /// Whether checking `insn` spawns nested walks (branch arms or a
+    /// subprogram). Those record their Insn event before the check so the
+    /// nested events follow them in the stream. Everything else records
+    /// after, with the registers reflecting what the instruction wrote.
+    /// Helper calls spawn no walk, so they record after too and the event
+    /// carries the returned r0.
+    fn records_before_check(insn: &Insn) -> bool {
+        if !matches!(insn.class(), BPF_JMP | BPF_JMP32) {
+            return false;
+        }
+        insn.opcode() & JMP_OP_MASK != BPF_CALL || insn.src_reg() == BPF_PSEUDO_CALL
+    }
+
     pub fn run(mut self) -> Result<VerificationOutput, VerifierError> {
+        self.record_walk_enter();
+
         let prog = &self.prog.clone();
         let mut iter = prog.insns.iter().enumerate().skip(self.pc as usize);
 
         while let Some((idx, insn)) = iter.by_ref().nth(self.skip) {
             self.skip = 0;
             self.pc = idx as isize + 1;
+            self.insn_reads.set(RegMask::empty());
+            self.insn_writes = RegMask::empty();
 
-            self.check_insn(idx, insn)?;
+            let record_early = Self::records_before_check(insn);
+            if record_early {
+                self.record_insn(idx, insn);
+            }
+            self.check_insn(insn)?;
+            if !record_early {
+                self.record_insn(idx, insn);
+            }
 
             if self.exit {
                 break;
@@ -783,13 +992,15 @@ impl<'a> Verifier<'a> {
 
         guard!(self, self.exit, "program ended without calling exit");
 
+        self.record_walk_exit();
+
         Ok(VerificationOutput {
             max_call_depth: self.max_call_depth,
             r0: self.reg(0),
         })
     }
 
-    fn check_insn(&mut self, idx: usize, insn: &Insn) -> Result<(), VerifierError> {
+    fn check_insn(&mut self, insn: &Insn) -> Result<(), VerifierError> {
         guard!(self, insn.src_reg() <= 10, "insn with invalid src register");
         guard!(
             self,
@@ -802,25 +1013,9 @@ impl<'a> Verifier<'a> {
             BPF_LD => self.check_non_conventional_ld(insn)?,
             BPF_LDX => self.check_ldx(insn)?,
             BPF_ST | BPF_STX => self.check_st(insn)?,
-            BPF_JMP32 | BPF_JMP => {
-                if insn.opcode() & JMP_OP_MASK != BPF_EXIT {
-                    self.record(VerifierEvent::Insn {
-                        depth: self.depth,
-                        pc: idx,
-                        registers: self.regs(),
-                    });
-                }
-
-                self.check_jmp(insn)?
-            }
+            BPF_JMP32 | BPF_JMP => self.check_jmp(insn)?,
             _ => {}
         }
-
-        self.record(VerifierEvent::Insn {
-            depth: self.depth,
-            pc: idx,
-            registers: self.regs(),
-        });
 
         Ok(())
     }
@@ -1184,56 +1379,51 @@ impl<'a> Verifier<'a> {
     /// * Moving unknown scalars simply copy the unknown status.
     /// * Moving IMMs result in known scalars with size according to the class.
     fn check_alu_mov(&mut self, insn: &Insn) -> Result<(), VerifierError> {
-        self.set_reg(
-            insn.dst_reg(),
-            match self.src_reg(insn) {
-                Ok(src) if src.is_pointer() => {
-                    guard!(self, insn.class() == BPF_ALU64, "partial copy of pointer");
-                    guard!(self, insn.offset() == 0, "sign extension on pointer");
+        let state = match self.src_reg(insn) {
+            Ok(src) if src.is_pointer() => {
+                guard!(self, insn.class() == BPF_ALU64, "partial copy of pointer");
+                guard!(self, insn.offset() == 0, "sign extension on pointer");
 
-                    src
-                }
-                Ok(RegisterState::Scalar(scalar)) if scalar.is_known() => {
-                    let scalar = match (insn.class(), scalar) {
-                        (BPF_ALU32, Scalar::U64(r)) => {
-                            Scalar::U32(ScalarRange::exact(r.min as u32))
-                        }
-                        (BPF_ALU64, Scalar::U32(r)) => {
-                            Scalar::U64(ScalarRange::exact(r.min as u64))
-                        }
-                        _ => scalar,
-                    };
+                src
+            }
+            Ok(RegisterState::Scalar(scalar)) if scalar.is_known() => {
+                let scalar = match (insn.class(), scalar) {
+                    (BPF_ALU32, Scalar::U64(r)) => Scalar::U32(ScalarRange::exact(r.min as u32)),
+                    (BPF_ALU64, Scalar::U32(r)) => Scalar::U64(ScalarRange::exact(r.min as u64)),
+                    _ => scalar,
+                };
 
-                    let scalar = match (insn.offset() as u32, scalar) {
-                        (0, _) => scalar,
-                        (offset @ (8 | 16), Scalar::U32(r)) => {
-                            let shift = u32::BITS - offset;
-                            Scalar::U32(ScalarRange::exact(
-                                ((r.min as i32) << shift >> shift) as u32,
-                            ))
-                        }
-                        (offset @ (8 | 16 | 32), Scalar::U64(r)) => {
-                            let shift = u64::BITS - offset;
-                            Scalar::U64(ScalarRange::exact(
-                                ((r.min as i64) << shift >> shift) as u64,
-                            ))
-                        }
-                        _ => guard!(self, "mov with invalid offset"),
-                    };
-
-                    RegisterState::Scalar(scalar)
-                }
-                Ok(src @ RegisterState::Scalar(_)) => src,
-                Ok(_) => guard!(self, "mov with invalid src register"),
-                Err(_) => {
-                    if insn.class() == BPF_ALU32 {
-                        RegisterState::Scalar(Scalar::U32(ScalarRange::exact(insn.imm() as u32)))
-                    } else {
-                        RegisterState::Scalar(Scalar::U64(ScalarRange::exact(insn.imm() as u64)))
+                let scalar = match (insn.offset() as u32, scalar) {
+                    (0, _) => scalar,
+                    (offset @ (8 | 16), Scalar::U32(r)) => {
+                        let shift = u32::BITS - offset;
+                        Scalar::U32(ScalarRange::exact(
+                            ((r.min as i32) << shift >> shift) as u32,
+                        ))
                     }
+                    (offset @ (8 | 16 | 32), Scalar::U64(r)) => {
+                        let shift = u64::BITS - offset;
+                        Scalar::U64(ScalarRange::exact(
+                            ((r.min as i64) << shift >> shift) as u64,
+                        ))
+                    }
+                    _ => guard!(self, "mov with invalid offset"),
+                };
+
+                RegisterState::Scalar(scalar)
+            }
+            Ok(src @ RegisterState::Scalar(_)) => src,
+            Ok(_) => guard!(self, "mov with invalid src register"),
+            Err(_) => {
+                if insn.class() == BPF_ALU32 {
+                    RegisterState::Scalar(Scalar::U32(ScalarRange::exact(insn.imm() as u32)))
+                } else {
+                    RegisterState::Scalar(Scalar::U64(ScalarRange::exact(insn.imm() as u64)))
                 }
-            },
-        );
+            }
+        };
+
+        self.set_reg(insn.dst_reg(), state);
 
         Ok(())
     }
@@ -1637,16 +1827,9 @@ impl<'a> Verifier<'a> {
         );
 
         if jmp_op == BPF_JA {
-            self.record(VerifierEvent::BranchEnter {
-                depth: self.depth,
-                target_pc: target_pc as usize,
-            });
-            self.run_fork(self.fork_at(target_pc))?;
-            self.record(VerifierEvent::BranchExit { depth: self.depth });
-
             // TODO: this is an unconditional jump we shouldnt run it in a separate state
             // just override the current PC
-
+            self.run_fork(self.fork_at(target_pc, BranchDecision::SkipFallthrough, None))?;
             self.exit = true;
 
             return Ok(());
@@ -1702,14 +1885,15 @@ impl<'a> Verifier<'a> {
         };
 
         let dst_idx = insn.dst_reg();
-        let mut branch_vm = self.fork_at(target_pc);
 
         let lhs = match self.dst_reg(insn) {
             RegisterState::Scalar(s) => scalar_to_expr(s, insn.class()),
             RegisterState::PtrToMapValueOrNull { map_fd } => ExprVal::PtrToMapValueOrNull(map_fd),
 
             // There's no refinement to be done
-            RegisterState::PtrToMapValue { .. } => return self.run_fork(branch_vm),
+            RegisterState::PtrToMapValue { .. } => {
+                return self.run_both_arms(target_pc, None, None);
+            }
 
             _ => guard!(self, "unsupported dst register for comparison"),
         };
@@ -1722,7 +1906,9 @@ impl<'a> Verifier<'a> {
             }
 
             // There's no refinement to be done
-            Ok(RegisterState::PtrToMapValue { .. }) => return self.run_fork(branch_vm),
+            Ok(RegisterState::PtrToMapValue { .. }) => {
+                return self.run_both_arms(target_pc, None, None);
+            }
 
             Ok(_) => guard!(self, "unsupported src register for comparison"),
         };
@@ -1746,27 +1932,30 @@ impl<'a> Verifier<'a> {
             }
         };
 
-        if let Some(branch_reg) = branch.branch_reg {
-            branch_vm.set_reg(dst_idx, narrow(branch_reg));
-        }
-        if let Some(fallthrough_reg) = branch.fallthrough_reg {
-            self.set_reg(dst_idx, narrow(fallthrough_reg));
-        }
+        let branch_refined = branch.branch_reg.map(|reg| (dst_idx, narrow(reg)));
+        let fallthrough_refined = branch.fallthrough_reg.map(|reg| (dst_idx, narrow(reg)));
 
         match branch.decision {
-            BranchDecision::Both => {}
-            BranchDecision::SkipFallthrough => self.exit = true,
-            BranchDecision::SkipBranch => return Ok(()),
+            BranchDecision::Both => {
+                self.run_both_arms(target_pc, branch_refined, fallthrough_refined)
+            }
+            BranchDecision::SkipFallthrough => {
+                self.exit = true;
+                self.run_fork(self.fork_at(
+                    target_pc,
+                    BranchDecision::SkipFallthrough,
+                    branch_refined,
+                ))
+            }
+            BranchDecision::SkipBranch => {
+                self.exit = true;
+                self.run_fork(self.fork_at(
+                    self.pc,
+                    BranchDecision::SkipBranch,
+                    fallthrough_refined,
+                ))
+            }
         }
-
-        self.record(VerifierEvent::BranchEnter {
-            depth: self.depth,
-            target_pc: target_pc as usize,
-        });
-        self.run_fork(branch_vm)?;
-        self.record(VerifierEvent::BranchExit { depth: self.depth });
-
-        Ok(())
     }
 
     fn check_jmp_call(&mut self, insn: &Insn) -> Result<(), VerifierError> {
@@ -1807,13 +1996,13 @@ impl<'a> Verifier<'a> {
 
         guard!(
             self,
-            self.call_stack.contains(&target_pc),
+            !self.call_stack.contains(&target_pc),
             "recursive subprogram call"
         );
 
         guard!(
             self,
-            self.call_stack.len() + 1 >= MAX_CALL_FRAMES,
+            self.call_stack.len() + 1 < MAX_CALL_FRAMES,
             "subprogram call depth exceeds maximum"
         );
 
@@ -1821,7 +2010,12 @@ impl<'a> Verifier<'a> {
         let callee_registers = Self::registers_from_params(btf, &callee_sig.params_types)
             .map_err(|_| self.err("callee has unsupported parameter type"))?;
 
-        for (expected, actual) in callee_registers.iter().zip(self.regs()) {
+        for (expected, actual) in callee_registers
+            .iter()
+            .zip(self.regs())
+            .skip(1)
+            .take(callee_sig.params_types.len())
+        {
             let compatible = matches!(
                 (actual, expected),
                 (RegisterState::Scalar(_), RegisterState::Scalar(_))
@@ -1853,605 +2047,5 @@ impl<'a> Verifier<'a> {
         }
 
         Ok(())
-    }
-}
-
-type ExprRange = ScalarRange<u64>;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ExprVal {
-    Known(ExprRange),
-    Unkown,
-    PtrToMapValueOrNull(u16),
-}
-
-impl ExprVal {
-    fn is_single_val(&self) -> bool {
-        match self {
-            Self::PtrToMapValueOrNull(_) => true,
-            ExprVal::Known(range) => range.min == range.max,
-            _ => false,
-        }
-    }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct BranchResult {
-    decision: BranchDecision,
-    branch_reg: Option<RegisterState>,
-    fallthrough_reg: Option<RegisterState>,
-}
-
-impl BranchResult {
-    fn skip_branch() -> Self {
-        Self {
-            decision: BranchDecision::SkipBranch,
-            ..Self::default()
-        }
-    }
-
-    fn skip_fallthrough() -> Self {
-        Self {
-            decision: BranchDecision::SkipFallthrough,
-            ..Self::default()
-        }
-    }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-enum BranchDecision {
-    #[default]
-    Both,
-    SkipBranch,
-    SkipFallthrough,
-}
-
-fn scalar_reg(r: ExprRange) -> RegisterState {
-    RegisterState::Scalar(Scalar::U64(r))
-}
-
-/// Decides how the branch will be taken and refines the registers.
-///
-/// * SRC=Unknown: both branches are taken, no refinement done
-/// * DST=Unknown, SRC=Known: creates a range for DST and refines using SRC
-/// * SRC=DST if they represent a single value:
-///   * If JEQ, JGE, JSGE, JLE, JSLE: skip fallthrough
-///   * If JNE, JGT, JSGT, JLT, JSLT: skip branch
-/// * DST=[`ExprVal::PtrToMapValueOrNull`], SRC=Known:
-///   * If JEQ and SRC does not contain NULL: refine to
-///     [`RegisterState::PtrToMapValue`] on branch
-///   * If JEQ and SRC is NULL: refine to [`RegisterState::PtrToMapValue`] on
-///     fallthrough
-///   * If JNE and SRC is NULL: refine to [`RegisterState::PtrToMapValue`] on
-///     branch
-/// * DST=Known, SRC=Known (range-vs-range refinement):
-///   * JEQ: skip branch if no overlap. Branch narrows DST to the intersection
-///     with SRC. If SRC is a single value, fallthrough excludes it from DST's
-///     boundary.
-///   * JNE: skip fallthrough if no overlap. Fallthrough narrows DST to the
-///     intersection. If SRC is a single value, branch excludes it from DST's
-///     boundary.
-///   * JGT: branch narrows DST.min up to SRC.min+1, fallthrough narrows DST.max
-///     down to SRC.max. Skip branch if DST.max <= SRC.min, skip fallthrough if
-///     DST.min > SRC.max. Unsigned comparison.
-///   * JSGT: same logic but using signed (i64) arithmetic. When the resulting
-///     range can't be stored as a valid unsigned range (min > max), we skip the
-///     refinement for that path.
-fn decide_branch(
-    op: u8,
-    lhs: ExprVal,
-    rhs: ExprVal,
-    jmp32: bool,
-) -> Result<BranchResult, &'static str> {
-    let signed = matches!(op, BPF_JSGT | BPF_JSGE | BPF_JSLT | BPF_JSLE);
-
-    let (dst, src) = match (lhs, rhs) {
-        (_, ExprVal::Unkown) => return Ok(BranchResult::default()),
-
-        (ExprVal::Unkown, ExprVal::Known(b)) => {
-            let range = match (signed, jmp32) {
-                (false, true) => ExprRange {
-                    min: 0,
-                    max: u32::MAX as u64,
-                    stride: 1,
-                },
-                (false, false) => ExprRange {
-                    min: 0,
-                    max: u64::MAX,
-                    stride: 1,
-                },
-                (true, true) => ExprRange {
-                    min: i32::MIN as i64 as u64,
-                    max: i32::MAX as i64 as u64,
-                    stride: 1,
-                },
-                (true, false) => ExprRange {
-                    min: i64::MIN as u64,
-                    max: i64::MAX as u64,
-                    stride: 1,
-                },
-            };
-            (range, b)
-        }
-
-        (lhs, rhs) if lhs.is_single_val() && lhs == rhs => {
-            return Ok(match op {
-                BPF_JEQ | BPF_JGE | BPF_JSGE | BPF_JLE | BPF_JSLE => {
-                    BranchResult::skip_fallthrough()
-                }
-                BPF_JNE | BPF_JGT | BPF_JSGT | BPF_JLT | BPF_JSLT => BranchResult::skip_branch(),
-                BPF_JSET => return Err("BPF_JSET refinement is not supported"),
-                _ => BranchResult::default(),
-            });
-        }
-
-        // TODO: prove for JGE, JLE, JGT, JLT
-        (ExprVal::PtrToMapValueOrNull(fd), ExprVal::Known(val)) => {
-            let mut result = BranchResult::default();
-            let register_state = Some(RegisterState::PtrToMapValue {
-                map_fd: fd,
-                offset: ScalarRange::exact(0),
-            });
-
-            match op {
-                BPF_JEQ if val.single_val() == Some(0) => result.fallthrough_reg = register_state,
-                BPF_JEQ if !val.contains(0) => result.branch_reg = register_state,
-                BPF_JNE if val.single_val() == Some(0) => result.branch_reg = register_state,
-                _ => {}
-            }
-
-            return Ok(result);
-        }
-
-        (ExprVal::Known(a), ExprVal::Known(b)) => (a, b),
-
-        (ExprVal::Known(_), ExprVal::PtrToMapValueOrNull(_))
-        | (ExprVal::Unkown, ExprVal::PtrToMapValueOrNull(_))
-        | (ExprVal::PtrToMapValueOrNull(_), ExprVal::PtrToMapValueOrNull(_)) => {
-            return Err("comparison against PtrToMapValueOrNull on this side is not supported");
-        }
-    };
-
-    let mut result = BranchResult::default();
-
-    match op {
-        BPF_JEQ => {
-            if !dst.overlap(&src) {
-                return Ok(BranchResult::skip_branch());
-            }
-            // Branch: dst must equal src, so narrow to intersection
-            let min = dst.min.max(src.min);
-            let max = dst.max.min(src.max);
-            let intersection = ExprRange {
-                min,
-                max,
-                stride: if min == max { 1 } else { dst.stride },
-            };
-            result.branch_reg = Some(scalar_reg(intersection));
-            // Fallthrough: dst != src. We can only exclude a boundary
-            // point; interior holes can't be represented.
-            if let Some(src_val) = src.single_val() {
-                match dst.exclude(src_val) {
-                    Some(r) => result.fallthrough_reg = Some(scalar_reg(r)),
-                    None => result.decision = BranchDecision::SkipFallthrough,
-                }
-            }
-        }
-        BPF_JNE => {
-            if !dst.overlap(&src) {
-                return Ok(BranchResult::skip_fallthrough());
-            }
-            // Fallthrough: dst == src, so narrow to intersection
-            let min = dst.min.max(src.min);
-            let max = dst.max.min(src.max);
-            let intersection = ExprRange {
-                min,
-                max,
-                stride: if min == max { 1 } else { dst.stride },
-            };
-            result.fallthrough_reg = Some(scalar_reg(intersection));
-            // Branch: dst != src. Exclude boundary point if possible.
-            if let Some(src_val) = src.single_val() {
-                match dst.exclude(src_val) {
-                    Some(r) => result.branch_reg = Some(scalar_reg(r)),
-                    None => result.decision = BranchDecision::SkipBranch,
-                }
-            }
-        }
-        BPF_JGT => {
-            if src.min >= dst.max {
-                result.decision = BranchDecision::SkipBranch;
-            } else {
-                result.branch_reg = Some(scalar_reg(ExprRange {
-                    min: (src.min + 1).max(dst.min),
-                    max: dst.max,
-                    stride: dst.stride,
-                }));
-            }
-
-            if src.max < dst.min {
-                result.decision = BranchDecision::SkipFallthrough;
-            } else {
-                result.fallthrough_reg = Some(scalar_reg(ExprRange {
-                    min: dst.min,
-                    max: src.max.min(dst.max),
-                    stride: dst.stride,
-                }));
-            }
-        }
-        BPF_JSGT => {
-            let dst_smin = dst.min as i64;
-            let dst_smax = dst.max as i64;
-            let src_smin = src.min as i64;
-            let src_smax = src.max as i64;
-
-            if src_smin >= dst_smax {
-                result.decision = BranchDecision::SkipBranch;
-            } else {
-                let smin = (src_smin + 1).max(dst_smin);
-                let smax = dst_smax;
-                if smin <= smax {
-                    result.branch_reg = Some(scalar_reg(ExprRange {
-                        min: smin as u64,
-                        max: smax as u64,
-                        stride: dst.stride,
-                    }));
-                }
-            }
-
-            if src_smax < dst_smin {
-                result.decision = BranchDecision::SkipFallthrough;
-            } else {
-                let smin = dst_smin;
-                let smax = src_smax.min(dst_smax);
-                if smin <= smax {
-                    result.fallthrough_reg = Some(scalar_reg(ExprRange {
-                        min: smin as u64,
-                        max: smax as u64,
-                        stride: dst.stride,
-                    }));
-                }
-            }
-        }
-        _ => {}
-    }
-
-    Ok(result)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn er(min: u64, max: u64, stride: u64) -> ExprRange {
-        ExprRange { min, max, stride }
-    }
-
-    fn db32(op: u8, lhs: ExprVal, rhs: ExprVal) -> BranchResult {
-        decide_branch(op, lhs, rhs, true).expect("decide_branch unsupported case in test")
-    }
-
-    #[test]
-    fn decide_branch_known_known() {
-        use BranchDecision::*;
-
-        let neg1 = -1i32 as u32 as u64;
-        let neg5 = -5i32 as u32 as u64;
-        let neg10 = -10i32 as u32 as u64;
-
-        let cases: &[(u8, (u64, u64, u64), (u64, u64, u64), BranchDecision)] = &[
-            (BPF_JEQ, (1, 1, 1), (1, 1, 1), SkipFallthrough),
-            (BPF_JNE, (1, 1, 1), (1, 1, 1), SkipBranch),
-            (BPF_JEQ, (0, 64, 4), (0, 64, 4), Both),
-            (BPF_JEQ, (0, 32, 2), (32, 64, 4), Both),
-            (BPF_JEQ, (0, 31, 2), (32, 64, 4), SkipBranch),
-            (BPF_JNE, (0, 31, 2), (32, 64, 4), SkipFallthrough),
-            // -1i32 as u32 == -1i32 as u32
-            (BPF_JEQ, (neg1, neg1, 1), (neg1, neg1, 1), SkipFallthrough),
-            // [-10..-1] vs [-5..-1]: overlapping
-            (BPF_JEQ, (neg10, neg1, 1), (neg5, neg1, 1), Both),
-            // [0..10] vs [-5..-1]: no overlap (unsigned: 0..10 vs 0xFFFFFFFB..0xFFFFFFFF)
-            (BPF_JEQ, (0, 10, 1), (neg5, neg1, 1), SkipBranch),
-            (BPF_JNE, (0, 10, 1), (neg5, neg1, 1), SkipFallthrough),
-        ];
-
-        for (op, lhs, rhs, expected) in cases {
-            let result = db32(
-                *op,
-                ExprVal::Known(er(lhs.0, lhs.1, lhs.2)),
-                ExprVal::Known(er(rhs.0, rhs.1, rhs.2)),
-            );
-            assert_eq!(result.decision, *expected, "{op:#x} {lhs:?} vs {rhs:?}");
-        }
-    }
-
-    #[test]
-    fn decide_branch_map_null() {
-        let non_null = Some(RegisterState::PtrToMapValue {
-            map_fd: 0,
-            offset: ScalarRange::exact(0),
-        });
-
-        let cases: &[(
-            u8,
-            (u64, u64, u64),
-            Option<RegisterState>,
-            Option<RegisterState>,
-        )] = &[
-            // if equal to 0, ptr is null on branch, fallthrough is non-null
-            (BPF_JEQ, (0, 0, 1), None, non_null),
-            // can't prove it will be non-null on fallthrough, but ptr can't be 0 on branch
-            (BPF_JEQ, (1, 5, 1), non_null, None),
-            // range including 0, can't prove anything
-            (BPF_JEQ, (0, 5, 1), None, None),
-            // if not equal to 0, ptr is non-null on branch
-            (BPF_JNE, (0, 0, 1), non_null, None),
-            // range including 0, can't prove anything
-            (BPF_JNE, (0, 5, 1), None, None),
-        ];
-
-        for (op, rhs, exp_branch, exp_ft) in cases {
-            let result = db32(
-                *op,
-                ExprVal::PtrToMapValueOrNull(0),
-                ExprVal::Known(er(rhs.0, rhs.1, rhs.2)),
-            );
-            assert_eq!(result.branch_reg, *exp_branch, "{op:#x} {rhs:?} branch_reg");
-            assert_eq!(
-                result.fallthrough_reg, *exp_ft,
-                "{op:#x} {rhs:?} fallthrough_reg"
-            );
-        }
-    }
-
-    #[test]
-    fn decide_branch_jeq_refinement() {
-        use BranchDecision::*;
-
-        let sr = |min, max, stride| Some(scalar_reg(er(min, max, stride)));
-
-        // range [2..8, stride 2] JEQ 2, branch gets exact 2, fallthrough gets [4..8]
-        let r = db32(
-            BPF_JEQ,
-            ExprVal::Known(er(2, 8, 2)),
-            ExprVal::Known(er(2, 2, 1)),
-        );
-        assert_eq!(r.decision, Both);
-        assert_eq!(r.branch_reg, sr(2, 2, 1));
-        assert_eq!(r.fallthrough_reg, sr(4, 8, 2));
-
-        // range [2..8, stride 2] JEQ 8, branch gets exact 8, fallthrough gets [2..6]
-        let r = db32(
-            BPF_JEQ,
-            ExprVal::Known(er(2, 8, 2)),
-            ExprVal::Known(er(8, 8, 1)),
-        );
-        assert_eq!(r.branch_reg, sr(8, 8, 1));
-        assert_eq!(r.fallthrough_reg, sr(2, 6, 2));
-
-        // range [5..5] JEQ 5, branch always taken
-        let r = db32(
-            BPF_JEQ,
-            ExprVal::Known(er(5, 5, 1)),
-            ExprVal::Known(er(5, 5, 1)),
-        );
-        assert_eq!(r.decision, SkipFallthrough);
-
-        // range [2..8] JEQ 99, branch never taken
-        let r = db32(
-            BPF_JEQ,
-            ExprVal::Known(er(2, 8, 1)),
-            ExprVal::Known(er(99, 99, 1)),
-        );
-        assert_eq!(r.decision, SkipBranch);
-
-        let neg1 = -1i32 as u32 as u64;
-        let neg5 = -5i32 as u32 as u64;
-        let neg10 = -10i32 as u32 as u64;
-
-        // [-10..-1] JEQ -1: branch exact -1, fallthrough [-10..-2]
-        let r = db32(
-            BPF_JEQ,
-            ExprVal::Known(er(neg10, neg1, 1)),
-            ExprVal::Known(er(neg1, neg1, 1)),
-        );
-        assert_eq!(r.decision, Both);
-        assert_eq!(r.branch_reg, sr(neg1, neg1, 1));
-        assert_eq!(r.fallthrough_reg, sr(neg10, neg1 - 1, 1));
-
-        // [-10..-1] JEQ -10: branch exact -10, fallthrough [-9..-1]
-        let r = db32(
-            BPF_JEQ,
-            ExprVal::Known(er(neg10, neg1, 1)),
-            ExprVal::Known(er(neg10, neg10, 1)),
-        );
-        assert_eq!(r.decision, Both);
-        assert_eq!(r.branch_reg, sr(neg10, neg10, 1));
-        assert_eq!(r.fallthrough_reg, sr(neg10 + 1, neg1, 1));
-
-        // [-5..-1] JNE -5: fallthrough exact -5, branch [-4..-1]
-        let r = db32(
-            BPF_JNE,
-            ExprVal::Known(er(neg5, neg1, 1)),
-            ExprVal::Known(er(neg5, neg5, 1)),
-        );
-        assert_eq!(r.decision, Both);
-        assert_eq!(r.fallthrough_reg, sr(neg5, neg5, 1));
-        assert_eq!(r.branch_reg, sr(neg5 + 1, neg1, 1));
-    }
-
-    #[test]
-    fn decide_branch_jgt_refinement() {
-        use BranchDecision::*;
-
-        let sr = |min, max, stride| Some(scalar_reg(er(min, max, stride)));
-
-        // range [0..10] JGT 5, branch [6..10], fallthrough [0..5]
-        let r = db32(
-            BPF_JGT,
-            ExprVal::Known(er(0, 10, 1)),
-            ExprVal::Known(er(5, 5, 1)),
-        );
-        assert_eq!(r.decision, Both);
-        assert_eq!(r.branch_reg, sr(6, 10, 1));
-        assert_eq!(r.fallthrough_reg, sr(0, 5, 1));
-
-        // range [0..5] JGT 10, branch impossible
-        let r = db32(
-            BPF_JGT,
-            ExprVal::Known(er(0, 5, 1)),
-            ExprVal::Known(er(10, 10, 1)),
-        );
-        assert_eq!(r.decision, SkipBranch);
-
-        // range [10..20] JGT 5, fallthrough impossible
-        let r = db32(
-            BPF_JGT,
-            ExprVal::Known(er(10, 20, 1)),
-            ExprVal::Known(er(5, 5, 1)),
-        );
-        assert_eq!(r.decision, SkipFallthrough);
-
-        // [0..20] JGT [3..7]: branch min = 3+1=4, fallthrough max = 7
-        let r = db32(
-            BPF_JGT,
-            ExprVal::Known(er(0, 20, 1)),
-            ExprVal::Known(er(3, 7, 1)),
-        );
-        assert_eq!(r.decision, Both);
-        assert_eq!(r.branch_reg, sr(4, 20, 1));
-        assert_eq!(r.fallthrough_reg, sr(0, 7, 1));
-
-        // [0..5] JGT [5..10]: dst.max(5) <= src.min(5), branch impossible
-        let r = db32(
-            BPF_JGT,
-            ExprVal::Known(er(0, 5, 1)),
-            ExprVal::Known(er(5, 10, 1)),
-        );
-        assert_eq!(r.decision, SkipBranch);
-
-        // [10..20] JGT [0..5]: dst.min(10) > src.max(5), fallthrough impossible
-        let r = db32(
-            BPF_JGT,
-            ExprVal::Known(er(10, 20, 1)),
-            ExprVal::Known(er(0, 5, 1)),
-        );
-        assert_eq!(r.decision, SkipFallthrough);
-
-        // [0..10] JGT [0..10]: overlapping, both paths possible
-        // branch min = 0+1=1, fallthrough max = 10
-        let r = db32(
-            BPF_JGT,
-            ExprVal::Known(er(0, 10, 1)),
-            ExprVal::Known(er(0, 10, 1)),
-        );
-        assert_eq!(r.decision, Both);
-        assert_eq!(r.branch_reg, sr(1, 10, 1));
-        assert_eq!(r.fallthrough_reg, sr(0, 10, 1));
-    }
-
-    #[test]
-    fn decide_branch_unknown_refinement() {
-        use BranchDecision::*;
-
-        let max = u32::MAX as u64;
-        let sr = |min, max, stride| Some(scalar_reg(er(min, max, stride)));
-
-        // Unknown JEQ 0: branch gets exact 0, fallthrough gets [1..MAX]
-        let r = db32(BPF_JEQ, ExprVal::Unkown, ExprVal::Known(er(0, 0, 1)));
-        assert_eq!(r.decision, Both);
-        assert_eq!(r.branch_reg, sr(0, 0, 1));
-        assert_eq!(r.fallthrough_reg, sr(1, max, 1));
-
-        // Unknown JEQ 42: branch gets exact 42, fallthrough unchanged (interior)
-        let r = db32(BPF_JEQ, ExprVal::Unkown, ExprVal::Known(er(42, 42, 1)));
-        assert_eq!(r.decision, Both);
-        assert_eq!(r.branch_reg, sr(42, 42, 1));
-        assert_eq!(r.fallthrough_reg, sr(0, max, 1));
-
-        // Unknown JNE 0: fallthrough gets exact 0, branch gets [1..MAX]
-        let r = db32(BPF_JNE, ExprVal::Unkown, ExprVal::Known(er(0, 0, 1)));
-        assert_eq!(r.decision, Both);
-        assert_eq!(r.fallthrough_reg, sr(0, 0, 1));
-        assert_eq!(r.branch_reg, sr(1, max, 1));
-
-        // Unknown JGT 5: branch gets [6..MAX], fallthrough gets [0..5]
-        let r = db32(BPF_JGT, ExprVal::Unkown, ExprVal::Known(er(5, 5, 1)));
-        assert_eq!(r.decision, Both);
-        assert_eq!(r.branch_reg, sr(6, max, 1));
-        assert_eq!(r.fallthrough_reg, sr(0, 5, 1));
-
-        // Unknown JSGT 5: signed, so unknown is [i32::MIN..i32::MAX]
-        // branch gets [6..i32::MAX], fallthrough gets [i32::MIN..5]
-        let smin = i32::MIN as i64 as u64;
-        let smax = i32::MAX as i64 as u64;
-        let r = db32(BPF_JSGT, ExprVal::Unkown, ExprVal::Known(er(5, 5, 1)));
-        assert_eq!(r.decision, Both);
-        assert_eq!(r.branch_reg, sr(6, smax, 1));
-        assert_eq!(r.fallthrough_reg, sr(smin, 5, 1));
-    }
-
-    #[test]
-    fn decide_branch_jsgt_refinement() {
-        use BranchDecision::*;
-
-        let sr = |min, max, stride| Some(scalar_reg(er(min, max, stride)));
-        let s = |v: i32| v as i64 as u64;
-
-        // [-10..10] JSGT 5: branch [6..10], fallthrough [-10..5]
-        let r = db32(
-            BPF_JSGT,
-            ExprVal::Known(er(s(-10), 10, 1)),
-            ExprVal::Known(er(5, 5, 1)),
-        );
-        assert_eq!(r.decision, Both);
-        assert_eq!(r.branch_reg, sr(6, 10, 1));
-        assert_eq!(r.fallthrough_reg, sr(s(-10), 5, 1));
-
-        // [-10..-1] JSGT -5: branch [-4..-1], fallthrough [-10..-5]
-        let r = db32(
-            BPF_JSGT,
-            ExprVal::Known(er(s(-10), s(-1), 1)),
-            ExprVal::Known(er(s(-5), s(-5), 1)),
-        );
-        assert_eq!(r.decision, Both);
-        assert_eq!(r.branch_reg, sr(s(-4), s(-1), 1));
-        assert_eq!(r.fallthrough_reg, sr(s(-10), s(-5), 1));
-
-        // [-5..-1] JSGT 0: all negative < 0, branch impossible
-        let r = db32(
-            BPF_JSGT,
-            ExprVal::Known(er(s(-5), s(-1), 1)),
-            ExprVal::Known(er(0, 0, 1)),
-        );
-        assert_eq!(r.decision, SkipBranch);
-
-        // [5..10] JSGT 0: all > 0, fallthrough impossible
-        let r = db32(
-            BPF_JSGT,
-            ExprVal::Known(er(5, 10, 1)),
-            ExprVal::Known(er(0, 0, 1)),
-        );
-        assert_eq!(r.decision, SkipFallthrough);
-
-        // [-10..10] JSGT [-5..5]: range vs range
-        // branch min = -5+1 = -4, clamped to dst_min(-10) -> -4; max = 10
-        // fallthrough min = -10; max = min(5, 10) = 5
-        let r = db32(
-            BPF_JSGT,
-            ExprVal::Known(er(s(-10), 10, 1)),
-            ExprVal::Known(er(s(-5), 5, 1)),
-        );
-        assert_eq!(r.decision, Both);
-        assert_eq!(r.branch_reg, sr(s(-4), 10, 1));
-        assert_eq!(r.fallthrough_reg, sr(s(-10), 5, 1));
-
-        // [5..5] JSGT [5..5]: equal, signed gt is strict, branch impossible
-        let r = db32(
-            BPF_JSGT,
-            ExprVal::Known(er(5, 5, 1)),
-            ExprVal::Known(er(5, 5, 1)),
-        );
-        assert_eq!(r.decision, SkipBranch);
     }
 }

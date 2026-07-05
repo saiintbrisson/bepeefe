@@ -19,7 +19,8 @@ impl Capture for JsCapture {
 }
 
 /// Wraps a JS callback so the engine can stream capture events to it as
-/// JSON strings.
+/// JSON strings. Each string parses into the `CaptureEvent` shape declared
+/// in types.ts.
 #[wasm_bindgen]
 pub struct WasmCapture {
     pub(crate) inner: Arc<dyn Capture>,

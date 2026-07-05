@@ -8,9 +8,9 @@ const TASK_COMM_LEN: usize = 16;
 const IPPROTO_TCP: u16 = 6;
 const AF_INET: u16 = 2;
 
-#[repr(C)]
+#[repr(u32)]
 #[derive(Clone, Copy, Default)]
-#[cfg_attr(not(target_arch = "bpf"), derive(Debug, serde::Serialize))]
+#[cfg_attr(not(target_arch = "bpf"), derive(Debug, serde_repr::Serialize_repr))]
 enum TcpState {
     Established = 1,
     SynSent = 2,

@@ -12,7 +12,8 @@ use bepeefe::EbpfObject;
 use clap::{Parser, Subcommand};
 use tabled::{Table, Tabled, settings::Style};
 
-/// Builds a borderless table. The plain style keeps rows easy to copy and paste.
+/// Builds a borderless table. The plain style keeps rows easy to copy and
+/// paste.
 fn table<T: Tabled>(rows: impl IntoIterator<Item = T>) -> Table {
     let mut table = Table::new(rows);
     table.with(Style::empty());

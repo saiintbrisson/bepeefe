@@ -1,6 +1,6 @@
-// TypeScript declarations for the shapes WasmObject returns, injected
-// into the generated bepeefe.d.ts via #[wasm_bindgen(typescript_custom_section)]
-// in lib.rs.
+// TypeScript declarations for the shapes WasmObject returns and the
+// capture event stream, injected into the generated bepeefe.d.ts via
+// #[wasm_bindgen(typescript_custom_section)] in lib.rs.
 //
 // Each interface has a serde::Serialize counterpart in this crate.
 // This file is the source of truth for the JS surface. The Rust
@@ -81,6 +81,89 @@ export interface CoreRelo {
 export interface CoreReloHop {
   name: string;
   type_id: number;
+}
+
+/** One event streamed to the WasmCapture callback. The callback receives a
+ *  JSON string that parses into this shape. Serde's externally tagged
+ *  encoding applies throughout: unit variants are plain strings, data
+ *  variants are single-key objects. */
+export type CaptureEvent =
+  | { Print: string }
+  | { Verifier: VerifierEvent }
+  | { PerfEventOutput: { fd: number; data: number[] } };
+
+export type VerifierEvent =
+  | { Insn: InsnEvent }
+  | { BranchEnter: BranchEnterEvent }
+  | { BranchExit: { depth: number } }
+  | { CallEnter: CallEnterEvent }
+  | { CallExit: CallExitEvent }
+  | { Warning: { pc: number; message: string } };
+
+export interface InsnEvent {
+  depth: number;
+  pc: number;
+  /** Registers whose state the check consulted, as register indices.
+   *  Calls over-approximate to r1 through r5. */
+  read: number[];
+  /** Registers the instruction wrote, paired with their new state.
+   *  Empty for walk-spawning jumps, whose refinements arrive on the
+   *  arms' BranchEnter events. */
+  written: [number, RegisterState][];
+}
+
+export type BranchDecision = "Both" | "SkipBranch" | "SkipFallthrough";
+
+export interface BranchEnterEvent {
+  depth: number;
+  target_pc: number;
+  /** Verdict for the jump that spawned this arm. "Both" means a sibling
+   *  arm is also walked. */
+  decision: BranchDecision;
+  /** Register the comparison refined on this arm, with its new state.
+   *  The rest of the arm's registers match the parent walk. */
+  refined: [number, RegisterState] | null;
+}
+
+export interface CallEnterEvent {
+  depth: number;
+  target_pc: number;
+  /** Subprogram name, empty when unknown. */
+  name: string;
+  /** BTF id of the subprogram's Func type, usable with type_schema. */
+  btf_id: number | null;
+  /** Callee registers on entry, r1 onwards carry the arguments. */
+  registers: RegisterState[];
+}
+
+export interface CallExitEvent {
+  depth: number;
+  /** State the call returns in r0. The caller's r1 through r5 always
+   *  become "Uninit" after a call, that is left implicit. */
+  r0: RegisterState;
+}
+
+/** Verifier view of a register. */
+export type RegisterState =
+  | "Uninit"
+  | "PtrToPacketEnd"
+  | { Scalar: Scalar }
+  | { PtrToCtx: { btf_id: number; offset: ScalarRange; size: number } }
+  | { PtrToPacket: { id: number; offset: ScalarRange } }
+  | { PtrToPacketMeta: { id: number; offset: ScalarRange } }
+  | { PtrToStack: { offset: ScalarRange } }
+  | { PtrToMap: { map_fd: number } }
+  | { PtrToMapValue: { map_fd: number; offset: ScalarRange } }
+  | { PtrToMapValueOrNull: { map_fd: number } };
+
+export type Scalar = "Unknown" | { U32: ScalarRange } | { U64: ScalarRange };
+
+/** Inclusive value range with a stride between representable points.
+ *  U64 ranges above 2^53 lose precision crossing JSON. */
+export interface ScalarRange {
+  min: number;
+  max: number;
+  stride: number;
 }
 
 /** Subset of JSON Schema Draft 7 covering BTF-renderable types, plus

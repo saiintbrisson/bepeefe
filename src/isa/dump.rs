@@ -99,6 +99,16 @@ pub fn describe(opcode: u8) -> InsnKind {
     }
 }
 
+/// eBPF prints ALU32 and JMP32 operands as 32-bit subregisters (`wN`),
+/// everything else as full 64-bit registers (`rN`). The width lives in the
+/// opcode class.
+fn reg_prefix(opcode: u8) -> &'static str {
+    match opcode & 0b111 {
+        crate::isa::BPF_ALU32 | crate::isa::BPF_JMP32 => "w",
+        _ => "r",
+    }
+}
+
 fn fmt_offset(off: i16) -> String {
     if off >= 0 {
         format!("+ 0x{:X}", off)
@@ -136,15 +146,16 @@ pub fn disasm(insn: Insn, next: Option<Insn>) -> String {
     let src = insn.src_reg();
     let imm = insn.imm();
     let off = insn.offset();
+    let r = reg_prefix(insn.opcode());
 
     match describe(insn.opcode()) {
-        InsnKind::AluSrc(op) => format!("r{} = r{} {} r{}", dst, dst, op, src),
-        InsnKind::AluImm(op) => format!("r{} = r{} {} 0x{:X}", dst, dst, op, imm as u32),
-        InsnKind::AluImmSigned => format!("r{} = r{} {}", dst, dst, fmt_imm_signed(imm)),
-        InsnKind::Neg => format!("r{} = ~r{}", dst, dst),
-        InsnKind::MovSrc => format!("r{} = r{}", dst, src),
-        InsnKind::MovImm => format!("r{} = 0x{:X}", dst, imm as u32),
-        InsnKind::Bswap => format!("r{} = bswap r{}", dst, dst),
+        InsnKind::AluSrc(op) => format!("{r}{} = {r}{} {} {r}{}", dst, dst, op, src),
+        InsnKind::AluImm(op) => format!("{r}{} = {r}{} {} 0x{:X}", dst, dst, op, imm as u32),
+        InsnKind::AluImmSigned => format!("{r}{} = {r}{} {}", dst, dst, fmt_imm_signed(imm)),
+        InsnKind::Neg => format!("{r}{} = ~{r}{}", dst, dst),
+        InsnKind::MovSrc => format!("{r}{} = {r}{}", dst, src),
+        InsnKind::MovImm => format!("{r}{} = 0x{:X}", dst, imm as u32),
+        InsnKind::Bswap => format!("{r}{} = bswap {r}{}", dst, dst),
         InsnKind::Load(size) => format!("r{} = {}(r{} {})", dst, size, src, fmt_offset(off)),
         InsnKind::Store(size) => format!("{}(r{} {}) = r{}", size, dst, fmt_offset(off), src),
         InsnKind::LdImm64 => {
@@ -162,9 +173,9 @@ pub fn disasm(insn: Insn, next: Option<Insn>) -> String {
             }
         }
         InsnKind::Atomic => format!("lock *(u64 *)(r{} {}) += r{}", dst, fmt_offset(off), src),
-        InsnKind::JmpSrc(cmp) => format!("if r{} {} r{} {}", dst, cmp, src, fmt_goto(off)),
+        InsnKind::JmpSrc(cmp) => format!("if {r}{} {} {r}{} {}", dst, cmp, src, fmt_goto(off)),
         InsnKind::JmpImm(cmp) => {
-            format!("if r{} {} 0x{:X} {}", dst, cmp, imm as u32, fmt_goto(off))
+            format!("if {r}{} {} 0x{:X} {}", dst, cmp, imm as u32, fmt_goto(off))
         }
         InsnKind::Ja32 => fmt_goto_imm(imm),
         InsnKind::Ja16 => fmt_goto(off),
@@ -193,15 +204,16 @@ pub fn disasm_brief(insn: Insn, next: Option<Insn>) -> String {
     let src = insn.src_reg();
     let imm = insn.imm();
     let off = insn.offset();
+    let r = reg_prefix(insn.opcode());
 
     match describe(insn.opcode()) {
-        InsnKind::AluSrc(op) => format!("r{} {} r{}", dst, op, src),
-        InsnKind::AluImm(op) => format!("r{} {} 0x{:X}", dst, op, imm as u32),
-        InsnKind::AluImmSigned => format!("r{} {}", dst, fmt_imm_signed(imm)),
-        InsnKind::Neg => format!("~r{}", dst),
-        InsnKind::MovSrc => format!("r{}", src),
+        InsnKind::AluSrc(op) => format!("{r}{} {} {r}{}", dst, op, src),
+        InsnKind::AluImm(op) => format!("{r}{} {} 0x{:X}", dst, op, imm as u32),
+        InsnKind::AluImmSigned => format!("{r}{} {}", dst, fmt_imm_signed(imm)),
+        InsnKind::Neg => format!("~{r}{}", dst),
+        InsnKind::MovSrc => format!("{r}{}", src),
         InsnKind::MovImm => format!("0x{:X}", imm as u32),
-        InsnKind::Bswap => format!("bswap r{}", dst),
+        InsnKind::Bswap => format!("bswap {r}{}", dst),
         InsnKind::Load(_) => format!("r{} {}", src, fmt_offset(off)),
         InsnKind::Store(_) => format!("r{} {} = r{}", dst, fmt_offset(off), src),
         InsnKind::LdImm64 => {
@@ -219,8 +231,8 @@ pub fn disasm_brief(insn: Insn, next: Option<Insn>) -> String {
             }
         }
         InsnKind::Atomic => format!("r{} {} += r{}", dst, fmt_offset(off), src),
-        InsnKind::JmpSrc(cmp) => format!("r{} {} r{}", dst, cmp, src),
-        InsnKind::JmpImm(cmp) => format!("r{} {} 0x{:X}", dst, cmp, imm as u32),
+        InsnKind::JmpSrc(cmp) => format!("{r}{} {} {r}{}", dst, cmp, src),
+        InsnKind::JmpImm(cmp) => format!("{r}{} {} 0x{:X}", dst, cmp, imm as u32),
         InsnKind::Ja32 | InsnKind::Ja16 | InsnKind::Call | InsnKind::Exit => String::new(),
         InsnKind::Unknown => String::new(),
     }
@@ -234,6 +246,7 @@ pub fn debugger(state: &crate::vm::Cpu, insn: Insn) -> String {
     let dst_val = state.reg(dst);
     let src_val = state.reg(src);
     let next = state.insn_at(state.pc());
+    let r = reg_prefix(insn.opcode());
 
     let brief = disasm_brief(insn, next);
     let ann = if brief.is_empty() {
@@ -243,18 +256,26 @@ pub fn debugger(state: &crate::vm::Cpu, insn: Insn) -> String {
     };
 
     match describe(insn.opcode()) {
-        InsnKind::AluSrc(op) => format!("r{} = 0x{:X} {} 0x{:X}{}", dst, dst_val, op, src_val, ann),
+        InsnKind::AluSrc(op) => {
+            format!("{r}{} = 0x{:X} {} 0x{:X}{}", dst, dst_val, op, src_val, ann)
+        }
         InsnKind::AluImm(op) => format!(
-            "r{} = 0x{:X} {} 0x{:X}{}",
+            "{r}{} = 0x{:X} {} 0x{:X}{}",
             dst, dst_val, op, imm as u32, ann
         ),
         InsnKind::AluImmSigned => {
-            format!("r{} = 0x{:X} {}{}", dst, dst_val, fmt_imm_signed(imm), ann)
+            format!(
+                "{r}{} = 0x{:X} {}{}",
+                dst,
+                dst_val,
+                fmt_imm_signed(imm),
+                ann
+            )
         }
-        InsnKind::Neg => format!("r{} = ~0x{:X}{}", dst, dst_val, ann),
-        InsnKind::MovSrc => format!("r{} = 0x{:X}{}", dst, src_val, ann),
-        InsnKind::MovImm => format!("r{} = 0x{:X}{}", dst, imm as u32, ann),
-        InsnKind::Bswap => format!("r{} = bswap 0x{:X}{}", dst, dst_val, ann),
+        InsnKind::Neg => format!("{r}{} = ~0x{:X}{}", dst, dst_val, ann),
+        InsnKind::MovSrc => format!("{r}{} = 0x{:X}{}", dst, src_val, ann),
+        InsnKind::MovImm => format!("{r}{} = 0x{:X}{}", dst, imm as u32, ann),
+        InsnKind::Bswap => format!("{r}{} = bswap 0x{:X}{}", dst, dst_val, ann),
         InsnKind::Load(size) => {
             let addr = src_val.wrapping_add(off as i64 as u64);
             format!("r{} = {}0x{:X}{}", dst, size, addr, ann)

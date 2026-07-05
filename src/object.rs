@@ -30,6 +30,10 @@ pub struct EbpfObject<'file> {
 #[derive(Clone, Debug)]
 pub struct FunctionSignature {
     pub name: String,
+    /// BTF id of the `Func` type describing this function, when the object
+    /// carries func_info for it. Lets consumers resolve the full signature
+    /// from BTF.
+    pub btf_id: Option<BtfTypeId>,
     /// Whether the symbol declaring this function is global, that is, it's an
     /// entrypoint program.
     pub is_global: bool,
@@ -754,6 +758,7 @@ fn collect_functions<'file>(
         let sec_name = name(info.sec_name_off)?;
         for func in &info.data {
             let section_offset = func.insn_off as usize * Insn::WIDTH;
+            let func_btf_id = func.type_id;
             let func = btf.resolve_must(func.type_id).ty();
             let func_name = name(func.name_off)?;
             let proto = match &func.kind {
@@ -784,7 +789,7 @@ fn collect_functions<'file>(
 
             ext_programs.insert(
                 (sec_name.clone(), func_name.clone()),
-                (section_offset, params_types, proto.return_type),
+                (section_offset, func_btf_id, params_types, proto.return_type),
             );
         }
     }
@@ -822,19 +827,21 @@ fn collect_functions<'file>(
                 )));
             }
 
-            let (params, ret) = match ext_programs.get(&(sec_name.into(), prog_name.into())) {
-                Some((offset, _, _)) if prog_addr != *offset => {
+            let (btf_id, params, ret) = match ext_programs.get(&(sec_name.into(), prog_name.into()))
+            {
+                Some((offset, _, _, _)) if prog_addr != *offset => {
                     return Err(LoaderError::Malformed(format!(
                         "func_info insn offset {offset} does not match symbol address \
                          for {sec_name}:{prog_name}"
                     )));
                 }
-                Some((_, params, ret)) => (params.clone(), Some(*ret)),
+                Some((_, btf_id, params, ret)) => (Some(*btf_id), params.clone(), Some(*ret)),
                 None => Default::default(),
             };
 
             functions.push(FunctionSignature {
                 name: prog_name.to_string(),
+                btf_id,
                 is_global: sym.is_global(),
                 params_types: params,
                 return_type: ret,
@@ -933,6 +940,7 @@ mod tests {
                     insn_pc: flat_pc,
                     func: FunctionSignature {
                         name: String::new(),
+                        btf_id: None,
                         is_global: false,
                         params_types: Vec::new(),
                         return_type: None,
