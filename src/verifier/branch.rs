@@ -51,6 +51,7 @@ impl BranchResult {
 /// compared ranges cannot settle the outcome, the skip variants when the jump
 /// is provably taken or not taken.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub enum BranchDecision {
     #[default]
     Both,

@@ -14,6 +14,10 @@ pub enum Event<'a> {
     /// (typically a perf event fd), and `data` is the payload copied
     /// out of the program's memory.
     PerfEventOutput {
+        /// pc of the emitting call instruction. Joins the payload to the
+        /// [`VerifierEvent::PerfEventLayout`] recorded for the same call
+        /// site.
+        pc: usize,
         fd: u32,
         data: Cow<'a, [u8]>,
     },
@@ -24,9 +28,9 @@ pub enum VerifierEvent<'a> {
     Insn {
         depth: usize,
         pc: usize,
-        /// Registers whose state the check consulted. Calls over-approximate
-        /// to r1 through r5 because their parameter reads flow through the
-        /// full register array.
+        /// Registers whose state the check consulted. Helper calls report the
+        /// exact arguments the helper read, subprogram calls report r1 through
+        /// the callee's last declared parameter.
         read: RegMask,
         /// Registers the instruction wrote, paired with their new state.
         /// Walk-spawning jumps record before their check runs and write
@@ -94,12 +98,16 @@ pub enum VerifierEvent<'a> {
 
 /// A stack slot inside a perf event payload, as the verifier saw it
 /// written.
-#[derive(Clone, Copy, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub struct PayloadSlot {
     /// Byte offset within the payload.
     pub offset: u32,
     pub size: u32,
     pub state: RegisterState,
+    /// pc of the store that wrote this slot. Joins to `line_info` for the
+    /// source location that produced the value.
+    pub pc: usize,
 }
 
 pub trait Capture {

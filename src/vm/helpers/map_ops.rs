@@ -88,6 +88,7 @@ pub(crate) fn perf_event_output(
     if let Some(cap) = state.capture() {
         let data = state.read_bytes(data_ptr, size as usize).into_owned();
         cap.record(Event::PerfEventOutput {
+            pc: state.pc().saturating_sub(1),
             fd,
             data: data.into(),
         });

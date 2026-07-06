@@ -48,6 +48,7 @@ impl WasmObject {
         })
     }
 
+    #[wasm_bindgen(unchecked_return_type = "DisasmRow[]")]
     pub fn disasm(&self, prog_name: &str) -> Result<String, JsError> {
         disasm::to_json(self.lookup(prog_name)?)
     }

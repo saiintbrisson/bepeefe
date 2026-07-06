@@ -3,15 +3,15 @@ use crate::verifier::{RegisterState, Scalar};
 use crate::vm::ptr::TaggetPtrType;
 use crate::vm::{Cpu, Vm};
 
-use super::{BpfHelper, probe_ops};
+use super::{ArgRegs, BpfHelper, probe_ops};
 
 /// Shared params validator. R3 is `ARG_ANYTHING` in Linux: any source
 /// value is accepted, with faults surfaced at runtime as `-EFAULT`.
-fn probe_params(regs: &[RegisterState; 11]) -> Result<(), &'static str> {
-    if !regs[1].is_pointer() {
+fn probe_params(regs: ArgRegs) -> Result<(), &'static str> {
+    if !regs.get(1).is_pointer() {
         return Err("probe_read: R1 must be a valid pointer");
     }
-    if !matches!(regs[2], RegisterState::Scalar(_)) {
+    if !regs.get(2).is_scalar() {
         return Err("probe_read: R2 must be a scalar");
     }
     Ok(())
@@ -46,16 +46,11 @@ impl BpfHelper for ProbeReadUser {
         run_probe_read(state, TaggetPtrType::User);
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, _: &Vm, regs: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
+    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
         probe_params(regs)
     }
 }
@@ -73,16 +68,11 @@ impl BpfHelper for ProbeReadKernel {
         run_probe_read(state, TaggetPtrType::Kernel);
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, _: &Vm, regs: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
+    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
         probe_params(regs)
     }
 }
@@ -100,16 +90,11 @@ impl BpfHelper for ProbeReadUserStr {
         run_probe_read_str(state, TaggetPtrType::User);
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, _: &Vm, regs: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
+    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
         probe_params(regs)
     }
 }
@@ -127,16 +112,11 @@ impl BpfHelper for ProbeReadKernelStr {
         run_probe_read_str(state, TaggetPtrType::Kernel);
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, _: &Vm, regs: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
+    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
         probe_params(regs)
     }
 }

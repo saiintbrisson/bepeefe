@@ -1,4 +1,6 @@
 mod branch;
+#[cfg(test)]
+mod tests;
 
 use std::{borrow::Cow, cell::Cell, collections::BTreeMap, ops::Range, sync::Arc};
 
@@ -117,6 +119,7 @@ macro_rules! guard {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub enum RegisterState {
     #[default]
     Uninit,
@@ -217,6 +220,7 @@ pub enum RegisterState {
 /// tracks what bits can be set. It's not complete and only validates a subset
 /// of programs tnum does.
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub struct ScalarRange<T: Copy> {
     pub min: T,
     pub max: T,
@@ -259,6 +263,7 @@ impl<T: Copy + From<u8>> ScalarRange<T> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub enum Scalar {
     U32(ScalarRange<u32>),
     U64(ScalarRange<u64>),
@@ -475,16 +480,20 @@ impl Scalar {
 impl RegisterState {
     pub fn is_pointer(&self) -> bool {
         match self {
-            RegisterState::PtrToCtx { .. }
-            | RegisterState::PtrToStack { .. }
-            | RegisterState::PtrToMap { .. }
-            | RegisterState::PtrToMapValue { .. }
-            | RegisterState::PtrToMapValueOrNull { .. }
-            | RegisterState::PtrToPacket { .. }
-            | RegisterState::PtrToPacketEnd
-            | RegisterState::PtrToPacketMeta { .. } => true,
-            RegisterState::Uninit | RegisterState::Scalar { .. } => false,
+            Self::PtrToCtx { .. }
+            | Self::PtrToStack { .. }
+            | Self::PtrToMap { .. }
+            | Self::PtrToMapValue { .. }
+            | Self::PtrToMapValueOrNull { .. }
+            | Self::PtrToPacket { .. }
+            | Self::PtrToPacketEnd
+            | Self::PtrToPacketMeta { .. } => true,
+            Self::Uninit | Self::Scalar { .. } => false,
         }
+    }
+
+    pub fn is_scalar(&self) -> bool {
+        matches!(self, Self::Scalar(_))
     }
 }
 
@@ -589,23 +598,36 @@ impl serde::Serialize for RegMask {
     }
 }
 
+/// Inverse of the index-list [`serde::Serialize`] impl, only needed by tests
+/// that round-trip events through their wire format.
+#[cfg(test)]
+impl<'de> serde::Deserialize<'de> for RegMask {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let indices = Vec::<u8>::deserialize(deserializer)?;
+        Ok(indices
+            .into_iter()
+            .fold(RegMask::empty(), |mask, idx| mask | RegMask::single(idx)))
+    }
+}
+
 /// Registers `insn` reads, judged from the opcode alone.
 ///
 /// Insn events prefer the state-based accounting gathered while an
 /// instruction is checked, which knows, for example, that a MOV destination
-/// is never read. This covers the cases that accounting cannot see: events
-/// recorded before their check runs (walk-spawning jumps) and calls, whose
-/// parameter reads flow through the full register array rather than the
-/// tracked accessors. Calls over-approximate to r1 through r5.
-pub fn static_reads(insn: &Insn) -> RegMask {
+/// is never read. This covers the cases that accounting cannot see: jumps
+/// recorded before their check runs and subprogram calls, whose argument
+/// reads flow through the raw register array rather than the tracked
+/// accessors. Helper calls are absent here on purpose: their reads are
+/// tracked precisely through [`helpers::ArgRegs`] and already sit in
+/// `insn_reads` by the time the event records.
+fn static_reads(insn: &Insn) -> RegMask {
     if !matches!(insn.class(), BPF_JMP | BPF_JMP32) {
         return RegMask::empty();
     }
 
     match insn.opcode() & JMP_OP_MASK {
-        BPF_CALL => RegMask::R1 | RegMask::R2 | RegMask::R3 | RegMask::R4 | RegMask::R5,
         BPF_EXIT => RegMask::R0,
-        BPF_JA => RegMask::empty(),
+        BPF_CALL | BPF_JA => RegMask::empty(),
         _ => {
             let mut mask = RegMask::single(insn.dst_reg());
             if insn.opcode() & BPF_X == BPF_X {
@@ -613,6 +635,33 @@ pub fn static_reads(insn: &Insn) -> RegMask {
             }
             mask
         }
+    }
+}
+
+/// A written stack slot.
+///
+/// The size and verifier state stored there, plus the pc of the store that
+/// wrote it. Written and read by the store/load checks.
+#[derive(Clone, Copy)]
+struct StackSlot {
+    size: u32,
+    state: RegisterState,
+    pc: usize,
+}
+
+impl StackSlot {
+    /// Whether a store of `store_size` bytes at `dst` partially overwrites this
+    /// slot sitting at `addr`, meaning the two byte ranges intersect but the
+    /// store does not exactly replace the slot.
+    ///
+    /// An exact replacement overwrites cleanly and a disjoint store leaves the
+    /// slot alone, only a partial overlap has to clear the stale slot.
+    fn partially_overwritten_by(&self, addr: u32, dst: u32, store_size: u32) -> bool {
+        let obj_end = addr + self.size;
+        let write_end = dst + store_size;
+        let exact = addr == dst && self.size == store_size;
+        let disjoint = write_end <= addr || dst >= obj_end;
+        !exact && !disjoint
     }
 }
 
@@ -637,7 +686,7 @@ pub struct Verifier<'a> {
     skip: usize,
     exit: bool,
 
-    stack_objects: BTreeMap<u32, (u32, RegisterState)>,
+    stack_objects: BTreeMap<u32, StackSlot>,
     stack_range: Range<u32>,
     depth: usize,
     call_stack: Vec<usize>,
@@ -943,9 +992,30 @@ impl<'a> Verifier<'a> {
         self.record(VerifierEvent::Insn {
             depth: self.depth,
             pc,
-            read: self.insn_reads.get() | static_reads(insn),
+            read: self.insn_reads.get() | static_reads(insn) | self.pseudo_call_reads(insn),
             written: written.get(..count).unwrap_or_default(),
         });
+    }
+
+    /// Argument registers a subprogram call reads: r1 through the last
+    /// parameter the callee's BTF signature declares. Helper calls track
+    /// their reads precisely through [`helpers::ArgRegs`], so this only
+    /// covers pseudo calls, whose Insn event records before the check that
+    /// would otherwise consult the arguments.
+    fn pseudo_call_reads(&self, insn: &Insn) -> RegMask {
+        let is_pseudo_call = matches!(insn.class(), BPF_JMP | BPF_JMP32)
+            && insn.opcode() & JMP_OP_MASK == BPF_CALL
+            && insn.src_reg() == BPF_PSEUDO_CALL;
+        if !is_pseudo_call {
+            return RegMask::empty();
+        }
+        let target_pc = (self.pc + insn.imm() as isize) as usize;
+        let argc = self
+            .prog
+            .subprogs
+            .get(&target_pc)
+            .map_or(5, |sig| sig.params_types.len().min(5));
+        (1..=argc).fold(RegMask::empty(), |mask, i| mask | RegMask::single(i as u8))
     }
 
     /// Emits the static view of a `bpf_perf_event_output` payload. The
@@ -981,11 +1051,12 @@ impl<'a> Verifier<'a> {
             .map(|(base, end)| {
                 self.stack_objects
                     .range(base..end)
-                    .filter(|&(&addr, &(size, _))| addr.saturating_add(size) <= end)
-                    .map(|(&addr, &(size, state))| PayloadSlot {
+                    .filter(|&(&addr, slot)| addr.saturating_add(slot.size) <= end)
+                    .map(|(&addr, slot)| PayloadSlot {
                         offset: addr - base,
-                        size,
-                        state,
+                        size: slot.size,
+                        state: slot.state,
+                        pc: slot.pc,
                     })
                     .collect()
             })
@@ -1461,7 +1532,7 @@ impl<'a> Verifier<'a> {
 
                 RegisterState::Scalar(scalar)
             }
-            Ok(src @ RegisterState::Scalar(_)) => src,
+            Ok(src) if src.is_scalar() => src,
             Ok(_) => guard!(self, "mov with invalid src register"),
             Err(_) => {
                 if insn.class() == BPF_ALU32 {
@@ -1558,16 +1629,16 @@ impl<'a> Verifier<'a> {
                             .min
                             .checked_add_signed(insn.offset() as i32)
                             .ok_or(self.err("tried reading out of stack bounds"))?;
-                        let &(slot_size, saved_state) = self
+                        let slot = *self
                             .stack_objects
                             .get(&dst)
                             .ok_or(self.err("tried reading out of uninit stack slot"))?;
                         guard!(
                             self,
-                            slot_size == load_size,
+                            slot.size == load_size,
                             "load size does not match stack slot size"
                         );
-                        self.set_reg(insn.dst_reg(), saved_state);
+                        self.set_reg(insn.dst_reg(), slot.state);
                         return Ok(());
                     }
                     RegisterState::PtrToMap { map_fd: _ } => {
@@ -1730,11 +1801,9 @@ impl<'a> Verifier<'a> {
                 let overlapping: Vec<u32> = self
                     .stack_objects
                     .range(dst.saturating_sub(7)..write_end)
-                    .filter_map(|(&addr, &(len, _))| {
-                        let obj_end = addr + len;
-                        let exact_match = addr == dst && len == store_size;
-                        let disjoint = write_end <= addr || dst >= obj_end;
-                        (!exact_match && !disjoint).then_some(addr)
+                    .filter_map(|(&addr, slot)| {
+                        slot.partially_overwritten_by(addr, dst, store_size)
+                            .then_some(addr)
                     })
                     .collect();
 
@@ -1744,20 +1813,27 @@ impl<'a> Verifier<'a> {
                     }
 
                     for &addr in &overlapping {
-                        let (_, existing) = self
+                        let existing = self
                             .stack_objects
                             .get(&addr)
                             .ok_or_else(|| self.err("overlapping stack addr is out of bounds"))?;
                         guard!(
                             self,
-                            !existing.is_pointer(),
+                            !existing.state.is_pointer(),
                             "scalar store clobbers pointer on stack"
                         );
                         self.stack_objects.remove(&addr);
                     }
                 }
 
-                self.stack_objects.insert(dst, (store_size, src_state));
+                self.stack_objects.insert(
+                    dst,
+                    StackSlot {
+                        size: store_size,
+                        state: src_state,
+                        pc: (self.pc - 1).max(0) as usize,
+                    },
+                );
             }
             RegisterState::PtrToMapValue { map_fd, offset } => {
                 let bpf_map = self.vm.get_map(map_fd);
@@ -1848,7 +1924,7 @@ impl<'a> Verifier<'a> {
             if let Some(ty) = self.expected_return {
                 let btf_type = self.prog.btf.resolve_must(ty);
                 let ok = match btf_type.kind() {
-                    BtfKind::Int(_) => matches!(self.reg(0), RegisterState::Scalar(_)),
+                    BtfKind::Int(_) => self.reg(0).is_scalar(),
                     BtfKind::Ptr(_) => self.reg(0).is_pointer(),
                     _ => true,
                 };
@@ -2019,8 +2095,9 @@ impl<'a> Verifier<'a> {
             BPF_HELPER_CALL => {
                 let helper = helpers::lookup(insn.imm())
                     .ok_or_else(|| self.err("BPF_HELPER_CALL refers to invalid helper ID"))?;
+                let args = helpers::ArgRegs::new(&self.registers, &self.insn_reads);
                 helper
-                    .params(self.vm, self.regs(), *insn)
+                    .params(self.vm, args, *insn)
                     .map_err(|_| self.err("helper parameter validation failed"))?;
 
                 if insn.imm() == helpers::PerfEventOutput::ID {
@@ -2028,7 +2105,7 @@ impl<'a> Verifier<'a> {
                 }
 
                 let retval = helper
-                    .retval(self.vm, self.regs(), *insn)
+                    .retval(self.vm, args, *insn)
                     .map_err(|msg| self.err(msg))?;
                 self.set_reg(0, retval);
             }

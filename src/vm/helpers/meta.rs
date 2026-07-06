@@ -2,7 +2,7 @@ use crate::isa::Insn;
 use crate::verifier::{RegisterState, Scalar};
 use crate::vm::{Cpu, Vm};
 
-use super::BpfHelper;
+use super::{ArgRegs, BpfHelper};
 
 pub struct KtimeGetNs;
 impl KtimeGetNs {
@@ -17,16 +17,11 @@ impl BpfHelper for KtimeGetNs {
         state.set_reg(0, state.ktime_ns());
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, _: &Vm, _: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
+    fn params(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<(), &'static str> {
         Ok(())
     }
 }
@@ -44,16 +39,11 @@ impl BpfHelper for GetPrandomU32 {
         state.set_reg(0, state.prandom_u32() as u64);
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, _: &Vm, _: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
+    fn params(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<(), &'static str> {
         Ok(())
     }
 }
@@ -71,16 +61,11 @@ impl BpfHelper for GetSmpProcessorId {
         state.set_reg(0, state.cpu() as u64);
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, _: &Vm, _: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
+    fn params(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<(), &'static str> {
         Ok(())
     }
 }
@@ -98,16 +83,11 @@ impl BpfHelper for GetCurrentPidTgid {
         state.set_reg(0, state.task().pid_tgid());
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, _: &Vm, _: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
+    fn params(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<(), &'static str> {
         Ok(())
     }
 }
@@ -140,20 +120,15 @@ impl BpfHelper for GetCurrentComm {
         state.set_reg(0, 0);
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, _: &Vm, regs: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
-        if !regs[1].is_pointer() {
+    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
+        if !regs.get(1).is_pointer() {
             return Err("get_current_comm: R1 must be a valid pointer");
         }
-        if !matches!(regs[2], RegisterState::Scalar(_)) {
+        if !regs.get(2).is_scalar() {
             return Err("get_current_comm: R2 must be a scalar");
         }
         Ok(())

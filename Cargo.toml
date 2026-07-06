@@ -66,3 +66,6 @@ disallowed_macros = "deny"
 [profile.release]
 lto = "fat"
 opt-level = "z"
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -12,6 +12,7 @@ pub use access::{Access, AccessError, Hop};
 pub mod value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 #[serde(transparent)]
 pub struct BtfTypeId(pub u32);
 

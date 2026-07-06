@@ -15,7 +15,10 @@ use crate::{
     btf::{Btf, BtfKind, BtfTypeId, ext::BtfExt},
     error::LoaderError,
     hook::Hook,
-    isa::Insn,
+    isa::{
+        Insn,
+        load::{BPF_PSEUDO_MAP_FD, BPF_PSEUDO_MAP_VALUE},
+    },
     maps::{BPF_MAP_TYPE_ARRAY, MapPinning, MapSpec},
 };
 
@@ -118,10 +121,10 @@ impl<'file> EbpfObject<'file> {
     /// here, they only get pulled in when an entrypoint transitively calls
     /// them.
     ///
-    /// Map and data-section relocations are recorded but not yet patched.
-    /// Those FDs don't exist until the program is prepared against a [`Vm`], at
-    /// which point the deferred relocations get rewritten with the assigned
-    /// FDs.
+    /// Map and data-section relocations get their pseudo src reg stamped so a
+    /// disassembler can tell a map load from a plain immediate, but their FDs
+    /// don't exist until the program is prepared against a [`Vm`], at which
+    /// point the deferred relocations get rewritten with the assigned FDs.
     ///
     /// [`Vm`]: crate::vm::Vm
     /// [`Vm::prepare`]: crate::vm::Vm::prepare
@@ -346,6 +349,9 @@ impl ProgLoader {
 
     /// Resolve a relocation following the Kernel rules for LLVM relos.
     ///
+    /// Jump relocations are resolved here and the instructions re-written. Maps
+    /// are deferred to program loading, but their SRC registers are fixed here.
+    ///
     /// Ref: <https://github.com/torvalds/linux/blob/master/Documentation/bpf/llvm_reloc.rst>
     fn resolve_relo(
         &mut self,
@@ -408,11 +414,13 @@ impl ProgLoader {
                     .is_some_and(|n| n.starts_with(".rodata") || n == ".data" || n == ".bss");
 
                 if is_data_sec {
+                    insn.with_src_reg(BPF_PSEUDO_MAP_VALUE);
                     Ok(Some(Deferred::Data {
                         sec_idx,
                         offset: addr as usize + insn.imm() as usize,
                     }))
                 } else {
+                    insn.with_src_reg(BPF_PSEUDO_MAP_FD);
                     Ok(Some(Deferred::Map {
                         sec_idx,
                         addr: addr as usize,
@@ -520,7 +528,11 @@ fn parse_btf<'a>(
 
     for sec in file.sections() {
         let Ok(name) = sec.name() else { continue };
-        if !name.starts_with(".rodata") {
+
+        if [".rodata", ".data", ".bss"]
+            .iter()
+            .all(|exp| !name.starts_with(exp))
+        {
             continue;
         }
 
@@ -1004,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn map_ref_emits_deferred_and_leaves_insn_alone() {
+    fn map_ref_emits_deferred_and_marks_pseudo_src() {
         let mut loader = loader_with(0, ld_imm64(0), &[]);
 
         let r = loader
@@ -1019,10 +1031,11 @@ mod tests {
             })
         );
         assert_eq!(
-            loader.insns[0].imm(),
-            0,
-            "ld_imm64 must not be patched here"
+            loader.insns[0].src_reg(),
+            BPF_PSEUDO_MAP_FD,
+            "pseudo src marks a map-by-fd load"
         );
+        assert_eq!(loader.insns[0].imm(), 0, "the FD is only filled at prepare");
     }
 
     #[test]
@@ -1040,6 +1053,11 @@ mod tests {
                 sec_idx: SectionIndex(3),
                 offset: 72, // 64 + 8
             })
+        );
+        assert_eq!(
+            loader.insns[0].src_reg(),
+            BPF_PSEUDO_MAP_VALUE,
+            "pseudo src marks a map-value load"
         );
     }
 

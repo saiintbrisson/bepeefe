@@ -4,7 +4,7 @@ use crate::isa::Insn;
 use crate::verifier::{RegisterState, Scalar};
 use crate::vm::{Cpu, Vm};
 
-use super::BpfHelper;
+use super::{ArgRegs, BpfHelper};
 
 pub struct TracePrintk;
 impl TracePrintk {
@@ -19,20 +19,15 @@ impl BpfHelper for TracePrintk {
         state.set_reg(0, bpf_trace_printk(state));
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, _: &Vm, regs: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
-        if !regs[1].is_pointer() {
+    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
+        if !regs.get(1).is_pointer() {
             return Err("trace_printk: R1 must be a valid pointer");
         }
-        if !matches!(regs[2], RegisterState::Scalar(_)) {
+        if !regs.get(2).is_scalar() {
             return Err("trace_printk: R2 must be a scalar");
         }
         Ok(())

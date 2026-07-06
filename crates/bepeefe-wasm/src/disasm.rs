@@ -10,8 +10,14 @@ use crate::js_err;
 struct Row {
     pc: usize,
     insn: Option<String>,
-    line: Option<u32>,
-    source: Option<String>,
+    source: Option<Source>,
+}
+
+#[derive(serde::Serialize)]
+struct Source {
+    line: u32,
+    col: u32,
+    source: String,
 }
 
 /// Disassemble a program to a JSON array of rows, one per instruction.
@@ -29,7 +35,6 @@ pub fn to_json(prog: &EbpfProgram) -> Result<String, JsError> {
             rows.push(Row {
                 pc,
                 insn: None,
-                line: None,
                 source: None,
             });
             continue;
@@ -37,14 +42,14 @@ pub fn to_json(prog: &EbpfProgram) -> Result<String, JsError> {
 
         let next = insns.get(pc + 1).copied();
         let text = dump::disasm(*insn, next);
-        let (line, source) = prog
-            .line_info()
-            .get(&pc)
-            .and_then(|entry| {
-                let src = btf.string(entry.line_off)?;
-                Some((Some(entry.line_no), Some(src.trim().to_owned())))
+        let source = prog.line_info().get(&pc).and_then(|entry| {
+            let src = btf.string(entry.line_off)?;
+            Some(Source {
+                line: entry.line_no,
+                col: entry.column_no,
+                source: src.to_string(),
             })
-            .unwrap_or((None, None));
+        });
 
         if matches!(dump::describe(insn.opcode()), InsnKind::LdImm64) {
             skip_next = true;
@@ -53,7 +58,6 @@ pub fn to_json(prog: &EbpfProgram) -> Result<String, JsError> {
         rows.push(Row {
             pc,
             insn: Some(text),
-            line,
             source,
         });
     }

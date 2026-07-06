@@ -9,6 +9,25 @@
 // Engine BTF types (BtfType, BtfKind, etc.) deliberately don't appear
 // here. Consumers work off pre-computed schemas instead.
 
+/** One disassembled instruction, as returned by the `disasm` methods on
+ *  WasmObject and WasmProgram (a JSON array of these). The second word of a
+ *  `LdImm64` is emitted as a row with `insn` null so program counters stay
+ *  aligned with the instruction stream. */
+export interface DisasmRow {
+  pc: number;
+  /** Rendered instruction text, null for the trailing word of a `LdImm64`. */
+  insn: string | null;
+  /** Source location from line_info, null when the pc has no entry. */
+  source: DisasmSource | null;
+}
+
+export interface DisasmSource {
+  line: number;
+  col: number;
+  /** Source line text pulled from BTF strings. */
+  source: string;
+}
+
 export interface ProgramSchema {
   name: string;
   section?: string;
@@ -90,7 +109,10 @@ export interface CoreReloHop {
 export type CaptureEvent =
   | { Print: string }
   | { Verifier: VerifierEvent }
-  | { PerfEventOutput: { fd: number; data: number[] } };
+  /** Runtime perf event payload. `pc` is the emitting call instruction and
+   *  joins the payload to the PerfEventLayout recorded for that call site.
+   *  `fd` is the perf event fd stored in the map slot, not the map's fd. */
+  | { PerfEventOutput: { pc: number; fd: number; data: number[] } };
 
 export type VerifierEvent =
   | { Insn: InsnEvent }
@@ -169,6 +191,9 @@ export interface PayloadSlot {
   offset: number;
   size: number;
   state: RegisterState;
+  /** pc of the store that wrote this slot. Joins to line_info for the
+   *  source location that produced the value. */
+  pc: number;
 }
 
 /** Verifier view of a register. */

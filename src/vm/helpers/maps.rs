@@ -2,7 +2,7 @@ use crate::isa::Insn;
 use crate::verifier::{RegisterState, Scalar, ScalarRange};
 use crate::vm::{Cpu, Vm};
 
-use super::{BpfHelper, map_ops};
+use super::{ArgRegs, BpfHelper, map_ops};
 
 pub struct MapLookupElem;
 impl MapLookupElem {
@@ -20,13 +20,8 @@ impl BpfHelper for MapLookupElem {
         state.set_reg(0, elem);
     }
 
-    fn retval(
-        &self,
-        vm: &Vm,
-        regs: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
-        let RegisterState::PtrToMap { map_fd } = regs[1] else {
+    fn retval(&self, vm: &Vm, regs: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
+        let RegisterState::PtrToMap { map_fd } = regs.get(1) else {
             return Err("map_lookup_elem: R1 must be PtrToMap");
         };
         let map = vm.get_map(map_fd);
@@ -40,11 +35,11 @@ impl BpfHelper for MapLookupElem {
         }
     }
 
-    fn params(&self, _: &Vm, regs: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
-        if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
+    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
+        if !matches!(regs.get(1), RegisterState::PtrToMap { .. }) {
             return Err("map_lookup_elem: R1 must be PtrToMap");
         }
-        if !regs[2].is_pointer() {
+        if !regs.get(2).is_pointer() {
             return Err("map_lookup_elem: R2 must be a valid pointer");
         }
         Ok(())
@@ -70,26 +65,21 @@ impl BpfHelper for MapUpdateElem {
         }
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, _: &Vm, regs: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
-        if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
+    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
+        if !matches!(regs.get(1), RegisterState::PtrToMap { .. }) {
             return Err("map_update_elem: R1 must be PtrToMap");
         }
-        if !regs[2].is_pointer() {
+        if !regs.get(2).is_pointer() {
             return Err("map_update_elem: R2 must be a valid pointer");
         }
-        if !regs[3].is_pointer() {
+        if !regs.get(3).is_pointer() {
             return Err("map_update_elem: R3 must be a valid pointer");
         }
-        if !matches!(regs[4], RegisterState::Scalar(_)) {
+        if !regs.get(4).is_scalar() {
             return Err("map_update_elem: R4 must be a scalar");
         }
         Ok(())
@@ -114,20 +104,15 @@ impl BpfHelper for MapDeleteElem {
         }
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, _: &Vm, regs: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
-        if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
+    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
+        if !matches!(regs.get(1), RegisterState::PtrToMap { .. }) {
             return Err("map_delete_elem: R1 must be PtrToMap");
         }
-        if !regs[2].is_pointer() {
+        if !regs.get(2).is_pointer() {
             return Err("map_delete_elem: R2 must be a valid pointer");
         }
         Ok(())
@@ -152,20 +137,15 @@ impl BpfHelper for MapPushElem {
         }
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, _: &Vm, regs: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
-        if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
+    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
+        if !matches!(regs.get(1), RegisterState::PtrToMap { .. }) {
             return Err("map_push_elem: R1 must be PtrToMap");
         }
-        if !regs[2].is_pointer() {
+        if !regs.get(2).is_pointer() {
             return Err("map_push_elem: R2 must be a valid pointer");
         }
         Ok(())
@@ -190,20 +170,15 @@ impl BpfHelper for MapPopElem {
         }
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, _: &Vm, regs: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
-        if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
+    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
+        if !matches!(regs.get(1), RegisterState::PtrToMap { .. }) {
             return Err("map_pop_elem: R1 must be PtrToMap");
         }
-        if !regs[2].is_pointer() {
+        if !regs.get(2).is_pointer() {
             return Err("map_pop_elem: R2 must be a valid pointer");
         }
         Ok(())
@@ -230,33 +205,28 @@ impl BpfHelper for PerfEventOutput {
         }
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, vm: &Vm, regs: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
-        if !matches!(regs[1], RegisterState::PtrToCtx { .. }) {
+    fn params(&self, vm: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
+        if !matches!(regs.get(1), RegisterState::PtrToCtx { .. }) {
             return Err("perf_event_output: R1 must be PtrToCtx");
         }
-        let RegisterState::PtrToMap { map_fd } = regs[2] else {
+        let RegisterState::PtrToMap { map_fd } = regs.get(2) else {
             return Err("perf_event_output: R2 must be PtrToMap");
         };
         let map = vm.get_map(map_fd);
         if map.spec.r#type != Some(crate::maps::BPF_MAP_TYPE_PERF_EVENT_ARRAY) {
             return Err("perf_event_output: R2 map must be BPF_MAP_TYPE_PERF_EVENT_ARRAY");
         }
-        if !matches!(regs[3], RegisterState::Scalar(_)) {
+        if !regs.get(3).is_scalar() {
             return Err("perf_event_output: R3 must be a scalar");
         }
-        if !regs[4].is_pointer() {
+        if !regs.get(4).is_pointer() {
             return Err("perf_event_output: R4 must be a valid pointer");
         }
-        if !matches!(regs[5], RegisterState::Scalar(_)) {
+        if !regs.get(5).is_scalar() {
             return Err("perf_event_output: R5 must be a scalar");
         }
         Ok(())
@@ -281,20 +251,15 @@ impl BpfHelper for MapPeekElem {
         }
     }
 
-    fn retval(
-        &self,
-        _: &Vm,
-        _: &[RegisterState; 11],
-        _: Insn,
-    ) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
-    fn params(&self, _: &Vm, regs: &[RegisterState; 11], _: Insn) -> Result<(), &'static str> {
-        if !matches!(regs[1], RegisterState::PtrToMap { .. }) {
+    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
+        if !matches!(regs.get(1), RegisterState::PtrToMap { .. }) {
             return Err("map_peek_elem: R1 must be PtrToMap");
         }
-        if !regs[2].is_pointer() {
+        if !regs.get(2).is_pointer() {
             return Err("map_peek_elem: R2 must be a valid pointer");
         }
         Ok(())

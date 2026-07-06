@@ -161,6 +161,7 @@ impl WasmProgram {
         Ok(self.prepared.run(image, capture.map(|c| c.inner)))
     }
 
+    #[wasm_bindgen(unchecked_return_type = "DisasmRow[]")]
     pub fn disasm(&self) -> Result<String, JsError> {
         disasm::to_json(&self.prepared)
     }
