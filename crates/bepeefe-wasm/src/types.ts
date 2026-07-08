@@ -117,6 +117,8 @@ export type CaptureEvent =
 export type VerifierEvent =
   | { Insn: InsnEvent }
   | { BranchEnter: BranchEnterEvent }
+  | { BranchDead: BranchDeadEvent }
+  | { StatePruned: StatePrunedEvent }
   | { BranchExit: { depth: number } }
   | { CallEnter: CallEnterEvent }
   | { CallExit: CallExitEvent }
@@ -135,21 +137,64 @@ export interface InsnEvent {
   written: [number, RegisterState][];
 }
 
-export type BranchDecision = "Both" | "SkipBranch" | "SkipFallthrough";
+/** How a walk came to exist. On a BranchEnter or BranchDead it is always Branch
+ *  or Fallthrough, never Call. `refined` is the register the comparison narrowed
+ *  on this arm with its new state, or null when the arm changed nothing.
+ *  `fork_pc` is the pc of the jump that spawned the arm: every arm of one
+ *  branch, live or dead, shares it, and a StatePruned landing on that jump
+ *  carries the same `fork_pc`, which is how it joins to the arms. */
+export type WalkOrigin =
+  | { Branch: { refined: [number, RegisterState] | null; fork_pc: number } }
+  | { Fallthrough: { refined: [number, RegisterState] | null; fork_pc: number } }
+  | "Call";
 
 export interface BranchEnterEvent {
   depth: number;
+  /** Stable id of this walk. StatePruned events reference it via `matched`. */
+  id: number;
+  /** For a Branch arm, the jump target. For a Fallthrough arm, the instruction
+   *  right after the branch. */
   target_pc: number;
-  /** Verdict for the jump that spawned this arm. "Both" means a sibling
-   *  arm is also walked. */
-  decision: BranchDecision;
-  /** Register the comparison refined on this arm, with its new state.
-   *  The rest of the arm's registers match the parent walk. */
-  refined: [number, RegisterState] | null;
+  /** Which arm this is, and the fork pc all its siblings share (see
+   *  `WalkOrigin`). */
+  kind: WalkOrigin;
+}
+
+/** An arm the comparison ruled out. It never entered, so it has no id and no
+ *  body, a leaf sibling of the arms that did. `kind` says which side was cut and
+ *  carries the same `fork_pc` as those live siblings. */
+export interface BranchDeadEvent {
+  depth: number;
+  target_pc: number;
+  kind: WalkOrigin;
+}
+
+/** Where walker `matched` sat relative to a StatePruned's `fork_pc`, which tells
+ *  you how to reach the continuation without resolving `matched` first. "Jump":
+ *  `fork_pc` is a jump `matched` branched at, so the continuation is `matched`'s
+ *  arm children, whose `kind.fork_pc` equals this `fork_pc`. "Arm": `fork_pc` is
+ *  `matched`'s own entry, so `matched` is itself the arm. */
+export type PruneSite = "Jump" | "Arm";
+
+/** This walk stopped because walker `matched` already covered every state
+ *  reachable from `fork_pc`. It is not an arm.
+ *
+ *  Resolve `matched` by indexing every BranchEnter and CallEnter by `id` in one
+ *  forward pass. `site` says what its continuation is: for "Jump" it is
+ *  `matched`'s arm children sharing this `fork_pc`, one or two of them; for
+ *  "Arm" it is `matched` itself and its whole subtree. Either way you never read
+ *  this as a single arm. */
+export interface StatePrunedEvent {
+  depth: number;
+  fork_pc: number;
+  matched: number;
+  site: PruneSite;
 }
 
 export interface CallEnterEvent {
   depth: number;
+  /** Stable id of this walk. AlreadyVisited prunes reference it via `matched`. */
+  id: number;
   target_pc: number;
   /** Subprogram name, empty when unknown. */
   name: string;

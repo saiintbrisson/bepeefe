@@ -21,9 +21,10 @@ use std::{
 };
 
 use object::SectionIndex;
+use pretty_assertions::assert_eq;
 
 use super::*;
-use crate::object::FunctionSignature;
+use crate::{object::FunctionSignature, verifier::event::PayloadSlot};
 
 /// Owned copy of [`VerifierEvent`], produced by deserializing the event's
 /// serialized form. Variant and field names must match the wire format.
@@ -37,15 +38,27 @@ enum RecordedEvent {
     },
     BranchEnter {
         depth: usize,
+        id: usize,
         target_pc: usize,
-        decision: BranchDecision,
-        refined: Option<(u8, RegisterState)>,
+        kind: WalkOrigin,
+    },
+    BranchDead {
+        depth: usize,
+        target_pc: usize,
+        kind: WalkOrigin,
+    },
+    StatePruned {
+        depth: usize,
+        fork_pc: usize,
+        matched: usize,
+        site: PruneSite,
     },
     BranchExit {
         depth: usize,
     },
     CallEnter {
         depth: usize,
+        id: usize,
         target_pc: usize,
         name: String,
         btf_id: Option<BtfTypeId>,
@@ -94,9 +107,17 @@ enum Expect {
     },
     Branch {
         target_pc: usize,
-        decision: BranchDecision,
-        refined: Option<(u8, RegisterState)>,
+        kind: WalkOrigin,
         body: Vec<Expect>,
+    },
+    Dead {
+        target_pc: usize,
+        kind: WalkOrigin,
+    },
+    StatePruned {
+        fork_pc: usize,
+        matched: usize,
+        site: PruneSite,
     },
     Subprog {
         target_pc: usize,
@@ -113,17 +134,22 @@ enum Expect {
 fn walk<const N: usize>(r0: RegisterState, body: [Expect; N]) -> Vec<RecordedEvent> {
     let mut events = vec![RecordedEvent::CallEnter {
         depth: 0,
+        id: 0,
         target_pc: 0,
         name: String::new(),
         btf_id: None,
         registers: entry_registers(),
     }];
-    flatten(body.into(), 0, &mut events);
+    let mut next_id = 1;
+    flatten(body.into(), 0, &mut next_id, &mut events);
     events.push(RecordedEvent::CallExit { depth: 0, r0 });
     events
 }
 
-fn flatten(body: Vec<Expect>, depth: usize, out: &mut Vec<RecordedEvent>) {
+/// Walk ids are drawn from a counter as forks are created, matching the
+/// verifier's [`Verifier::fork_at`]. A pruned arm is still a fork, so it draws
+/// an id even though it never enters; a dead arm is not a fork and draws none.
+fn flatten(body: Vec<Expect>, depth: usize, next_id: &mut usize, out: &mut Vec<RecordedEvent>) {
     for node in body {
         match node {
             Expect::Insn { pc, read, written } => out.push(RecordedEvent::Insn {
@@ -134,18 +160,39 @@ fn flatten(body: Vec<Expect>, depth: usize, out: &mut Vec<RecordedEvent>) {
             }),
             Expect::Branch {
                 target_pc,
-                decision,
-                refined,
+                kind,
                 body,
             } => {
+                let id = *next_id;
+                *next_id += 1;
                 out.push(RecordedEvent::BranchEnter {
                     depth: depth + 1,
+                    id,
                     target_pc,
-                    decision,
-                    refined,
+                    kind,
                 });
-                flatten(body, depth + 1, out);
+                flatten(body, depth + 1, next_id, out);
                 out.push(RecordedEvent::BranchExit { depth: depth + 1 });
+            }
+            Expect::Dead { target_pc, kind } => out.push(RecordedEvent::BranchDead {
+                depth: depth + 1,
+                target_pc,
+                kind,
+            }),
+            Expect::StatePruned {
+                fork_pc,
+                matched,
+                site,
+            } => {
+                // A pruned arm is still a fork, so it drew an id from the
+                // counter before it was cut, even though it emits no enter.
+                *next_id += 1;
+                out.push(RecordedEvent::StatePruned {
+                    depth: depth + 1,
+                    fork_pc,
+                    matched,
+                    site,
+                });
             }
             Expect::Subprog {
                 target_pc,
@@ -154,14 +201,17 @@ fn flatten(body: Vec<Expect>, depth: usize, out: &mut Vec<RecordedEvent>) {
                 r0,
                 body,
             } => {
+                let id = *next_id;
+                *next_id += 1;
                 out.push(RecordedEvent::CallEnter {
                     depth: depth + 1,
+                    id,
                     target_pc,
                     name,
                     btf_id,
                     registers: entry_registers(),
                 });
-                flatten(body, depth + 1, out);
+                flatten(body, depth + 1, next_id, out);
                 out.push(RecordedEvent::CallExit {
                     depth: depth + 1,
                     r0,
@@ -216,18 +266,6 @@ macro_rules! refined {
     };
 }
 
-macro_rules! decision {
-    (both) => {
-        BranchDecision::Both
-    };
-    (skip_branch) => {
-        BranchDecision::SkipBranch
-    };
-    (skip_fallthrough) => {
-        BranchDecision::SkipFallthrough
-    };
-}
-
 macro_rules! btf_id {
     () => {
         None
@@ -249,15 +287,65 @@ macro_rules! insn {
     };
 }
 
-/// `branch!(target_pc, decision, refine rN = state, [body])` where decision
-/// is `both`, `skip_branch` or `skip_fallthrough` and `refine` is optional.
+/// `branch!(fork_pc, target_pc, refine rN = state, [body])` for a walked
+/// branch arm, with `refine` optional. `fork_pc` is the jump that spawned it.
+/// Use [`fallthrough!`] for the fall-through arm, [`dead!`] for a ruled-out
+/// arm, and [`pruned!`] when a walk stops on an already-visited state.
 macro_rules! branch {
-    ($target:literal, $decision:ident $(, refine $r:ident = $v:expr)?, [$($body:expr),* $(,)?]) => {
+    ($base:literal, $target:literal $(, refine $r:ident = $v:expr)?, [$($body:expr),* $(,)?]) => {
         Expect::Branch {
             target_pc: $target,
-            decision: decision!($decision),
-            refined: refined!($($r = $v)?),
+            kind: WalkOrigin::Branch { refined: refined!($($r = $v)?), fork_pc: $base },
             body: vec![$($body),*],
+        }
+    };
+}
+
+/// `fallthrough!(fork_pc, target_pc, refine rN = state, [body])`, the
+/// fall-through counterpart to [`branch!`].
+macro_rules! fallthrough {
+    ($base:literal, $target:literal $(, refine $r:ident = $v:expr)?, [$($body:expr),* $(,)?]) => {
+        Expect::Branch {
+            target_pc: $target,
+            kind: WalkOrigin::Fallthrough { refined: refined!($($r = $v)?), fork_pc: $base },
+            body: vec![$($body),*],
+        }
+    };
+}
+
+/// `dead!(fork_pc, target_pc, branch|fallthrough [refine rN = state])` for an
+/// arm the comparison ruled out. `fork_pc` is shared with its live siblings.
+macro_rules! dead {
+    ($base:literal, $target:literal, branch $(, refine $r:ident = $v:expr)?) => {
+        Expect::Dead {
+            target_pc: $target,
+            kind: WalkOrigin::Branch { refined: refined!($($r = $v)?), fork_pc: $base },
+        }
+    };
+    ($base:literal, $target:literal, fallthrough $(, refine $r:ident = $v:expr)?) => {
+        Expect::Dead {
+            target_pc: $target,
+            kind: WalkOrigin::Fallthrough { refined: refined!($($r = $v)?), fork_pc: $base },
+        }
+    };
+}
+
+/// `pruned!(fork_pc, matched, jump|arm)` for a walk that stops because walker
+/// `matched` already covered its state at `fork_pc`. `jump` means `matched`
+/// branched there, `arm` means `matched` entered there.
+macro_rules! pruned {
+    ($base:literal, $matched:literal, jump) => {
+        Expect::StatePruned {
+            fork_pc: $base,
+            matched: $matched,
+            site: PruneSite::Jump,
+        }
+    };
+    ($base:literal, $matched:literal, arm) => {
+        Expect::StatePruned {
+            fork_pc: $base,
+            matched: $matched,
+            site: PruneSite::Arm,
         }
     };
 }
@@ -360,6 +448,10 @@ fn alu64_reg(op: u8, dst: u8, src: u8) -> Insn {
 
 fn jeq_imm(dst: u8, imm: i32, offset: i16) -> Insn {
     encode(BPF_JMP | BPF_JEQ | BPF_K, dst, 0, offset, imm)
+}
+
+fn jne_imm(dst: u8, imm: i32, offset: i16) -> Insn {
+    encode(BPF_JMP | BPF_JNE | BPF_K, dst, 0, offset, imm)
 }
 
 fn ja(offset: i16) -> Insn {
@@ -477,11 +569,11 @@ fn unknown_compare_walks_both_arms() {
                 insn!(0, write r1 = exact(0)),
                 insn!(1, read r1, write r1 = unknown()),
                 insn!(2, read r1),
-                branch!(5, both, refine r1 = exact(5), [
+                branch!(2, 5, refine r1 = exact(5), [
                     insn!(5, write r0 = exact(1)),
                     insn!(6, read r0),
                 ]),
-                branch!(3, both, refine r1 = full64(), [
+                fallthrough!(2, 3, refine r1 = full64(), [
                     insn!(3, write r0 = exact(0)),
                     insn!(4, read r0),
                 ]),
@@ -509,7 +601,8 @@ fn known_true_compare_skips_fallthrough() {
                 insn!(0, write r0 = exact(0)),
                 insn!(1, write r1 = exact(5)),
                 insn!(2, read r1),
-                branch!(4, skip_fallthrough, [insn!(4, read r0)]),
+                branch!(2, 4, [insn!(4, read r0)]),
+                dead!(2, 3, fallthrough),
             ]
         )
     );
@@ -534,7 +627,8 @@ fn known_false_compare_skips_branch() {
                 insn!(0, write r0 = exact(0)),
                 insn!(1, write r1 = exact(4)),
                 insn!(2, read r1),
-                branch!(3, skip_branch, [insn!(3, read r0)]),
+                dead!(2, 4, branch),
+                fallthrough!(2, 3, [insn!(3, read r0)]),
             ]
         )
     );
@@ -552,7 +646,47 @@ fn unconditional_jump_forks_with_skip_fallthrough() {
             [
                 insn!(0, write r0 = exact(0)),
                 insn!(1),
-                branch!(3, skip_fallthrough, [insn!(3, read r0)]),
+                branch!(1, 3, [insn!(3, read r0)]),
+                dead!(1, 2, fallthrough),
+            ]
+        )
+    );
+}
+
+// Two conditional jumps target the same exit, so the second reaches an arm's
+// own entry snapshot rather than a shared branch jump. The first jump's arm
+// (id 1) records the state at pc4, the second is pruned against it with
+// `site=Arm` and `matched=1`, meaning `matched` is that arm directly and
+// `fork_pc` (4) is its target, not a jump the arms hang off.
+#[test]
+fn state_pruned_matches_an_arm_on_a_shared_jump_target() {
+    let (result, events) = verify(vec![
+        helper_call(7),   // pc0: r0 = prandom (unknown)
+        jne_imm(0, 0, 2), // pc1: if r0 != 0 goto pc4
+        helper_call(7),   // pc2: r0 = prandom (unknown)
+        jne_imm(0, 0, 0), // pc3: if r0 != 0 goto pc4
+        exit(),           // pc4
+    ]);
+
+    assert_eq!(result.expect("must verify").r0, exact(0));
+    assert_eq!(
+        events,
+        walk(
+            exact(0),
+            [
+                insn!(0, write r0 = unknown()),
+                insn!(1, read r0),
+                branch!(1, 4, refine r0 = scalar64(1, u64::MAX, 1), [
+                    insn!(4, read r0),
+                ]),
+                fallthrough!(1, 2, refine r0 = exact(0), [
+                    insn!(2, write r0 = unknown()),
+                    insn!(3, read r0),
+                    pruned!(4, 1, arm),
+                    fallthrough!(3, 4, refine r0 = exact(0), [
+                        insn!(4, read r0),
+                    ]),
+                ]),
             ]
         )
     );

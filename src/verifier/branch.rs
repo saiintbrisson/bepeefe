@@ -32,14 +32,21 @@ pub(super) struct BranchResult {
 }
 
 impl BranchResult {
-    fn skip_branch() -> Self {
+    pub fn both() -> Self {
+        Self {
+            decision: BranchDecision::Both,
+            ..Default::default()
+        }
+    }
+
+    pub fn skip_branch() -> Self {
         Self {
             decision: BranchDecision::SkipBranch,
             ..Self::default()
         }
     }
 
-    fn skip_fallthrough() -> Self {
+    pub fn skip_fallthrough() -> Self {
         Self {
             decision: BranchDecision::SkipFallthrough,
             ..Self::default()

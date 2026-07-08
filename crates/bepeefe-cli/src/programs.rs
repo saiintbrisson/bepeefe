@@ -1,11 +1,16 @@
 //! The `programs` subcommand. Listing, inspecting, and disassembling.
 
+use std::sync::Arc;
+
 use bepeefe::{
     EbpfObject,
     btf::Btf,
+    capture::{Capture, Event},
     hook::{Attach, Hook},
     isa::Insn,
     object::FunctionSignature,
+    verifier::{VerifierConfig, VerifierEvent},
+    vm::{MapReuseStrategy, Vm},
 };
 use tabled::Tabled;
 
@@ -90,7 +95,8 @@ pub fn show(obj: &EbpfObject, name: &str) -> Result<(), Box<dyn std::error::Erro
         prog.section_offset
     );
     crate::hint(&format!(
-        "next:  programs {name} dump   disassemble (--src for source)"
+        "next:  programs {name} dump     disassemble (--src for source)\n\
+         \x20      programs {name} verify   stream verifier events"
     ));
     Ok(())
 }
@@ -126,6 +132,105 @@ pub fn disasm(obj: &EbpfObject, name: &str, src: bool) -> Result<(), Box<dyn std
         pc += if insn.is_ld_imm64() { 2 } else { 1 };
     }
     Ok(())
+}
+
+pub fn verify(
+    obj: &EbpfObject,
+    name: &str,
+    events: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let prog = obj.load_prog(name)?;
+    let vm = Vm::new();
+    let config = VerifierConfig {
+        capture: events.then(|| Arc::new(EventLines) as Arc<dyn Capture>),
+        ..Default::default()
+    };
+    if let Err(e) = vm.prepare(prog, MapReuseStrategy::None, &config) {
+        eprint!("{}", e.report());
+    }
+    Ok(())
+}
+
+/// Prints each verifier event on its own line, nested by walk depth so the
+/// branch tree reads top to bottom.
+struct EventLines;
+
+impl Capture for EventLines {
+    fn record(&self, event: Event<'_>) {
+        let Event::Verifier(event) = event else {
+            return;
+        };
+        println!("{}", event_line(&event));
+    }
+}
+
+fn event_line(event: &VerifierEvent<'_>) -> String {
+    let pad = |depth: usize| "  ".repeat(depth);
+    match event {
+        VerifierEvent::Insn {
+            depth,
+            pc,
+            read,
+            written,
+        } => {
+            let writes = written
+                .iter()
+                .map(|(reg, state)| format!("r{reg}={state:?}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{}insn pc={pc} read={read:?} write=[{writes}]", pad(*depth))
+        }
+        VerifierEvent::BranchEnter {
+            depth,
+            id,
+            target_pc,
+            kind,
+        } => format!(
+            "{}branch-enter id={id} target={target_pc} kind={kind:?}",
+            pad(*depth)
+        ),
+        VerifierEvent::BranchDead {
+            depth,
+            target_pc,
+            kind,
+        } => format!(
+            "{}branch-dead target={target_pc} kind={kind:?}",
+            pad(*depth)
+        ),
+        VerifierEvent::StatePruned {
+            depth,
+            fork_pc,
+            matched,
+            site,
+        } => format!(
+            "{}state-pruned fork={fork_pc} matched={matched} site={site:?}",
+            pad(*depth)
+        ),
+        VerifierEvent::BranchExit { depth } => format!("{}branch-exit", pad(*depth)),
+        VerifierEvent::CallEnter {
+            depth,
+            id,
+            target_pc,
+            name,
+            btf_id,
+            ..
+        } => format!(
+            "{}call-enter id={id} target={target_pc} name={name:?} btf={btf_id:?}",
+            pad(*depth)
+        ),
+        VerifierEvent::CallExit { depth, r0 } => format!("{}call-exit r0={r0:?}", pad(*depth)),
+        VerifierEvent::PerfEventLayout {
+            depth,
+            pc,
+            map_fd,
+            size,
+            ..
+        } => format!(
+            "{}perf-layout pc={pc} map_fd={map_fd} size={size:?}",
+            pad(*depth)
+        ),
+        VerifierEvent::Warning { pc, message } => format!("warning pc={pc} {message}"),
+    }
 }
 
 fn print_function(btf: &Btf, f: &FunctionSignature) {

@@ -31,6 +31,7 @@ Examples:
   bepeefe-cli obj.o programs            list programs
   bepeefe-cli obj.o programs foo        inspect program `foo`
   bepeefe-cli obj.o programs foo dump   disassemble it (--src for source)
+  bepeefe-cli obj.o programs foo verify stream the verifier's events
   bepeefe-cli obj.o maps                list maps
   bepeefe-cli obj.o maps backends       inspect map `backends`
   bepeefe-cli obj.o btf                 list named btf types
@@ -81,6 +82,17 @@ enum ProgAction {
         #[arg(long)]
         src: bool,
     },
+    /// Verify the program, streaming each verifier event on its own line.
+    Verify {
+        /// Print events emitted by the verifier:
+        /// * Per-instruction register access,
+        /// * Branch enter/exit,
+        /// * Pruned states,
+        /// * BPF-to-BPF calls,
+        /// * Perf event layout.
+        #[arg(long)]
+        events: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -115,6 +127,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             name: Some(n),
             action: Some(ProgAction::Dump { src }),
         }) => programs::disasm(&obj, &n, src)?,
+        Some(Cmd::Programs {
+            name: Some(n),
+            action: Some(ProgAction::Verify { events }),
+        }) => programs::verify(&obj, &n, events)?,
         Some(Cmd::Maps { name: None }) => maps::list(&obj),
         Some(Cmd::Maps { name: Some(n) }) => maps::show(&obj, &n)?,
         Some(Cmd::Btf {
