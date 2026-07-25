@@ -99,16 +99,6 @@ pub fn describe(opcode: u8) -> InsnKind {
     }
 }
 
-/// eBPF prints ALU32 and JMP32 operands as 32-bit subregisters (`wN`),
-/// everything else as full 64-bit registers (`rN`). The width lives in the
-/// opcode class.
-fn reg_prefix(opcode: u8) -> &'static str {
-    match opcode & 0b111 {
-        crate::isa::BPF_ALU32 | crate::isa::BPF_JMP32 => "w",
-        _ => "r",
-    }
-}
-
 fn fmt_offset(off: i16) -> String {
     if off >= 0 {
         format!("+ 0x{:X}", off)
@@ -146,7 +136,7 @@ pub fn disasm(insn: Insn, next: Option<Insn>) -> String {
     let src = insn.src_reg();
     let imm = insn.imm();
     let off = insn.offset();
-    let r = reg_prefix(insn.opcode());
+    let r = insn.width().reg_prefix();
 
     match describe(insn.opcode()) {
         InsnKind::AluSrc(op) => format!("{r}{} = {r}{} {} {r}{}", dst, dst, op, src),
@@ -204,7 +194,7 @@ pub fn disasm_brief(insn: Insn, next: Option<Insn>) -> String {
     let src = insn.src_reg();
     let imm = insn.imm();
     let off = insn.offset();
-    let r = reg_prefix(insn.opcode());
+    let r = insn.width().reg_prefix();
 
     match describe(insn.opcode()) {
         InsnKind::AluSrc(op) => format!("{r}{} {} {r}{}", dst, op, src),
@@ -246,7 +236,7 @@ pub fn debugger(state: &crate::vm::Cpu, insn: Insn) -> String {
     let dst_val = state.reg(dst);
     let src_val = state.reg(src);
     let next = state.insn_at(state.pc());
-    let r = reg_prefix(insn.opcode());
+    let r = insn.width().reg_prefix();
 
     let brief = disasm_brief(insn, next);
     let ann = if brief.is_empty() {

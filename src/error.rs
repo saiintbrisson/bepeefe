@@ -46,7 +46,7 @@ pub enum LoaderError {
     /// Catch-all for inputs that are structurally invalid in ways that
     /// don't have a more specific variant: wrong BTF kind at a position,
     /// dangling subprogram references, instruction streams that aren't a
-    /// multiple of `Insn::WIDTH`, etc.
+    /// multiple of `Insn::BYTES`, etc.
     #[error("malformed object: {0}")]
     Malformed(String),
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use super::{MapReuseStrategy, PreparedProgram, Vm};
 use crate::{
     error::PrepareError,
-    isa::load::{BPF_PSEUDO_MAP_FD, BPF_PSEUDO_MAP_VALUE},
+    isa::mem::{BPF_PSEUDO_MAP_FD, BPF_PSEUDO_MAP_VALUE},
     maps::{BpfMap, MapPinning, MapRepr},
     object::{Deferred, EbpfProgram},
     verifier::{Verifier, VerifierConfig},

@@ -91,7 +91,7 @@ pub fn show(obj: &EbpfObject, name: &str) -> Result<(), Box<dyn std::error::Erro
     }
     println!(
         "insns:     {} (section offset {})",
-        prog.size / Insn::WIDTH,
+        prog.size / Insn::BYTES,
         prog.section_offset
     );
     crate::hint(&format!(

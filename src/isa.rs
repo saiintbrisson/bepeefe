@@ -22,62 +22,15 @@ pub const BPF_ALU64: u8 = 0x07;
 
 pub mod alu;
 pub mod dump;
+pub mod insn;
 pub mod jmp;
-pub mod load;
+pub mod mem;
 
 use alu::*;
 use jmp::*;
-use load::*;
+use mem::*;
 
-#[derive(Clone, Copy, Debug)]
-#[repr(transparent)]
-pub struct Insn(pub u64);
-
-impl Insn {
-    pub const WIDTH: usize = size_of::<Self>();
-
-    #[inline(always)]
-    pub fn opcode(&self) -> u8 {
-        (self.0 & 0xFF) as u8
-    }
-    #[inline(always)]
-    pub fn dst_reg(&self) -> u8 {
-        (self.0 >> 8) as u8 & 0xF
-    }
-    #[inline(always)]
-    pub fn src_reg(&self) -> u8 {
-        (self.0 >> 12) as u8 & 0xF
-    }
-    #[inline(always)]
-    pub fn imm(&self) -> i32 {
-        (self.0 >> 32) as i32
-    }
-    #[inline(always)]
-    pub fn offset(&self) -> i16 {
-        (self.0 >> 16) as i16
-    }
-
-    pub fn class(&self) -> u8 {
-        self.opcode() & 0b111
-    }
-
-    pub fn with_src_reg(&mut self, src_reg: u8) {
-        self.0 = (self.0 & !(0xF << 12)) | ((src_reg as u64 & 0xF) << 12);
-    }
-    pub fn with_imm(&mut self, imm: i32) {
-        self.0 = (self.0 << 32 >> 32) | ((imm as u64) << 32);
-    }
-
-    pub fn is_call(&self) -> bool {
-        self.opcode() == BPF_JMP | BPF_CALL | BPF_K
-    }
-    pub fn is_subprog_call(&self) -> bool {
-        self.is_call() && self.src_reg() == 1 && self.dst_reg() == 0 && self.offset() == 0
-    }
-    pub fn is_ld_imm64(&self) -> bool {
-        self.opcode() == BPF_LD | MODE_IMM | SIZE_DW
-    }
-}
+pub use insn::*;
 
 fn noop(_: &mut crate::vm::Cpu, _: Insn) {}
 

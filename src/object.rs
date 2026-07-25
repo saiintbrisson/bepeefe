@@ -17,7 +17,7 @@ use crate::{
     hook::Hook,
     isa::{
         Insn,
-        load::{BPF_PSEUDO_MAP_FD, BPF_PSEUDO_MAP_VALUE},
+        mem::{BPF_PSEUDO_MAP_FD, BPF_PSEUDO_MAP_VALUE},
     },
     maps::{BPF_MAP_TYPE_ARRAY, MapPinning, MapSpec},
 };
@@ -245,7 +245,7 @@ impl ProgLoader {
                     func.name
                 ))
             })?
-            .as_chunks::<{ Insn::WIDTH }>();
+            .as_chunks::<{ Insn::BYTES }>();
 
         self.insns.reserve(chunks.len());
         self.loaded_progs.push(LoadedSubprog {
@@ -274,7 +274,7 @@ impl ProgLoader {
                 Some((_, rel)) if insn.is_ld_imm64() => self.relos.push((flat_pc, rel)),
 
                 None if insn.is_subprog_call() => {
-                    let target_off = sec_off + (insn.imm() as usize + 1) * Insn::WIDTH;
+                    let target_off = sec_off + (insn.imm() as usize + 1) * Insn::BYTES;
                     self.ensure_subprog_loaded(
                         obj,
                         func.section_idx,
@@ -286,7 +286,7 @@ impl ProgLoader {
                 _ => {}
             }
 
-            sec_off += Insn::WIDTH;
+            sec_off += Insn::BYTES;
         }
 
         Ok(())
@@ -462,7 +462,7 @@ impl ProgLoader {
                     continue;
                 };
 
-                let pc = dst_off + (insn_off - sec_off) / Insn::WIDTH;
+                let pc = dst_off + (insn_off - sec_off) / Insn::BYTES;
                 line_info.insert(
                     pc,
                     LineEntry {
@@ -769,7 +769,7 @@ fn collect_functions<'file>(
     for info in &btf.ext.func_info {
         let sec_name = name(info.sec_name_off)?;
         for func in &info.data {
-            let section_offset = func.insn_off as usize * Insn::WIDTH;
+            let section_offset = func.insn_off as usize * Insn::BYTES;
             let func_btf_id = func.type_id;
             let func = btf.resolve_must(func.type_id).ty();
             let func_name = name(func.name_off)?;
@@ -832,10 +832,10 @@ fn collect_functions<'file>(
                 ))
             })?;
 
-            if !insns.len().is_multiple_of(Insn::WIDTH) {
+            if !insns.len().is_multiple_of(Insn::BYTES) {
                 return Err(LoaderError::Malformed(format!(
                     "program {prog_name:?} byte length is not a multiple of {}",
-                    Insn::WIDTH
+                    Insn::BYTES
                 )));
             }
 

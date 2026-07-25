@@ -17,7 +17,7 @@ use crate::{
     btf::{Btf, BtfKind, BtfTypeId},
     capture::{Capture, Event},
     hook::ProgType,
-    isa::{alu::*, jmp::*, load::*, *},
+    isa::{alu::*, jmp::*, mem::*, *},
     object::EbpfProgram,
     verifier::branch::BranchResult,
     vm::{MAX_CALL_FRAMES, STACK_SIZE, Vm, helpers},
