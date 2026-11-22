@@ -1,8 +1,9 @@
 use crate::vm::{
     World,
-    cpu::Cpu,
     ptr::{TaggedPtr, TaggetPtrType},
 };
+
+use super::args::{Call, Out};
 
 /// Linux `-EFAULT`. Returned when the source pointer can't be read.
 const E_FAULT: i64 = -14;
@@ -45,53 +46,41 @@ fn read_str(world: &World, space: TaggetPtrType, src: u64, cap: usize) -> Option
     Some(out)
 }
 
-/// `bpf_probe_read_{kernel,user}`. Copies `size` bytes from `src` into
-/// `dst`. On fault, zeroes `dst` and returns `-EFAULT`, matching Linux.
-pub(crate) fn probe_read(
-    state: &mut Cpu,
-    space: TaggetPtrType,
-    dst: u64,
-    size: u32,
-    src: u64,
-) -> i64 {
-    let len = size as usize;
-    let bytes = read_at(&state.world(), space, src, len);
+/// `bpf_probe_read_{kernel,user}`. Fills `dst` from `src`. On fault,
+/// zeroes `dst` and returns `-EFAULT`, matching Linux.
+pub(crate) fn probe_read(cx: &mut Call<'_>, space: TaggetPtrType, dst: &Out, src: u64) -> i64 {
+    let len = dst.size();
+    let bytes = read_at(&cx.world(), space, src, len);
     match bytes {
         Some(bytes) => {
-            state.write(dst, &bytes);
+            cx.write(dst, &bytes);
             0
         }
         None => {
-            state.write(dst, &vec![0u8; len]);
+            cx.write(dst, &vec![0u8; len]);
             E_FAULT
         }
     }
 }
 
-/// `bpf_probe_read_{kernel,user}_str`. Copies up to `size - 1` bytes
-/// from `src` into `dst`, stopping at the first NUL, then writes a
+/// `bpf_probe_read_{kernel,user}_str`. Copies up to `dst.size() - 1`
+/// bytes from `src` into `dst`, stopping at the first NUL, then writes a
 /// terminating NUL. Returns the number of bytes written including the
 /// NUL, or `-EFAULT` on fault (with `dst` zeroed).
-pub(crate) fn probe_read_str(
-    state: &mut Cpu,
-    space: TaggetPtrType,
-    dst: u64,
-    size: u32,
-    src: u64,
-) -> i64 {
+pub(crate) fn probe_read_str(cx: &mut Call<'_>, space: TaggetPtrType, dst: &Out, src: u64) -> i64 {
+    let size = dst.size();
     if size == 0 {
         return 0;
     }
-    let cap = (size as usize).min(STR_CAP);
-    let bytes = read_str(&state.world(), space, src, cap);
+    let bytes = read_str(&cx.world(), space, src, size.min(STR_CAP));
     match bytes {
         Some(bytes) => {
             let n = bytes.len() as i64;
-            state.write(dst, &bytes);
+            cx.write(dst, &bytes);
             n
         }
         None => {
-            state.write(dst, &vec![0u8; size as usize]);
+            cx.write(dst, &vec![0u8; size]);
             E_FAULT
         }
     }

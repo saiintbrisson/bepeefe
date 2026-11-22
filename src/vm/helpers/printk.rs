@@ -1,36 +1,21 @@
 use std::ffi::CStr;
 
-use crate::isa::Insn;
-use crate::verifier::{RegisterState, Scalar};
-use crate::vm::{Cpu, Vm};
-
-use super::{ArgRegs, BpfHelper};
+use super::BpfHelper;
+use super::args::{Call, In, Raw};
 
 pub struct TracePrintk;
 impl TracePrintk {
     pub const ID: i32 = 6;
 }
 impl BpfHelper for TracePrintk {
+    type Args = (In, Raw, Raw, Raw);
+
     fn name(&self) -> &'static str {
         "bpf_trace_printk"
     }
 
-    fn exec(&self, state: &mut Cpu, _: Insn) {
-        state.set_reg(0, bpf_trace_printk(state));
-    }
-
-    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
-        Ok(RegisterState::Scalar(Scalar::Unknown))
-    }
-
-    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
-        if !regs.get(1).is_pointer() {
-            return Err("trace_printk: R1 must be a valid pointer");
-        }
-        if !regs.get(2).is_scalar() {
-            return Err("trace_printk: R2 must be a scalar");
-        }
-        Ok(())
+    fn exec(&self, cx: &mut Call<'_>, (fmt, a, b, c): Self::Args) -> u64 {
+        bpf_trace_printk(cx, &fmt.0, [a.0, b.0, c.0])
     }
 }
 
@@ -50,17 +35,13 @@ impl BpfHelper for TracePrintk {
 /// > encounters an unknown specifier.
 ///
 /// Ref: <https://github.com/torvalds/linux/blob/f406055cb18c6e299c4a783fc1effeb16be41803/include/uapi/linux/bpf.h#L1961>
-fn bpf_trace_printk(state: &Cpu) -> u64 {
+fn bpf_trace_printk(cx: &Call<'_>, data: &[u8], params: [u64; 3]) -> u64 {
     enum FmtState {
         WaitingNext(Option<Vec<u8>>),
         Formatting(Vec<u8>),
     }
 
-    let addr = state.reg(1);
-    let len = state.reg(2) as usize;
-    let data = state.read_bytes(addr, len);
-
-    let Ok(s) = CStr::from_bytes_until_nul(&data) else {
+    let Ok(s) = CStr::from_bytes_until_nul(data) else {
         return -22i64 as u64;
     };
     let Ok(s) = s.to_str() else {
@@ -78,13 +59,15 @@ fn bpf_trace_printk(state: &Cpu) -> u64 {
                 return -22i64 as u64;
             }
 
-            let param = state.reg(2 + arg_count as u8);
+            let Some(&param) = params.get(arg_count - 1) else {
+                return -22i64 as u64;
+            };
             match c {
                 'd' => {
                     buf.extend(param.to_string().as_bytes());
                 }
                 's' => {
-                    let data = state.try_buf(param).unwrap_or(&[0]);
+                    let data = cx.local_tail(param).unwrap_or(&[0]);
                     let Ok(s) = CStr::from_bytes_until_nul(data) else {
                         return -22i64 as u64;
                     };
@@ -129,7 +112,7 @@ fn bpf_trace_printk(state: &Cpu) -> u64 {
 
     let len = s.len() as u64;
 
-    if let Some(capture) = state.capture() {
+    if let Some(capture) = cx.capture() {
         capture.record(crate::capture::Event::Print(s));
     }
 

@@ -131,6 +131,7 @@ impl Value {
             BtfKind::Array(arr) => from::array(arr, ty, bytes),
             BtfKind::Datasec(_) => from::datasec(bytes),
             BtfKind::Struct(s) => from::strct(s, ty, bytes),
+            BtfKind::Ptr(_) => from::scalar(8, ty, bytes).map(Value::Number),
             _ => Err(ValueError::UnsupportedKind(ty.kind().into(), ty.id())),
         }
     }

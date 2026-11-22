@@ -1,4 +1,5 @@
 mod alu;
+mod helper;
 mod mem;
 
 use super::*;
@@ -230,17 +231,14 @@ impl<'v, 'a> Walk<'v, 'a> {
             Some(CallKind::Helper(id)) => {
                 let helper = helpers::lookup(id)
                     .ok_or_else(|| self.err("BPF_HELPER_CALL refers to invalid helper ID"))?;
-                let args = self.arg_regs();
-                helper
-                    .params(self.verifier().vm, args, *insn)
-                    .map_err(|_| self.err("helper parameter validation failed"))?;
+                self.check_helper_args(helper.sig())?;
 
                 if id == helpers::PerfEventOutput::ID {
                     self.record_perf_event_layout();
                 }
 
                 let retval = helper
-                    .retval(self.verifier().vm, args, *insn)
+                    .retval(self.verifier().vm, self.arg_regs())
                     .map_err(|msg| self.err(msg))?;
                 self.set_reg(0, retval);
             }

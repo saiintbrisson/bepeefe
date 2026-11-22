@@ -152,7 +152,7 @@ pub fn jmp_call(state: &mut crate::vm::Cpu, insn: Insn) {
         BPF_PSEUDO_CALL => state.call(insn.imm()),
         BPF_HELPER_CALL => {
             if let Some(helper) = helpers::lookup(insn.imm()) {
-                helper.exec(state, insn)
+                helper.exec(state)
             }
         }
         #[expect(

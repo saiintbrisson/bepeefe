@@ -1,57 +1,25 @@
-use crate::isa::Insn;
-use crate::verifier::{RegisterState, Scalar};
 use crate::vm::ptr::TaggetPtrType;
-use crate::vm::{Cpu, Vm};
 
-use super::{ArgRegs, BpfHelper, probe_ops};
+use super::args::{Any, Call, Out};
+use super::{BpfHelper, probe_ops};
 
-/// Shared params validator. R3 is `ARG_ANYTHING` in Linux: any source
-/// value is accepted, with faults surfaced at runtime as `-EFAULT`.
-fn probe_params(regs: ArgRegs) -> Result<(), &'static str> {
-    if !regs.get(1).is_pointer() {
-        return Err("probe_read: R1 must be a valid pointer");
-    }
-    if !regs.get(2).is_scalar() {
-        return Err("probe_read: R2 must be a scalar");
-    }
-    Ok(())
-}
-
-fn run_probe_read(state: &mut Cpu, space: TaggetPtrType) {
-    let dst = state.reg(1);
-    let size = state.reg(2) as u32;
-    let src = state.reg(3);
-    let r = probe_ops::probe_read(state, space, dst, size, src);
-    state.set_reg(0, r as u64);
-}
-
-fn run_probe_read_str(state: &mut Cpu, space: TaggetPtrType) {
-    let dst = state.reg(1);
-    let size = state.reg(2) as u32;
-    let src = state.reg(3);
-    let r = probe_ops::probe_read_str(state, space, dst, size, src);
-    state.set_reg(0, r as u64);
-}
+/// R3 is `ARG_ANYTHING` in Linux: any source value is accepted, with faults
+/// surfaced at runtime as `-EFAULT`.
+type ProbeArgs = (Out, Any);
 
 pub struct ProbeReadUser;
 impl ProbeReadUser {
     pub const ID: i32 = 112;
 }
 impl BpfHelper for ProbeReadUser {
+    type Args = ProbeArgs;
+
     fn name(&self) -> &'static str {
         "bpf_probe_read_user"
     }
 
-    fn exec(&self, state: &mut Cpu, _: Insn) {
-        run_probe_read(state, TaggetPtrType::User);
-    }
-
-    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
-        Ok(RegisterState::Scalar(Scalar::Unknown))
-    }
-
-    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
-        probe_params(regs)
+    fn exec(&self, cx: &mut Call<'_>, (dst, src): Self::Args) -> u64 {
+        probe_ops::probe_read(cx, TaggetPtrType::User, &dst, src.0) as u64
     }
 }
 
@@ -60,20 +28,14 @@ impl ProbeReadKernel {
     pub const ID: i32 = 113;
 }
 impl BpfHelper for ProbeReadKernel {
+    type Args = ProbeArgs;
+
     fn name(&self) -> &'static str {
         "bpf_probe_read_kernel"
     }
 
-    fn exec(&self, state: &mut Cpu, _: Insn) {
-        run_probe_read(state, TaggetPtrType::Kernel);
-    }
-
-    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
-        Ok(RegisterState::Scalar(Scalar::Unknown))
-    }
-
-    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
-        probe_params(regs)
+    fn exec(&self, cx: &mut Call<'_>, (dst, src): Self::Args) -> u64 {
+        probe_ops::probe_read(cx, TaggetPtrType::Kernel, &dst, src.0) as u64
     }
 }
 
@@ -82,20 +44,14 @@ impl ProbeReadUserStr {
     pub const ID: i32 = 114;
 }
 impl BpfHelper for ProbeReadUserStr {
+    type Args = ProbeArgs;
+
     fn name(&self) -> &'static str {
         "bpf_probe_read_user_str"
     }
 
-    fn exec(&self, state: &mut Cpu, _: Insn) {
-        run_probe_read_str(state, TaggetPtrType::User);
-    }
-
-    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
-        Ok(RegisterState::Scalar(Scalar::Unknown))
-    }
-
-    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
-        probe_params(regs)
+    fn exec(&self, cx: &mut Call<'_>, (dst, src): Self::Args) -> u64 {
+        probe_ops::probe_read_str(cx, TaggetPtrType::User, &dst, src.0) as u64
     }
 }
 
@@ -104,19 +60,13 @@ impl ProbeReadKernelStr {
     pub const ID: i32 = 115;
 }
 impl BpfHelper for ProbeReadKernelStr {
+    type Args = ProbeArgs;
+
     fn name(&self) -> &'static str {
         "bpf_probe_read_kernel_str"
     }
 
-    fn exec(&self, state: &mut Cpu, _: Insn) {
-        run_probe_read_str(state, TaggetPtrType::Kernel);
-    }
-
-    fn retval(&self, _: &Vm, _: ArgRegs, _: Insn) -> Result<RegisterState, &'static str> {
-        Ok(RegisterState::Scalar(Scalar::Unknown))
-    }
-
-    fn params(&self, _: &Vm, regs: ArgRegs, _: Insn) -> Result<(), &'static str> {
-        probe_params(regs)
+    fn exec(&self, cx: &mut Call<'_>, (dst, src): Self::Args) -> u64 {
+        probe_ops::probe_read_str(cx, TaggetPtrType::Kernel, &dst, src.0) as u64
     }
 }

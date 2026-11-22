@@ -24,7 +24,12 @@ use object::SectionIndex;
 use pretty_assertions::assert_eq;
 
 use super::*;
-use crate::{object::FunctionSignature, verifier::event::PayloadSlot};
+use crate::{
+    isa::mem::BPF_PSEUDO_MAP_FD,
+    maps::{BPF_MAP_TYPE_HASH, BpfMap, MapRepr, MapSpec},
+    object::FunctionSignature,
+    verifier::event::PayloadSlot,
+};
 
 /// Owned copy of [`VerifierEvent`], produced by deserializing the event's
 /// serialized form. Variant and field names must match the wire format.
@@ -393,6 +398,17 @@ fn verify_with_subprogs(
     Result<VerificationOutput, VerifierError>,
     Vec<RecordedEvent>,
 ) {
+    verify_in(&Vm::new(), insns, subprogs)
+}
+
+fn verify_in(
+    vm: &Vm,
+    insns: Vec<Insn>,
+    subprogs: BTreeMap<usize, FunctionSignature>,
+) -> (
+    Result<VerificationOutput, VerifierError>,
+    Vec<RecordedEvent>,
+) {
     let prog = EbpfProgram {
         insns,
         func: signature("test_prog", None),
@@ -408,8 +424,7 @@ fn verify_with_subprogs(
         capture: Some(log.clone()),
         ..Default::default()
     };
-    let vm = Vm::new();
-    let result = Verifier::new(&vm, Arc::new(prog), &config)
+    let result = Verifier::new(vm, Arc::new(prog), &config)
         .expect("verifier construction must succeed")
         .run();
     let events = std::mem::take(&mut *log.0.lock().expect("event log lock poisoned"));
@@ -472,6 +487,39 @@ fn call(imm: i32) -> Insn {
 
 fn helper_call(id: i32) -> Insn {
     encode(BPF_JMP | BPF_CALL | BPF_K, 0, BPF_HELPER_CALL, 0, id)
+}
+
+/// Two instruction words loading map `fd` into `dst`.
+fn ld_map_fd(dst: u8, fd: i32) -> [Insn; 2] {
+    [
+        encode(0x18, dst, BPF_PSEUDO_MAP_FD, 0, fd),
+        encode(0, 0, 0, 0, 0),
+    ]
+}
+
+/// A VM holding one hash map at fd 0.
+fn vm_with_hash_map(key_size: u32, value_size: u32) -> Arc<Vm> {
+    let vm = Vm::new();
+    let spec = MapSpec {
+        name: "map".into(),
+        r#type: Some(BPF_MAP_TYPE_HASH),
+        key_size: Some(key_size),
+        value_size: Some(value_size),
+        max_entries: Some(16),
+        ..Default::default()
+    };
+    let btf = Arc::new(Btf::default());
+    let repr = MapRepr::create_from_btf(&btf, &spec).expect("hash map spec must be valid");
+    vm.maps
+        .lock()
+        .expect("map lock poisoned")
+        .push(Arc::new(BpfMap {
+            fd: 0,
+            repr,
+            spec,
+            btf,
+        }));
+    vm
 }
 
 fn exit() -> Insn {
@@ -727,11 +775,13 @@ fn subprogram_call_frames_with_name_and_btf_id() {
 
 #[test]
 fn helper_call_reports_only_the_arguments_it_reads() {
-    // bpf_probe_read_kernel (id 113) consults r1 and r2 only, so the call's
-    // Insn event must not over-report r3 through r5 as read.
+    // bpf_probe_read_kernel (id 113) consults r1 through r3 only, so the
+    // call's Insn event must not over-report r4 and r5 as read.
     let (result, events) = verify(vec![
         mov64_reg(1, 10),
+        alu64_imm(BPF_ADD, 1, -8),
         mov64_imm(2, 8),
+        mov64_imm(3, 0),
         helper_call(113),
         exit(),
     ]);
@@ -743,9 +793,11 @@ fn helper_call_reports_only_the_arguments_it_reads() {
             unknown(),
             [
                 insn!(0, read r10, write r1 = stack_at(512)),
-                insn!(1, write r2 = exact(8)),
-                insn!(2, read r1 r2, write r0 = unknown()),
-                insn!(3, read r0),
+                insn!(1, read r1, write r1 = stack_at(504)),
+                insn!(2, write r2 = exact(8)),
+                insn!(3, write r3 = exact(0)),
+                insn!(4, read r1 r2 r3, write r0 = unknown()),
+                insn!(5, read r0),
             ]
         )
     );
@@ -959,4 +1011,101 @@ fn stack_read_spanning_two_slots_fails() {
 
     let err = result.expect_err("reading across two slots must fail verification");
     assert!(err.to_string().contains("crosses a slot boundary"));
+}
+
+/// Looks up an 8 byte key whose pointer starts `key_offset` below r10, with
+/// a 4 byte scalar stored there first.
+fn lookup_with_key_at(key_offset: i16) -> Result<VerificationOutput, VerifierError> {
+    let vm = vm_with_hash_map(8, 8);
+    let mut insns = vec![
+        mov64_imm(1, 3000),
+        stx(SIZE_W, 10, 1, -key_offset),
+        mov64_reg(2, 10),
+        alu64_imm(BPF_ADD, 2, -key_offset as i32),
+    ];
+    insns.extend(ld_map_fd(1, 0));
+    insns.extend([helper_call(1), exit()]);
+    verify_in(&vm, insns, BTreeMap::new()).0
+}
+
+#[test]
+fn map_key_running_past_the_stack_fails() {
+    let err = lookup_with_key_at(4).expect_err("an 8 byte key at r10-4 must fail");
+    assert!(
+        err.to_string()
+            .contains("helper memory runs past the stack")
+    );
+}
+
+#[test]
+fn map_key_within_the_stack_verifies() {
+    lookup_with_key_at(8).expect("an 8 byte key at r10-8 must verify");
+}
+
+#[test]
+fn map_key_holding_a_spilled_pointer_fails() {
+    let vm = vm_with_hash_map(8, 8);
+    let mut insns = vec![
+        stx(SIZE_DW, 10, 10, -8),
+        mov64_reg(2, 10),
+        alu64_imm(BPF_ADD, 2, -8),
+    ];
+    insns.extend(ld_map_fd(1, 0));
+    insns.extend([helper_call(1), exit()]);
+    let (result, _) = verify_in(&vm, insns, BTreeMap::new());
+
+    let err = result.expect_err("passing a spilled pointer as a key must fail");
+    assert!(
+        err.to_string()
+            .contains("helper would read a spilled pointer")
+    );
+}
+
+#[test]
+fn helper_write_initializes_the_stack() {
+    let (result, _) = verify(vec![
+        mov64_reg(1, 10),
+        alu64_imm(BPF_ADD, 1, -8),
+        mov64_imm(2, 8),
+        mov64_imm(3, 0),
+        helper_call(113),
+        ldx(SIZE_DW, 0, 10, -8),
+        exit(),
+    ]);
+
+    assert_eq!(result.expect("must verify").r0, unknown());
+}
+
+#[test]
+fn helper_write_past_the_stack_fails() {
+    let (result, _) = verify(vec![
+        mov64_reg(1, 10),
+        alu64_imm(BPF_ADD, 1, -8),
+        mov64_imm(2, 16),
+        mov64_imm(3, 0),
+        helper_call(113),
+        exit(),
+    ]);
+
+    let err = result.expect_err("a 16 byte write at r10-8 must fail");
+    assert!(
+        err.to_string()
+            .contains("helper memory runs past the stack")
+    );
+}
+
+#[test]
+fn unbounded_helper_size_fails() {
+    let (result, _) = verify(vec![
+        helper_call(7),
+        mov64_reg(2, 0),
+        mov64_reg(1, 10),
+        alu64_imm(BPF_ADD, 1, -8),
+        mov64_imm(3, 0),
+        helper_call(113),
+        exit(),
+    ]);
+
+    let err = result.expect_err("a size of unknown bound must fail");
+    assert!(err.to_string().contains("must be a bounded scalar"));
 }

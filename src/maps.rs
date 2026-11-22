@@ -132,6 +132,14 @@ macro_rules! delegate_map_impl {
             }
         }
 
+        /// Key and value sizes, `None` for map types without a backing store.
+        pub fn sizes(&self) -> Option<(usize, usize)> {
+            match self {
+                $(Self::$name(map) => Some((map.key_size(), map.value_size())),)+
+                _ => None,
+            }
+        }
+
         pub fn lookup(&self, key: &[u8]) -> Option<usize> {
             match self {
                 $(Self::$name(map) => map.lookup(key),)+

@@ -1,8 +1,12 @@
 use std::cell::Cell;
 
-use crate::isa::Insn;
-use crate::verifier::{RegMask, RegisterState};
+use crate::verifier::{RegMask, RegisterState, Scalar};
+use crate::vm::{Cpu, Vm};
 
+pub use args::{Access, ArgSpec};
+use args::{ArgList, Call};
+
+mod args;
 mod map_ops;
 mod maps;
 mod meta;
@@ -12,10 +16,9 @@ mod probes;
 
 pub(crate) use maps::PerfEventOutput;
 
-/// Register view handed to a helper's [`BpfHelper::params`] and
-/// [`BpfHelper::retval`]. Every [`get`](ArgRegs::get) marks the register in
-/// the verifier's read mask, so the recorded `Insn` event reports exactly the
-/// arguments the helper consulted.
+/// Register view handed to a helper's [`BpfHelper::retval`]. Every
+/// [`get`](ArgRegs::get) marks the register in the verifier's read mask, so
+/// the recorded `Insn` event reports exactly the arguments the call consulted.
 #[derive(Clone, Copy)]
 pub struct ArgRegs<'a> {
     registers: &'a [RegisterState; 11],
@@ -42,28 +45,58 @@ impl<'a> ArgRegs<'a> {
 
 /// BPF helper functions and dispatch.
 ///
-/// Each helper is a unit struct implementing [`BpfHelper`]. The
-/// verifier validates a call's argument types via `params` and tracks
-/// the return type via `retval`; the runtime calls `exec`. [`lookup`]
-/// maps a helper id to a `&'static dyn BpfHelper` via a single match,
-/// leaving room for a future host-supplied registry to fall through.
-pub trait BpfHelper {
+/// Each helper is a unit struct implementing [`BpfHelper`]. Its `Args` tuple
+/// is both what the verifier checks the argument registers against and what
+/// `exec` receives, so the memory a helper touches is the memory that was
+/// checked. [`lookup`] maps a helper id to a `&'static dyn Helper` via a
+/// single match, leaving room for a future host-supplied registry to fall
+/// through.
+pub trait BpfHelper: Sync + 'static {
+    type Args: ArgList;
+
     fn name(&self) -> &'static str;
 
-    fn exec(&self, state: &mut crate::vm::Cpu, insn: Insn);
+    /// Runs after the arguments were checked against `Args`. Helpers whose
+    /// return type depends on their arguments, or that constrain them further
+    /// than a signature can say, override this.
+    fn retval(&self, _: &Vm, _: ArgRegs) -> Result<RegisterState, &'static str> {
+        Ok(RegisterState::Scalar(Scalar::Unknown))
+    }
 
-    fn retval(
-        &self,
-        vm: &crate::vm::Vm,
-        regs: ArgRegs,
-        insn: Insn,
-    ) -> Result<RegisterState, &'static str>;
-
-    fn params(&self, vm: &crate::vm::Vm, regs: ArgRegs, insn: Insn) -> Result<(), &'static str>;
+    /// Returns the value for r0.
+    fn exec(&self, cx: &mut Call<'_>, args: Self::Args) -> u64;
 }
 
-pub fn lookup(id: i32) -> Option<&'static dyn BpfHelper> {
-    fn dyn_ref<H: BpfHelper + 'static>(h: &'static H) -> &'static dyn BpfHelper {
+/// Object safe face of [`BpfHelper`].
+pub trait Helper {
+    fn name(&self) -> &'static str;
+    fn sig(&self) -> &'static [ArgSpec];
+    fn retval(&self, vm: &Vm, regs: ArgRegs) -> Result<RegisterState, &'static str>;
+    fn exec(&self, cpu: &mut Cpu);
+}
+
+impl<H: BpfHelper> Helper for H {
+    fn name(&self) -> &'static str {
+        BpfHelper::name(self)
+    }
+
+    fn sig(&self) -> &'static [ArgSpec] {
+        H::Args::SIG
+    }
+
+    fn retval(&self, vm: &Vm, regs: ArgRegs) -> Result<RegisterState, &'static str> {
+        BpfHelper::retval(self, vm, regs)
+    }
+
+    fn exec(&self, cpu: &mut Cpu) {
+        let args = H::Args::decode(cpu);
+        let r0 = BpfHelper::exec(self, &mut Call::new(cpu), args);
+        cpu.set_reg(0, r0);
+    }
+}
+
+pub fn lookup(id: i32) -> Option<&'static dyn Helper> {
+    fn dyn_ref<H: BpfHelper>(h: &'static H) -> &'static dyn Helper {
         h
     }
 
