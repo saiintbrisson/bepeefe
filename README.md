@@ -6,7 +6,7 @@ What does it do?
 
 - ISA supports most of the base32 and base64 groups. ALU32/ALU64, conditional and unconditional jumps, calls, load and store operations, LD_IMM64, subprograms.
   - Immediate stores, sign-extending loads, atomics for or/and/xor/xchg are missing.
-- ELF loading, relocations, `.maps` support, `.BTF` and `.BTF.ext` parsing, `.bss`/`.data`/`.rodata` auto-generated as array maps, program and sub-program discovery, limited section-based [attach point parsing](./src/bpf_prog.rs).
+- ELF loading, relocations, `.maps` support, `.BTF` and `.BTF.ext` parsing, `.bss`/`.data`/`.rodata` auto-generated as array maps, program and sub-program discovery, limited section-based [attach point parsing](./src/hook.rs).
   - Only `R_BPF_64_32` and `R_BPF_64_64` relocations are supported (as of now).
 - BTF and BTF extension parsing, validation, datasec resolution. 
 - Small maps coverage: `ARRAY`, `HASH`, `STACK`, `PERF_EVENT_ARRAY`.
@@ -51,7 +51,7 @@ Your program needs preparation in order to run. The `Vm` struct holds maps, and 
 
 ```rust
 let vm = Vm::new();
-let prog: Arc<PreparedProgram> = vm.prepare(prog, MapReuseStrategy::None, VerifierConfig::default())?;
+let prog: Arc<PreparedProgram> = vm.prepare(prog, MapReuseStrategy::None, &VerifierConfig::default())?;
 ```
 
 > `MapReuseStrategy` is either `None` or `MatchByName`. The former fails if a new map declaration conflicts with an existing map, regardless of type. The latter searches for existing maps with the same name. Libbpf's `pinning` attribute on maps overrides this behavior.
@@ -217,6 +217,54 @@ And the same applies to building the context. If your program is also written in
 
 For anon fields in a struct or union, the field name is `_anon_<idx>`, where `idx` is the index for that field. There's also a BTF builder to help with tests and missing BTF information.
 
+#### Datasecs
+
+It's common for programs to have config values you can tweak before load time. Some of these become `.rodata` sections and BTF encodes them as `datasec`s, and we have good support for that:
+
+```c
+const volatile __u32 max_len = 1000;
+const volatile __u8 verbose = 0;
+
+__u64 dropped = 0;
+
+SEC("cgroup/skb")
+int entry(struct __sk_buff *ctx) {
+    if (ctx->len > max_len) {
+        __sync_fetch_and_add(&dropped, 1);
+        if (verbose)
+            bpf_printk("dropped len %d", ctx->len);
+        return 0;
+    }
+    return 1;
+}
+```
+
+Like a libbpf skeleton, you set the `const volatile` knobs on the loaded program, before it goes through `Vm::prepare`:
+
+```rust
+let mut prog = obj.load_prog("entry")?;
+prog.set_datasec_vars(".rodata", &BTreeMap::from([
+    ("max_len".to_string(), Value::Number(100)),
+    ("verbose".to_string(), Value::Number(1)),
+]))?;
+
+let prog = vm.prepare(prog, MapReuseStrategy::None, &VerifierConfig::default())?;
+```
+
+Each load gets its own copy of every data section, reachable through `PreparedProgram::datasec`. Reading one gives back a map keyed by variable name, decoded through BTF like any other `Value`, and writing patches only the variables you name:
+
+```rust
+let image = prog.build_image(&[Value::from([("len", Value::Number(500))])])?;
+prog.run(image, None);
+
+let bss = prog.datasec(".bss").unwrap();
+println!("{:?}", bss.read()?); // Map({"dropped": Number(1)})
+
+bss.write(&BTreeMap::from([("dropped".to_string(), Value::Number(0))]))?;
+```
+
+Writes go through for `.rodata` too, unlike the libbpf, which treats it immutable. This also means that some of the verifier optimizations done in the kernel are not available here, since it can't assume anything based on `.rodata` values.
+
 ### VM
 
 The memory is not flat. The VM does not hold a single memory slice accessed by all programs, instead, different memory regions exist. Maps manage their own memory, each program execution (through [`Cpu`](./src/vm/cpu.rs)) owns its own stack allocation, user and kernel memories are nothing but an `Arc<[u8]>` in the VM's [`World`](./src/vm/world.rs). What we do instead is tag the pointers when initializing the registers (see [`TaggedPtr`](./src/vm/ptr.rs)), and the CPU is responsible for decoding the register and routing the read/write to the correct place.
@@ -239,14 +287,16 @@ KFuncs are not supported yet.
 
 ### Verifier
 
-The kernel verifier is a very complex piece of engineering. And the implementation here doesn't begin to scratch the surface of what the complete verifier does. I began working on it with a simple goal in mind: be able to verify a snake game. This was complex enough to cover many simple eBPF programs.
+The kernel verifier is a very complex piece of engineering. And the implementation here doesn't begin to scratch the surface of what the complete verifier does. I began working on it with a simple goal in mind: be able to verify a snake game. This was complex enough to cover many simple eBPF programs, and it now goes beyond.
 
-It does the basics (which is already decently complex): track register states, written stack, call stack, helper calling hygiene, memory access validation (based on BTF types), register refinement. I wouldn't say it does it well, though.
+It does the basics: track register states, stack tracking and enforcing, call stack, helper calling hygiene, memory access validation (based on BTF types), register refinement, limited state pruning. I wouldn't say it does any particularly well, though.
 
-For example, scalar tracking is a big part of the kernel verifier. It uses something called `tnum`, which tracks what bits can and cannot be set at any given time. Very clever, also very complex to implement. So I came up with a much simpler way to deal with scalars. Apart from min/max tracking like the kernel does, each scalar contains a `stride`, the distance between numbers in the min/max range. This is enough to enable shift operations over scalar registers, and was enough for the snake game. As I would come to find out, it is enough for a good amount of eBPF programs (see [`ScalarRange`](./src/verifier.rs)).
-
-Helper call hygiene is enforced for all implemented helpers. The verifier also emits warnings in a few specific cases. Currently, the only one is when a tracepoint program accesses the `trace_entry` struct, which in the real kernel gets overwritten with a pointer to a `pt_regs` struct.
+For example, scalar tracking is a big part of the kernel verifier. It uses something called `tnum`, which tracks what bits can and cannot be set at any given time. Very clever, also very complex to implement. So I came up with a much simpler way to deal with scalars. Apart from min/max tracking like the kernel does, each scalar contains a `stride`, the distance between numbers in the min/max range. This is enough to enable shift operations over scalar registers. As I would come to find out, it is enough for a good amount of eBPF programs (see [`ScalarRange`](./src/verifier.rs)).
 
 Refinement is implemented for most relevant jump conditions, but not all (see [`decide_branch`](./src/verifier/branch.rs)). Refining a value means that, for example, given a register with an unknown scalar, an `if unsigned reg < 64` means that in that branch the register will be in the range 0..64, and we use this information to enforce memory access rules. Another refinement happens around map lookups, where the verifier figures out from a null check whether the result is null or a valid pointer: `if reg != 0` means that in that branch, the register holds a valid pointer to a map element.
 
-This verifier isn't complete, and probably never will be. It lacks many features (e.g. pruning), isn't well tested (if at all, apart from refinement branches), and is (or should be) way more restrictive than the kernel version.
+This verifier isn't complete, and probably never will be. It lacks many features, isn't well tested (yet to add regression tests), and is (or should be) way more restrictive than the kernel version.
+
+## AI usage
+
+I first began this project in 2024, and by that time, I was a huge AI skeptic. The vast majority of the code was painstakingly hand-written throughout 2024 and 2025, and this was the right choice, I know all the details that go into making it work. This is still true today, but now I use AI to write some of it, otherwise I just feel like I'm wasting time, specially with the WASM and CLI crates. Components like the verifier and object loading are still mostly hand written as I use them to learn about the tech.
