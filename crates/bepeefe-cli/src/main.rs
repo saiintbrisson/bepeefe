@@ -5,6 +5,8 @@ mod core;
 mod maps;
 mod programs;
 mod render;
+mod report;
+mod trace;
 
 use std::{path::PathBuf, process::ExitCode};
 
@@ -82,16 +84,15 @@ enum ProgAction {
         #[arg(long)]
         src: bool,
     },
-    /// Verify the program, streaming each verifier event on its own line.
+    /// Verify the program, reporting what led to a failure.
     Verify {
-        /// Print events emitted by the verifier:
-        /// * Per-instruction register access,
-        /// * Branch enter/exit,
-        /// * Pruned states,
-        /// * BPF-to-BPF calls,
-        /// * Perf event layout.
-        #[arg(long)]
-        events: bool,
+        /// How much of the verifier's event stream to print:
+        /// * slice: what produced the registers the failing check read,
+        /// * path:  every event on the failing walk and its ancestors,
+        /// * all:   every event, streamed as it happens,
+        /// * none:  just the error report.
+        #[arg(long, value_enum, default_value_t = trace::TraceMode::Slice)]
+        trace: trace::TraceMode,
     },
 }
 
@@ -129,8 +130,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }) => programs::disasm(&obj, &n, src)?,
         Some(Cmd::Programs {
             name: Some(n),
-            action: Some(ProgAction::Verify { events }),
-        }) => programs::verify(&obj, &n, events)?,
+            action: Some(ProgAction::Verify { trace }),
+        }) => programs::verify(&obj, &n, trace)?,
         Some(Cmd::Maps { name: None }) => maps::list(&obj),
         Some(Cmd::Maps { name: Some(n) }) => maps::show(&obj, &n)?,
         Some(Cmd::Btf {

@@ -4,7 +4,7 @@ use crate::btf::BtfTypeId;
 
 use super::{PruneSite, RegMask, RegisterState, WalkOrigin};
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 pub enum VerifierEvent<'a> {
     Insn {
         depth: usize,
@@ -19,7 +19,7 @@ pub enum VerifierEvent<'a> {
         /// events instead.
         ///
         /// [`BranchEnter`]: VerifierEvent::BranchEnter
-        written: &'a [(u8, RegisterState)],
+        written: Cow<'a, [(u8, RegisterState)]>,
     },
     BranchEnter {
         depth: usize,
@@ -80,7 +80,7 @@ pub enum VerifierEvent<'a> {
         /// func_info for it. Resolvable to the full signature through BTF.
         btf_id: Option<BtfTypeId>,
         /// Callee register state on entry, r1 onwards carry the arguments.
-        registers: &'a [RegisterState; 11],
+        registers: Cow<'a, [RegisterState]>,
     },
     CallExit {
         depth: usize,
@@ -105,12 +105,125 @@ pub enum VerifierEvent<'a> {
         /// Slots fully inside the payload region. Bytes covered by no slot
         /// were never written on this path. Empty when the data pointer is
         /// not an exact stack pointer or the length is unknown.
-        slots: &'a [PayloadSlot],
+        slots: Cow<'a, [PayloadSlot]>,
     },
     Warning {
         pc: usize,
         message: Cow<'a, str>,
     },
+}
+
+impl VerifierEvent<'_> {
+    /// Clones and allocates all borrowed values.
+    pub fn into_owned(self) -> VerifierEvent<'static> {
+        use VerifierEvent::*;
+        match self {
+            Insn {
+                depth,
+                pc,
+                read,
+                written,
+            } => Insn {
+                depth,
+                pc,
+                read,
+                written: Cow::Owned(written.into_owned()),
+            },
+            BranchEnter {
+                depth,
+                id,
+                target_pc,
+                kind,
+            } => BranchEnter {
+                depth,
+                id,
+                target_pc,
+                kind,
+            },
+            BranchDead {
+                depth,
+                target_pc,
+                kind,
+            } => BranchDead {
+                depth,
+                target_pc,
+                kind,
+            },
+            StatePruned {
+                depth,
+                fork_pc,
+                matched,
+                site,
+            } => StatePruned {
+                depth,
+                fork_pc,
+                matched,
+                site,
+            },
+            BranchExit { depth } => BranchExit { depth },
+            CallEnter {
+                depth,
+                id,
+                target_pc,
+                name,
+                btf_id,
+                registers,
+            } => CallEnter {
+                depth,
+                id,
+                target_pc,
+                name: Cow::Owned(name.into_owned()),
+                btf_id,
+                registers: Cow::Owned(registers.into_owned()),
+            },
+            CallExit { depth, r0 } => CallExit { depth, r0 },
+            PerfEventLayout {
+                depth,
+                pc,
+                map_fd,
+                size,
+                slots,
+            } => PerfEventLayout {
+                depth,
+                pc,
+                map_fd,
+                size,
+                slots: Cow::Owned(slots.into_owned()),
+            },
+            Warning { pc, message } => Warning {
+                pc,
+                message: Cow::Owned(message.into_owned()),
+            },
+        }
+    }
+
+    /// Nesting level of the walk that emitted this event. [`Warning`]s carry
+    /// no depth, they are advisory and belong to no particular walk.
+    ///
+    /// [`Warning`]: VerifierEvent::Warning
+    pub fn depth(&self) -> Option<usize> {
+        use VerifierEvent::*;
+        match self {
+            Insn { depth, .. }
+            | BranchEnter { depth, .. }
+            | BranchDead { depth, .. }
+            | StatePruned { depth, .. }
+            | BranchExit { depth }
+            | CallEnter { depth, .. }
+            | CallExit { depth, .. }
+            | PerfEventLayout { depth, .. } => Some(*depth),
+            Warning { .. } => None,
+        }
+    }
+
+    /// Whether this event opens a walk, the point where a path filter
+    /// following it steps out into the parent.
+    pub fn is_walk_enter(&self) -> bool {
+        matches!(
+            self,
+            VerifierEvent::BranchEnter { .. } | VerifierEvent::CallEnter { .. }
+        )
+    }
 }
 
 /// A stack slot inside a perf event payload, as the verifier saw it written.

@@ -48,7 +48,7 @@ impl WasmVm {
         let prepared = self
             .inner
             .prepare(prog, MapReuseStrategy::None, &verifier_config)
-            .map_err(|e| JsError::new(&e.report()))?;
+            .map_err(|e| JsError::new(&e.to_string()))?;
         Ok(WasmProgram { prepared })
     }
 

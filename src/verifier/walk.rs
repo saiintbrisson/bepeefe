@@ -366,7 +366,7 @@ impl<'v, 'a> Walk<'v, 'a> {
                     target_pc: self.this_pc(),
                     name: sig.map(|s| Cow::from(s.name.as_str())).unwrap_or_default(),
                     btf_id: sig.and_then(|s| s.btf_id),
-                    registers: self.regs(),
+                    registers: Cow::Borrowed(self.regs()),
                 });
             }
         }
@@ -411,7 +411,7 @@ impl<'v, 'a> Walk<'v, 'a> {
             depth: self.depth,
             pc,
             read: self.insn_reads.get() | static_jmp_reads(insn) | self.pseudo_call_reads(insn),
-            written: written.get(..count).unwrap_or_default(),
+            written: Cow::Borrowed(written.get(..count).unwrap_or_default()),
         });
     }
 
@@ -466,7 +466,7 @@ impl<'v, 'a> Walk<'v, 'a> {
             pc: self.this_pc(),
             map_fd,
             size,
-            slots: &slots,
+            slots: Cow::Borrowed(&slots),
         });
     }
 
@@ -503,6 +503,7 @@ impl<'v, 'a> Walk<'v, 'a> {
             insn_off,
             msg,
             registers: Box::new(*self.regs()),
+            read: self.insn_reads.get(),
         }
     }
 

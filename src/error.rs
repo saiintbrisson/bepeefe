@@ -90,10 +90,11 @@ pub enum PrepareError {
 }
 
 impl PrepareError {
-    pub fn report(&self) -> String {
+    /// Structured view of a verifier failure.
+    pub fn diagnostic(&self) -> Option<crate::verifier::Diagnostic<'_>> {
         match self {
-            PrepareError::Verifier { source, prog } => source.report(prog),
-            other => format!("error: {other}\n"),
+            PrepareError::Verifier { source, prog } => source.diagnostic(prog),
+            _ => None,
         }
     }
 }

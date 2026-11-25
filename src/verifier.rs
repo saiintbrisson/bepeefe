@@ -42,77 +42,42 @@ pub enum VerifierError {
         insn_off: usize,
         msg: &'static str,
         registers: Box<[RegisterState; 11]>,
+        read: RegMask,
     },
 }
 
+/// A failing instruction report produced by the verifier.
+pub struct Diagnostic<'a> {
+    pub prog: &'a EbpfProgram,
+    pub insn: Insn,
+    pub pc: usize,
+    pub message: &'static str,
+    pub registers: &'a [RegisterState; 11],
+    pub read: RegMask,
+}
+
 impl VerifierError {
-    pub fn report(&self, prog: &EbpfProgram) -> String {
+    /// Structured view of the failure, `None` for errors raised too early.
+    pub fn diagnostic<'a>(&'a self, prog: &'a EbpfProgram) -> Option<Diagnostic<'a>> {
         let VerifierError::Other {
             insn,
             insn_off,
             msg,
             registers,
+            read,
         } = self
         else {
-            return format!("error: {self}\n");
+            return None;
         };
 
-        let btf = &prog.btf;
-        let radius = 3;
-        let start = insn_off.saturating_sub(radius);
-        let end = (insn_off + radius + 1).min(prog.insns.len());
-        let pc_width = end.saturating_sub(1).to_string().len().max(2);
-        let gutter = " ".repeat(pc_width + 4);
-
-        let mut out = format!("error: {msg}\n  --> pc {insn_off}\n\n");
-
-        let mut prev_line_off: Option<u32> = None;
-        for pc in start..end {
-            let Some(cur) = prog.insns.get(pc) else {
-                break;
-            };
-            let next = prog.insns.get(pc + 1).copied();
-            let dis = crate::isa::dump::disasm(*cur, next);
-
-            let line_entry = (|| {
-                let entry = prog.line_info.get(&pc)?;
-                let line = btf.string(entry.line_off)?;
-                Some((entry.line_off, entry.line_no, line.into_owned()))
-            })();
-            let annotation = match &line_entry {
-                Some((off, _, _)) if prev_line_off == Some(*off) => String::new(),
-                Some((_, line_no, line)) => format!("    ; @{line_no:<3}  {}", line.trim()),
-                None => String::new(),
-            };
-            if let Some((off, _, _)) = &line_entry {
-                prev_line_off = Some(*off);
-            }
-
-            let marker = if pc == *insn_off { '>' } else { ' ' };
-            out.push_str(&format!(
-                " {marker} {pc:>w$} | {dis}{annotation}\n",
-                w = pc_width,
-            ));
-
-            if pc == *insn_off {
-                let dst = insn.dst_reg();
-                let src = insn.src_reg();
-                // `dst`/`src` are 4-bit instruction fields (0..=15). The
-                // failing instruction may itself have a register index >= 11
-                // (that's exactly why `check_insn` would have rejected it),
-                // so use `.get` and degrade gracefully.
-                let fmt_reg = |idx: u8| match registers.get(idx as usize) {
-                    Some(state) => format!("{state:?}"),
-                    None => "<invalid register>".to_string(),
-                };
-                out.push_str(&format!("{gutter}|   r{dst} = {}", fmt_reg(dst)));
-                if src != dst {
-                    out.push_str(&format!(", r{src} = {}", fmt_reg(src)));
-                }
-                out.push('\n');
-            }
-        }
-        out
+        Some(Diagnostic {
+            prog,
+            insn: *insn,
+            pc: *insn_off,
+            message: msg,
+            registers,
+            read: *read,
+        })
     }
 }
 
