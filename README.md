@@ -5,7 +5,7 @@ BEPEEFE is a userspace eBPF VM written in Rust. Load an eBPF object file, verify
 What does it do?
 
 - ISA supports most of the base32 and base64 groups. ALU32/ALU64, conditional and unconditional jumps, calls, load and store operations, LD_IMM64, subprograms.
-  - Immediate stores, sign-extending loads, atomics for or/and/xor/xchg are missing.
+  - atomics for or/and/xor/xchg are missing.
 - ELF loading, relocations, `.maps` support, `.BTF` and `.BTF.ext` parsing, `.bss`/`.data`/`.rodata` auto-generated as array maps, program and sub-program discovery, limited section-based [attach point parsing](./src/hook.rs).
   - Only `R_BPF_64_32` and `R_BPF_64_64` relocations are supported (as of now).
 - BTF and BTF extension parsing, validation, datasec resolution. 

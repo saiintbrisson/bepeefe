@@ -60,6 +60,11 @@ impl<'v, 'a> Walk<'v, 'a> {
     }
 
     pub fn check_insn(&mut self, insn: &Insn) -> Result<(), VerifierError> {
+        guard!(
+            self,
+            crate::isa::opcode_name(insn.opcode()) != "unknown",
+            "VM does not support this instruction"
+        );
         guard!(self, insn.src_reg() <= 10, "insn with invalid src register");
         guard!(
             self,
@@ -73,7 +78,7 @@ impl<'v, 'a> Walk<'v, 'a> {
             BPF_LDX => self.check_ldx(insn)?,
             BPF_ST | BPF_STX => self.check_st(insn)?,
             BPF_JMP32 | BPF_JMP => self.check_jmp(insn)?,
-            _ => {}
+            _ => guard!(self, "unsupported instruction class"),
         }
 
         Ok(())

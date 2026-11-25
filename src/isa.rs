@@ -200,17 +200,26 @@ instruction_table! {
     BPF_JMP | BPF_K | BPF_CALL => jmp_call;
     BPF_JMP | BPF_K | BPF_EXIT => exit;
 
-    BPF_LDX | SIZE_W | MODE_MEM => ldx_mem_w;
-    BPF_STX | SIZE_W | MODE_MEM => stx_mem_w;
+    BPF_LDX | SIZE_B | MODE_MEM => ldx_mem_b;
+    BPF_STX | SIZE_B | MODE_MEM => stx_mem_b;
 
     BPF_LDX | SIZE_H | MODE_MEM => ldx_mem_h;
     BPF_STX | SIZE_H | MODE_MEM => stx_mem_h;
 
-    BPF_LDX | SIZE_B | MODE_MEM => ldx_mem_b;
-    BPF_STX | SIZE_B | MODE_MEM => stx_mem_b;
+    BPF_LDX | SIZE_W | MODE_MEM => ldx_mem_w;
+    BPF_STX | SIZE_W | MODE_MEM => stx_mem_w;
 
     BPF_LDX | SIZE_DW | MODE_MEM => ldx_mem_dw;
     BPF_STX | SIZE_DW | MODE_MEM => stx_mem_dw;
+
+    BPF_LDX | SIZE_B | MODE_MEMSX => ldx_memsx_b;
+    BPF_LDX | SIZE_H | MODE_MEMSX => ldx_memsx_h;
+    BPF_LDX | SIZE_W | MODE_MEMSX => ldx_memsx_w;
+
+    BPF_ST | SIZE_B | MODE_MEM => st_mem_b;
+    BPF_ST | SIZE_H | MODE_MEM => st_mem_h;
+    BPF_ST | SIZE_W | MODE_MEM => st_mem_w;
+    BPF_ST | SIZE_DW | MODE_MEM => st_mem_dw;
 
     // Special load/store operations
 

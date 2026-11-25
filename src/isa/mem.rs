@@ -39,7 +39,7 @@ pub const SIZE_B: u8 = 2 << 3;
 pub const SIZE_DW: u8 = 3 << 3;
 
 macro_rules! mem_insns {
-    ($($ld:ident, $st:ident, $size:ident;)+) => {
+    ($($ld:ident, $st:ident, $stx:ident, $size:ident;)+) => {
         $(
             pub fn $ld(state: &mut crate::vm::Cpu, insn: Insn) {
                 const SIZE: usize = ($size::BITS / 8) as usize;
@@ -52,6 +52,13 @@ macro_rules! mem_insns {
 
             pub fn $st(state: &mut crate::vm::Cpu, insn: Insn) {
                 let ptr = state.reg(insn.dst_reg()).saturating_add_signed(insn.offset() as i64);
+                let val = insn.imm() as $size;
+
+                state.write(ptr, &val.to_ne_bytes());
+            }
+
+            pub fn $stx(state: &mut crate::vm::Cpu, insn: Insn) {
+                let ptr = state.reg(insn.dst_reg()).saturating_add_signed(insn.offset() as i64);
                 let val = state.reg(insn.src_reg()) as $size;
 
                 state.write(ptr, &val.to_ne_bytes());
@@ -60,11 +67,32 @@ macro_rules! mem_insns {
     };
 }
 
+macro_rules! memsx_insns {
+    ($($ld:ident, $size:ident;)+) => {
+        $(
+            pub fn $ld(state: &mut crate::vm::Cpu, insn: Insn) {
+                const SIZE: usize = ($size::BITS / 8) as usize;
+
+                let ptr = state.reg(insn.src_reg()).saturating_add_signed(insn.offset() as i64);
+                let val: [_; SIZE] = state.read(ptr);
+
+                state.set_reg(insn.dst_reg(), $size::from_ne_bytes(val) as i64 as u64);
+            }
+        )+
+    };
+}
+
 mem_insns! {
-    ldx_mem_w,   stx_mem_w,  u32;
-    ldx_mem_h,   stx_mem_h,  u16;
-    ldx_mem_b,   stx_mem_b,  u8;
-    ldx_mem_dw,  stx_mem_dw, u64;
+    ldx_mem_b,  st_mem_b,  stx_mem_b,  u8;
+    ldx_mem_h,  st_mem_h,  stx_mem_h,  u16;
+    ldx_mem_w,  st_mem_w,  stx_mem_w,  u32;
+    ldx_mem_dw, st_mem_dw, stx_mem_dw, u64;
+}
+
+memsx_insns! {
+    ldx_memsx_b, i8;
+    ldx_memsx_h, i16;
+    ldx_memsx_w, i32;
 }
 
 /// LD IMM64 will load the map address with the FD given in IMM.

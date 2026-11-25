@@ -1,4 +1,4 @@
-use crate::isa::Insn;
+use crate::isa::*;
 
 #[derive(Clone, Copy)]
 pub enum InsnKind {
@@ -10,7 +10,8 @@ pub enum InsnKind {
     MovImm,
     Bswap,
     Load(&'static str),
-    Store(&'static str),
+    StoreImm(&'static str),
+    StoreSrc(&'static str),
     LdImm64,
     Atomic,
     JmpSrc(&'static str),
@@ -19,7 +20,7 @@ pub enum InsnKind {
     Ja16,
     Call,
     Exit,
-    Unknown,
+    Unknown(u8),
 }
 
 pub fn describe(opcode: u8) -> InsnKind {
@@ -58,10 +59,19 @@ pub fn describe(opcode: u8) -> InsnKind {
         "ldx_mem_w" => InsnKind::Load("*(u32 *)"),
         "ldx_mem_dw" => InsnKind::Load("*(u64 *)"),
 
-        "stx_mem_b" => InsnKind::Store("*(u8 *)"),
-        "stx_mem_h" => InsnKind::Store("*(u16 *)"),
-        "stx_mem_w" => InsnKind::Store("*(u32 *)"),
-        "stx_mem_dw" => InsnKind::Store("*(u64 *)"),
+        "ldx_memsx_b" => InsnKind::Load("*(i8 *)"),
+        "ldx_memsx_h" => InsnKind::Load("*(i16 *)"),
+        "ldx_memsx_w" => InsnKind::Load("*(i32 *)"),
+
+        "st_mem_b" => InsnKind::StoreImm("*(u8 *)"),
+        "st_mem_h" => InsnKind::StoreImm("*(u16 *)"),
+        "st_mem_w" => InsnKind::StoreImm("*(u32 *)"),
+        "st_mem_dw" => InsnKind::StoreImm("*(u64 *)"),
+
+        "stx_mem_b" => InsnKind::StoreSrc("*(u8 *)"),
+        "stx_mem_h" => InsnKind::StoreSrc("*(u16 *)"),
+        "stx_mem_w" => InsnKind::StoreSrc("*(u32 *)"),
+        "stx_mem_dw" => InsnKind::StoreSrc("*(u64 *)"),
 
         "ld_imm64" => InsnKind::LdImm64,
         "stx_atomic_dw" => InsnKind::Atomic,
@@ -95,7 +105,7 @@ pub fn describe(opcode: u8) -> InsnKind {
         "jmp_call" => InsnKind::Call,
         "exit" => InsnKind::Exit,
 
-        _ => InsnKind::Unknown,
+        _ => InsnKind::Unknown(opcode),
     }
 }
 
@@ -147,7 +157,10 @@ pub fn disasm(insn: Insn, next: Option<Insn>) -> String {
         InsnKind::MovImm => format!("{r}{} = 0x{:X}", dst, imm as u32),
         InsnKind::Bswap => format!("{r}{} = bswap {r}{}", dst, dst),
         InsnKind::Load(size) => format!("r{} = {}(r{} {})", dst, size, src, fmt_offset(off)),
-        InsnKind::Store(size) => format!("{}(r{} {}) = r{}", size, dst, fmt_offset(off), src),
+        InsnKind::StoreImm(size) => {
+            format!("{}(r{} {}) = {}", size, dst, fmt_offset(off), imm as u32)
+        }
+        InsnKind::StoreSrc(size) => format!("{}(r{} {}) = r{}", size, dst, fmt_offset(off), src),
         InsnKind::LdImm64 => {
             let imm_u = imm as u32 as u64;
             let next_imm = next.map(|i| i.imm() as u32 as u64).unwrap_or(0);
@@ -185,7 +198,7 @@ pub fn disasm(insn: Insn, next: Option<Insn>) -> String {
             _ => format!("call ?{imm}"),
         },
         InsnKind::Exit => "exit".into(),
-        InsnKind::Unknown => String::new(),
+        InsnKind::Unknown(opcode) => unknown_insn(opcode),
     }
 }
 
@@ -205,7 +218,8 @@ pub fn disasm_brief(insn: Insn, next: Option<Insn>) -> String {
         InsnKind::MovImm => format!("0x{:X}", imm as u32),
         InsnKind::Bswap => format!("bswap {r}{}", dst),
         InsnKind::Load(_) => format!("r{} {}", src, fmt_offset(off)),
-        InsnKind::Store(_) => format!("r{} {} = r{}", dst, fmt_offset(off), src),
+        InsnKind::StoreImm(_) => format!("r{} {} = {}", dst, fmt_offset(off), imm as u32),
+        InsnKind::StoreSrc(_) => format!("r{} {} = r{}", dst, fmt_offset(off), src),
         InsnKind::LdImm64 => {
             let imm_u = imm as u32 as u64;
             let next_imm = next.map(|i| i.imm() as u32 as u64).unwrap_or(0);
@@ -224,7 +238,7 @@ pub fn disasm_brief(insn: Insn, next: Option<Insn>) -> String {
         InsnKind::JmpSrc(cmp) => format!("{r}{} {} {r}{}", dst, cmp, src),
         InsnKind::JmpImm(cmp) => format!("{r}{} {} 0x{:X}", dst, cmp, imm as u32),
         InsnKind::Ja32 | InsnKind::Ja16 | InsnKind::Call | InsnKind::Exit => String::new(),
-        InsnKind::Unknown => String::new(),
+        InsnKind::Unknown(opcode) => unknown_insn(opcode),
     }
 }
 
@@ -270,7 +284,11 @@ pub fn debugger(state: &crate::vm::Cpu, insn: Insn) -> String {
             let addr = src_val.wrapping_add(off as i64 as u64);
             format!("r{} = {}0x{:X}{}", dst, size, addr, ann)
         }
-        InsnKind::Store(size) => {
+        InsnKind::StoreImm(size) => {
+            let addr = dst_val.wrapping_add(off as i64 as u64);
+            format!("{}0x{:X} = 0x{:X}{}", size, addr, imm as u32, ann)
+        }
+        InsnKind::StoreSrc(size) => {
             let addr = dst_val.wrapping_add(off as i64 as u64);
             format!("{}0x{:X} = 0x{:X}{}", size, addr, src_val, ann)
         }
@@ -303,6 +321,35 @@ pub fn debugger(state: &crate::vm::Cpu, insn: Insn) -> String {
         InsnKind::Ja16 => fmt_goto(off),
         InsnKind::Call => disasm(insn, next),
         InsnKind::Exit => "exit".into(),
-        InsnKind::Unknown => String::new(),
+        InsnKind::Unknown(opcode) => unknown_insn(opcode),
     }
+}
+
+fn unknown_insn(opcode: u8) -> String {
+    let insn = Insn(opcode as u64);
+    let class = match insn.class() {
+        BPF_ALU32 => "BPF_ALU32",
+        BPF_ALU64 => "BPF_ALU64",
+        BPF_LD => "BPF_LD",
+        BPF_LDX => "BPF_LDX",
+        BPF_ST => "BPF_ST",
+        BPF_STX => "BPF_STX",
+        BPF_JMP32 => "BPF_JMP32",
+        BPF_JMP => "BPF_JMP",
+        _ => unreachable!("class is a 3 bit field"),
+    };
+
+    let detail = match insn.class() {
+        BPF_LD | BPF_LDX | BPF_ST | BPF_STX => {
+            let mode = match insn.mem_mode() {
+                Some(mode) => format!("{mode:?}"),
+                None => format!("0x{:X}", opcode & LOAD_MODE_MASK),
+            };
+            format!("mode={mode}, size={:?}", insn.mem_size())
+        }
+        BPF_ALU32 | BPF_ALU64 => format!("op=0x{:X}", opcode & ALU_OP_MASK),
+        _ => format!("op=0x{:X}", opcode & JMP_OP_MASK),
+    };
+
+    format!("unknown(class={class}, opcode=0x{opcode:02X}, {detail})")
 }

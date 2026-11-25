@@ -43,7 +43,16 @@ impl<'v, 'a> Walk<'v, 'a> {
 
                 Ok(())
             }
-            Some(MemMode::Memsx) => guard!(self, "sign-extension loads are not supported yet"),
+            Some(MemMode::Memsx) => {
+                let load_size = insn.mem_size().bytes();
+                guard!(
+                    self,
+                    matches!(load_size, 1 | 2 | 4),
+                    "sign extension load only supports B, H and W sizes"
+                );
+                // TODO: improve this in the future, if need be
+                self.mark_unknown(insn.dst_reg())
+            }
             _ => guard!(self, "unsupported load mode"),
         }
     }
