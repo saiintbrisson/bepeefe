@@ -1,7 +1,8 @@
-use std::cell::Cell;
+use std::{cell::Cell, sync::Arc};
 
+use crate::maps::BpfMap;
 use crate::verifier::{RegMask, RegisterState, Scalar};
-use crate::vm::{Cpu, Vm};
+use crate::vm::Cpu;
 
 pub use args::{Access, ArgSpec};
 use args::{ArgList, Call};
@@ -59,7 +60,7 @@ pub trait BpfHelper: Sync + 'static {
     /// Runs after the arguments were checked against `Args`. Helpers whose
     /// return type depends on their arguments, or that constrain them further
     /// than a signature can say, override this.
-    fn retval(&self, _: &Vm, _: ArgRegs) -> Result<RegisterState, &'static str> {
+    fn retval(&self, _: &[Arc<BpfMap>], _: ArgRegs) -> Result<RegisterState, &'static str> {
         Ok(RegisterState::Scalar(Scalar::Unknown))
     }
 
@@ -71,7 +72,7 @@ pub trait BpfHelper: Sync + 'static {
 pub trait Helper {
     fn name(&self) -> &'static str;
     fn sig(&self) -> &'static [ArgSpec];
-    fn retval(&self, vm: &Vm, regs: ArgRegs) -> Result<RegisterState, &'static str>;
+    fn retval(&self, maps: &[Arc<BpfMap>], regs: ArgRegs) -> Result<RegisterState, &'static str>;
     fn exec(&self, cpu: &mut Cpu);
 }
 
@@ -84,8 +85,8 @@ impl<H: BpfHelper> Helper for H {
         H::Args::SIG
     }
 
-    fn retval(&self, vm: &Vm, regs: ArgRegs) -> Result<RegisterState, &'static str> {
-        BpfHelper::retval(self, vm, regs)
+    fn retval(&self, maps: &[Arc<BpfMap>], regs: ArgRegs) -> Result<RegisterState, &'static str> {
+        BpfHelper::retval(self, maps, regs)
     }
 
     fn exec(&self, cpu: &mut Cpu) {

@@ -12,7 +12,7 @@ fn is_null(reg: RegisterState) -> bool {
 impl<'v, 'a> Walk<'v, 'a> {
     pub(super) fn check_helper_args(&mut self, sig: &[ArgSpec]) -> Result<(), VerifierError> {
         let mut reg = 1u8;
-        let mut map_fd = None;
+        let mut map_idx = None;
 
         for &spec in sig {
             guard!(
@@ -39,13 +39,13 @@ impl<'v, 'a> Walk<'v, 'a> {
                     "helper argument must point to ctx"
                 ),
                 ArgSpec::Map => {
-                    let RegisterState::PtrToMap { map_fd: fd } = self.arg_regs().get(reg) else {
+                    let RegisterState::PtrToMap { map_idx: fd } = self.arg_regs().get(reg) else {
                         guard!(self, "helper argument must point to a map")
                     };
-                    map_fd = Some(fd);
+                    map_idx = Some(fd);
                 }
                 ArgSpec::MapKey | ArgSpec::MapValue | ArgSpec::UninitMapValue => {
-                    let fd = map_fd
+                    let fd = map_idx
                         .ok_or_else(|| self.err("helper map argument has no preceding map"))?;
                     let (key_size, value_size) = self.map_sizes(fd)?;
                     let (len, access) = match spec {
@@ -79,8 +79,8 @@ impl<'v, 'a> Walk<'v, 'a> {
         Ok(())
     }
 
-    fn map_sizes(&self, map_fd: u16) -> Result<(u32, u32), VerifierError> {
-        let sizes = self.verifier().vm.get_map(map_fd).repr.sizes();
+    fn map_sizes(&self, map_idx: u16) -> Result<(u32, u32), VerifierError> {
+        let sizes = self.map(map_idx)?.repr.sizes();
         sizes
             .and_then(|(k, v)| Some((u32::try_from(k).ok()?, u32::try_from(v).ok()?)))
             .ok_or_else(|| self.err("helper does not support this map type"))
@@ -107,8 +107,8 @@ impl<'v, 'a> Walk<'v, 'a> {
                     Access::Write => self.mark_stack_range_written(start..end),
                 }
             }
-            RegisterState::PtrToMapValue { map_fd, offset } => {
-                let (_, value_size) = self.map_sizes(map_fd)?;
+            RegisterState::PtrToMapValue { map_idx, offset } => {
+                let (_, value_size) = self.map_sizes(map_idx)?;
                 guard!(
                     self,
                     offset

@@ -120,6 +120,12 @@ impl WasmVm {
     pub fn dump_pinned_maps(&self) -> Result<String, JsError> {
         map_ops::dump(self.inner.pinned_maps())
     }
+
+    /// Returns whether `name` was pinned. Programs already bound to the map
+    /// keep it, the next load declaring `name` creates a new one.
+    pub fn unpin(&self, name: &str) -> bool {
+        self.inner.unpin(name)
+    }
 }
 
 #[wasm_bindgen]

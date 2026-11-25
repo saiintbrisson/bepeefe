@@ -244,7 +244,7 @@ export interface PerfEventLayoutEvent {
   /** pc of the emitting call. Joins this layout to the runtime
    *  PerfEventOutput payloads and the call's Insn event. */
   pc: number;
-  map_fd: number;
+  map_idx: number;
   /** Payload byte length when known at verification time. */
   size: number | null;
   /** Slots fully inside the payload region. Bytes covered by no slot were
@@ -274,9 +274,9 @@ export type RegisterState =
   | { PtrToPacket: { id: number; offset: ScalarRange } }
   | { PtrToPacketMeta: { id: number; offset: ScalarRange } }
   | { PtrToStack: { offset: ScalarRange } }
-  | { PtrToMap: { map_fd: number } }
-  | { PtrToMapValue: { map_fd: number; offset: ScalarRange } }
-  | { PtrToMapValueOrNull: { map_fd: number } };
+  | { PtrToMap: { map_idx: number } }
+  | { PtrToMapValue: { map_idx: number; offset: ScalarRange } }
+  | { PtrToMapValueOrNull: { map_idx: number } };
 
 export type Scalar = "Unknown" | { U32: ScalarRange } | { U64: ScalarRange };
 

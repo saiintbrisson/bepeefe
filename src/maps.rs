@@ -97,7 +97,6 @@ pub enum MapPinning {
 }
 
 pub struct BpfMap {
-    pub fd: i32,
     pub repr: MapRepr,
     pub spec: MapSpec,
     pub btf: Arc<Btf>,

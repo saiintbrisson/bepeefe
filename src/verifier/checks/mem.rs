@@ -19,8 +19,8 @@ impl<'v, 'a> Walk<'v, 'a> {
                     RegisterState::PtrToStack { offset } => {
                         self.check_ldx_stack(insn, load_size, offset)
                     }
-                    RegisterState::PtrToMapValue { map_fd, offset } => {
-                        self.check_ldx_map_value(insn, load_size, map_fd, offset)
+                    RegisterState::PtrToMapValue { map_idx, offset } => {
+                        self.check_ldx_map_value(insn, load_size, map_idx, offset)
                     }
                     RegisterState::PtrToPacket {
                         offset,
@@ -29,7 +29,7 @@ impl<'v, 'a> Walk<'v, 'a> {
                         ..
                     } => self.check_ldx_pkt(insn, offset, known_ceiling, access),
 
-                    RegisterState::PtrToMap { map_fd: _ } => {
+                    RegisterState::PtrToMap { map_idx: _ } => {
                         return Err(self.err("load through PtrToMap is not supported"));
                     }
                     _ => guard!(self, "invalid memory location"),
@@ -164,10 +164,10 @@ impl<'v, 'a> Walk<'v, 'a> {
         &self,
         insn: &Insn,
         load_size: u32,
-        map_fd: u16,
+        map_idx: u16,
         offset: ScalarRange<u32>,
     ) -> Result<Option<RegisterState>, VerifierError> {
-        let bpf_map = self.verifier().vm.get_map(map_fd);
+        let bpf_map = self.map(map_idx)?;
         let map_val = bpf_map
             .spec
             .value
@@ -217,7 +217,7 @@ impl<'v, 'a> Walk<'v, 'a> {
         Ok(None)
     }
 
-    /// Checks for LD IMM64 instructions. For now, only IMM and MAP FD loads
+    /// Checks for LD IMM64 instructions. For now, only IMM and map slot loads
     /// are supported. Signals for the verifier to skip next instruction.
     pub(super) fn check_non_conventional_ld(&mut self, insn: &Insn) -> Result<(), VerifierError> {
         guard!(
@@ -242,37 +242,17 @@ impl<'v, 'a> Walk<'v, 'a> {
                     RegisterState::Scalar(Scalar::U64(ScalarRange::exact(imm64))),
                 );
             }
-            BPF_PSEUDO_MAP_FD => {
-                guard!(
-                    self,
-                    insn.imm() >> u16::BITS == 0,
-                    "map fd is larger than allowed"
-                );
-                let map_fd = insn.imm() as u16;
-                guard!(
-                    self,
-                    self.verifier().vm.has_map(map_fd),
-                    "referenced non-existing map FD"
-                );
-                self.set_reg(insn.dst_reg(), RegisterState::PtrToMap { map_fd })
+            BPF_PSEUDO_MAP_IDX => {
+                let map_idx = self.map_slot(insn)?;
+                self.set_reg(insn.dst_reg(), RegisterState::PtrToMap { map_idx })
             }
-            BPF_PSEUDO_MAP_VALUE => {
+            BPF_PSEUDO_MAP_IDX_VALUE => {
                 let offset = next.imm() as u32;
-                guard!(
-                    self,
-                    insn.imm() >> u16::BITS == 0,
-                    "map fd is larger than allowed"
-                );
-                let map_fd = insn.imm() as u16;
-                guard!(
-                    self,
-                    self.verifier().vm.has_map(map_fd),
-                    "referenced non-existing map FD"
-                );
+                let map_idx = self.map_slot(insn)?;
                 self.set_reg(
                     insn.dst_reg(),
                     RegisterState::PtrToMapValue {
-                        map_fd,
+                        map_idx,
                         offset: ScalarRange::exact(offset),
                     },
                 );
@@ -298,8 +278,8 @@ impl<'v, 'a> Walk<'v, 'a> {
         match dst_reg {
             RegisterState::Uninit => guard!(self, "store to uninit register"),
             RegisterState::PtrToStack { offset } => self.check_st_stack(insn, store_size, offset),
-            RegisterState::PtrToMapValue { map_fd, offset } => {
-                self.check_st_map_value(insn, store_size, map_fd, offset)
+            RegisterState::PtrToMapValue { map_idx, offset } => {
+                self.check_st_map_value(insn, store_size, map_idx, offset)
             }
             RegisterState::PtrToCtx {
                 btf_id,
@@ -436,10 +416,10 @@ impl<'v, 'a> Walk<'v, 'a> {
         &self,
         insn: &Insn,
         store_size: u32,
-        map_fd: u16,
+        map_idx: u16,
         offset: ScalarRange<u32>,
     ) -> Result<(), VerifierError> {
-        let bpf_map = self.verifier().vm.get_map(map_fd);
+        let bpf_map = self.map(map_idx)?;
         let map_val = bpf_map
             .spec
             .value

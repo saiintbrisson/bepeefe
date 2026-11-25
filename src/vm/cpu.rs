@@ -131,10 +131,10 @@ impl Cpu {
 
     /// # Panics
     ///
-    /// Panics if `fd` is not a known map FD. All callers reach this
-    /// through verifier-validated register states.
-    pub(crate) fn get_map(&self, fd: u16) -> Arc<BpfMap> {
-        self.prog.vm.get_map(fd)
+    /// Panics if `idx` is not one of the program's map slots. All callers
+    /// reach this through verifier-validated register states.
+    pub(crate) fn get_map(&self, idx: u16) -> Arc<BpfMap> {
+        self.prog.map_at(idx).clone()
     }
 
     pub fn prandom_u32(&self) -> u32 {
@@ -219,8 +219,8 @@ impl Cpu {
     #[expect(clippy::unwrap_used, reason = "caller is expected to run verifier")]
     pub fn read<const SIZE: usize>(&self, ptr: u64) -> [u8; SIZE] {
         match TaggedPtr::decode(ptr) {
-            TaggedPtr::Map { fd, offset } => {
-                let map = self.get_map(fd);
+            TaggedPtr::Map { map_idx, offset } => {
+                let map = self.get_map(map_idx);
                 map.repr.read(offset as usize).unwrap()
             }
             TaggedPtr::Local { offset } => self.local_read(offset as usize),
@@ -231,8 +231,8 @@ impl Cpu {
     #[expect(clippy::unwrap_used, reason = "caller is expected to run verifier")]
     pub fn write(&mut self, ptr: u64, src: &[u8]) {
         match TaggedPtr::decode(ptr) {
-            TaggedPtr::Map { fd, offset } => {
-                let map = self.get_map(fd);
+            TaggedPtr::Map { map_idx, offset } => {
+                let map = self.get_map(map_idx);
                 map.repr.write(offset as usize, src).unwrap();
             }
             TaggedPtr::Local { offset } => {
@@ -246,8 +246,8 @@ impl Cpu {
     #[expect(clippy::unwrap_used, reason = "caller is expected to run verifier")]
     pub fn read_bytes(&self, ptr: u64, len: usize) -> Cow<'_, [u8]> {
         match TaggedPtr::decode(ptr) {
-            TaggedPtr::Map { fd, offset } => {
-                let map = self.get_map(fd);
+            TaggedPtr::Map { map_idx, offset } => {
+                let map = self.get_map(map_idx);
                 map.repr.read_bytes(offset as usize, len).unwrap().into()
             }
             TaggedPtr::Local { offset } => self.buf_slice(offset as usize, len).into(),

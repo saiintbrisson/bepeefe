@@ -952,11 +952,12 @@ mod deser {
                     .remove("offset")
                     .ok_or_else(|| ValueError::Serde("missing offset".into()))
                     .and_then(from_value)?;
-                let fd: Option<u16> = m.remove("fd").map(from_value).transpose()?;
+                let map_idx: Option<u16> = m.remove("map_idx").map(from_value).transpose()?;
                 let tp = match region {
                     TaggetPtrType::Map => TaggedPtr::Map {
-                        fd: fd
-                            .ok_or_else(|| ValueError::Serde("missing fd for map region".into()))?,
+                        map_idx: map_idx.ok_or_else(|| {
+                            ValueError::Serde("missing map_idx for map region".into())
+                        })?,
                         offset,
                     },
                     TaggetPtrType::Local => TaggedPtr::Local { offset },
@@ -1058,8 +1059,8 @@ mod deser {
                         ("region", to_value(&tp.region())?),
                         ("offset", Value::Number(tp.offset() as i64)),
                     ];
-                    if let TaggedPtr::Map { fd, .. } = tp {
-                        fields.push(("fd", Value::Number(fd as i64)));
+                    if let TaggedPtr::Map { map_idx, .. } = tp {
+                        fields.push(("map_idx", Value::Number(map_idx as i64)));
                     }
                     visitor.visit_map(MapAccess {
                         iter: fields

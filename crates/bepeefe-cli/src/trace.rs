@@ -251,8 +251,8 @@ pub fn event_line(event: &VerifierEvent<'_>, indent: usize) -> String {
         } => format!("{pad}call-enter id={id} target={target_pc} name={name:?} btf={btf_id:?}"),
         VerifierEvent::CallExit { r0, .. } => format!("{pad}call-exit r0={r0:?}"),
         VerifierEvent::PerfEventLayout {
-            pc, map_fd, size, ..
-        } => format!("{pad}perf-layout pc={pc} map_fd={map_fd} size={size:?}"),
+            pc, map_idx, size, ..
+        } => format!("{pad}perf-layout pc={pc} map_idx={map_idx} size={size:?}"),
         VerifierEvent::Warning { pc, message } => format!("{pad}warning pc={pc} {message}"),
     }
 }

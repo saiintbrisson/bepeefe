@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize, de, ser::SerializeStruct};
 
 const PTR_OFFSET_MASK: u64 = u32::MAX as u64;
-const TAG_MAP_FD_MASK: u64 = (u16::MAX as u64) << 40;
+const TAG_MAP_IDX_MASK: u64 = (u16::MAX as u64) << 40;
 
 const TAG_MASK: u64 = 0b1111 << 60;
 const TAG_MAP: u64 = 1 << 60;
@@ -23,7 +23,7 @@ pub(crate) const TAGGED_PTR_NAME: &str = "$bepeefe::TaggedPtr";
 #[strum_discriminants(derive(serde::Deserialize, serde::Serialize))]
 #[strum_discriminants(serde(rename_all = "lowercase"))]
 pub enum TaggedPtr {
-    Map { fd: u16, offset: u32 },
+    Map { map_idx: u16, offset: u32 },
     Local { offset: u32 },
     Kernel { offset: u32 },
     User { offset: u32 },
@@ -34,8 +34,9 @@ impl TaggedPtr {
         let offset = (raw & PTR_OFFSET_MASK) as u32;
         match raw & TAG_MASK {
             TAG_MAP => {
-                let fd = ((raw & TAG_MAP_FD_MASK) >> TAG_MAP_FD_MASK.trailing_zeros()) as u16;
-                Some(TaggedPtr::Map { fd, offset })
+                let map_idx =
+                    ((raw & TAG_MAP_IDX_MASK) >> TAG_MAP_IDX_MASK.trailing_zeros()) as u16;
+                Some(TaggedPtr::Map { map_idx, offset })
             }
             TAG_LOCAL => Some(TaggedPtr::Local { offset }),
             TAG_KERNEL => Some(TaggedPtr::Kernel { offset }),
@@ -72,15 +73,15 @@ impl TaggedPtr {
 
     pub fn to_raw(self) -> u64 {
         match self {
-            TaggedPtr::Map { fd, offset } => Self::map(fd, offset),
+            TaggedPtr::Map { map_idx, offset } => Self::map(map_idx, offset),
             TaggedPtr::Local { offset } => Self::local(offset),
             TaggedPtr::Kernel { offset } => Self::kernel(offset),
             TaggedPtr::User { offset } => Self::user(offset),
         }
     }
 
-    pub fn map(fd: u16, offset: u32) -> u64 {
-        TAG_MAP | ((fd as u64) << 40) | offset as u64
+    pub fn map(map_idx: u16, offset: u32) -> u64 {
+        TAG_MAP | ((map_idx as u64) << 40) | offset as u64
     }
     pub fn local(offset: u32) -> u64 {
         TAG_LOCAL | offset as u64
@@ -103,8 +104,8 @@ impl Serialize for TaggedPtr {
         let mut s = ser.serialize_struct(TAGGED_PTR_NAME, len)?;
         s.serialize_field("region", &self.region())?;
         s.serialize_field("offset", &self.offset())?;
-        if let TaggedPtr::Map { fd, .. } = self {
-            s.serialize_field("fd", fd)?;
+        if let TaggedPtr::Map { map_idx, .. } = self {
+            s.serialize_field("map_idx", map_idx)?;
         }
         s.end()
     }
@@ -117,12 +118,14 @@ impl<'de> Deserialize<'de> for TaggedPtr {
             region: TaggetPtrType,
             offset: u32,
             #[serde(default)]
-            fd: Option<u16>,
+            map_idx: Option<u16>,
         }
         let h = Helper::deserialize(d)?;
         Ok(match h.region {
             TaggetPtrType::Map => TaggedPtr::Map {
-                fd: h.fd.ok_or_else(|| de::Error::missing_field("fd"))?,
+                map_idx: h
+                    .map_idx
+                    .ok_or_else(|| de::Error::missing_field("map_idx"))?,
                 offset: h.offset,
             },
             TaggetPtrType::Local => TaggedPtr::Local { offset: h.offset },
@@ -140,8 +143,8 @@ mod tests {
     fn round_trip_map() {
         let raw = TaggedPtr::map(0xABCD, 0xDEADBEEF);
         match TaggedPtr::decode(raw) {
-            TaggedPtr::Map { fd, offset } => {
-                assert_eq!(fd, 0xABCD);
+            TaggedPtr::Map { map_idx, offset } => {
+                assert_eq!(map_idx, 0xABCD);
                 assert_eq!(offset, 0xDEADBEEF);
             }
             other => panic!("expected Map, got {other:?}"),

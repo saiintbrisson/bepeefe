@@ -18,9 +18,10 @@ use crate::{
     capture::{Capture, Event},
     hook::ProgType,
     isa::{alu::*, jmp::*, mem::*, *},
+    maps::BpfMap,
     object::EbpfProgram,
     verifier::branch::BranchResult,
-    vm::{MAX_CALL_FRAMES, STACK_SIZE, Vm, helpers},
+    vm::{MAX_CALL_FRAMES, STACK_SIZE, helpers},
 };
 
 pub use {branch::BranchDecision, event::VerifierEvent, walk::PruneSite};
@@ -142,12 +143,12 @@ pub enum RegisterState {
         offset: ScalarRange<u32>,
     },
     PtrToMap {
-        map_fd: u16,
+        map_idx: u16,
     },
     /// A non-null pointer to a map value, returned by `map_lookup_elem`. Either
     /// returned by an array or refined through a check against NULL.
     PtrToMapValue {
-        map_fd: u16,
+        map_idx: u16,
         offset: ScalarRange<u32>,
     },
     /// Pointer to a map value or NULL. Returned by map_lookup_elem. Arrays
@@ -156,7 +157,7 @@ pub enum RegisterState {
     /// Must be bounds-checked against NULL in order to transform into
     /// a [`RegisterState::PtrToMapValue`].
     PtrToMapValueOrNull {
-        map_fd: u16,
+        map_idx: u16,
     },
 }
 
@@ -756,7 +757,8 @@ pub enum WalkOrigin {
 /// One per run. It tracks ids and records the snapshots that the [`Walk`]s
 /// it spawns read and update through a shared borrow.
 pub struct Verifier<'a> {
-    vm: &'a Vm,
+    /// The program's map slots, what `ld_imm64` and map pointers index into.
+    maps: &'a [Arc<BpfMap>],
     prog: Arc<EbpfProgram>,
     config: &'a VerifierConfig,
     /// Walks get their own IDs are forks are created. Needed for reliably
@@ -773,7 +775,7 @@ pub struct Verifier<'a> {
 
 impl<'a> Verifier<'a> {
     pub fn new(
-        vm: &'a Vm,
+        maps: &'a [Arc<BpfMap>],
         prog: Arc<EbpfProgram>,
         config: &'a VerifierConfig,
     ) -> Result<Self, VerifierError> {
@@ -784,7 +786,7 @@ impl<'a> Verifier<'a> {
         }
 
         Ok(Verifier {
-            vm,
+            maps,
             prog,
             config,
             next_walk_id: Cell::new(1),

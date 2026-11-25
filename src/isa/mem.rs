@@ -99,6 +99,10 @@ memsx_insns! {
 pub const BPF_PSEUDO_MAP_FD: u8 = 1;
 /// LD IMM64 will load map_val(map_by_fd(imm)) + next_imm.
 pub const BPF_PSEUDO_MAP_VALUE: u8 = 2;
+/// LD IMM64 will load the map in slot IMM of the program's maps.
+pub const BPF_PSEUDO_MAP_IDX: u8 = 5;
+/// LD IMM64 will load map_val(map_by_idx(imm)) + next_imm.
+pub const BPF_PSEUDO_MAP_IDX_VALUE: u8 = 6;
 
 /// The non-conventional load with IMM mode uses the
 /// wide instruction encoding to construct 64-bit
@@ -138,21 +142,21 @@ pub fn ld_imm64(state: &mut crate::vm::Cpu, insn: Insn) {
 
     match insn.src_reg() {
         0 => state.set_reg(dst, next_imm | imm as u64),
-        BPF_PSEUDO_MAP_FD => state.set_reg(dst, imm as u64),
-        BPF_PSEUDO_MAP_VALUE => {
+        BPF_PSEUDO_MAP_IDX => state.set_reg(dst, imm as u64),
+        BPF_PSEUDO_MAP_IDX_VALUE => {
             let map = state.get_map(imm as u16);
             let Some(base) = map.repr.lookup(&0u32.to_ne_bytes()) else {
                 return;
             };
             state.set_reg(
                 dst,
-                TaggedPtr::map(map.fd as u16, base as u32 + (next_imm >> 32) as u32),
+                TaggedPtr::map(imm as u16, base as u32 + (next_imm >> 32) as u32),
             );
         }
+        // 1 => dst = map_by_fd(imm)                      imm: map fd      dst: map
+        // 2 => dst = map_val(map_by_fd(imm)) + next_imm  imm: map fd      dst: data address
         // 3 => dst = var_addr(imm)                       imm: variable id dst: data address
         // 4 => dst = code_addr(imm)                      imm: integer     dst: code address
-        // 5 => dst = map_by_idx(imm)                     imm: map index   dst: map
-        // 6 => dst = map_val(map_by_idx(imm)) + next_imm imm: map index   dst: data address
         _ => {}
     }
 }

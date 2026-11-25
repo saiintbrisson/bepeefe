@@ -99,7 +99,7 @@ pub enum VerifierEvent<'a> {
         /// pc of the emitting call. Joins this layout to the runtime
         /// [`Event::PerfEventOutput`] payloads and the call's `Insn` event.
         pc: usize,
-        map_fd: u16,
+        map_idx: u16,
         /// Payload byte length when known at verification time.
         size: Option<u32>,
         /// Slots fully inside the payload region. Bytes covered by no slot
@@ -180,13 +180,13 @@ impl VerifierEvent<'_> {
             PerfEventLayout {
                 depth,
                 pc,
-                map_fd,
+                map_idx,
                 size,
                 slots,
             } => PerfEventLayout {
                 depth,
                 pc,
-                map_fd,
+                map_idx,
                 size,
                 slots: Cow::Owned(slots.into_owned()),
             },

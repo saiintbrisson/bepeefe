@@ -188,17 +188,18 @@ impl Arg for Ctx {
 }
 
 pub struct Map {
-    pub fd: u16,
+    /// The program's slot for this map, what map pointers carry.
+    pub idx: u16,
     pub map: Arc<BpfMap>,
 }
 
 impl Arg for Map {
     const SPEC: ArgSpec = ArgSpec::Map;
     fn decode(cur: &mut Cursor<'_>) -> Self {
-        let fd = cur.next(Self::SPEC) as u16;
-        let map = cur.cpu.get_map(fd);
+        let idx = cur.next(Self::SPEC) as u16;
+        let map = cur.cpu.get_map(idx);
         cur.map = Some(map.clone());
-        Self { fd, map }
+        Self { idx, map }
     }
 }
 

@@ -426,7 +426,7 @@ impl<'v, 'a> Walk<'v, 'a> {
             return;
         }
 
-        let RegisterState::PtrToMap { map_fd } = self.reg(2) else {
+        let RegisterState::PtrToMap { map_idx } = self.reg(2) else {
             return;
         };
 
@@ -464,7 +464,7 @@ impl<'v, 'a> Walk<'v, 'a> {
         self.record(VerifierEvent::PerfEventLayout {
             depth: self.depth,
             pc: self.this_pc(),
-            map_fd,
+            map_idx,
             size,
             slots: Cow::Borrowed(&slots),
         });

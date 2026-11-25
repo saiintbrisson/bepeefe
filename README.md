@@ -47,7 +47,7 @@ let obj = EbpfObject::from_elf(PROGRAM)?;
 let prog: EbpfProgram = obj.load_prog("handle_set_state")?;
 ```
 
-Your program needs preparation in order to run. The `Vm` struct holds maps, and different programs can access shared maps. It assigns FDs and IDs to maps, and the program needs this information to rewrite relos targeting them. `Vm::prepare` will find all maps declared in your object, create and assign the metadata necessary, then resolve the relocations with the newly created FDs. Finally, it passes the program through the verifier, checking all possible branches the code takes and tracking memory accesses, helper parameters, and more.
+Your program needs preparation in order to run. `Vm::prepare` binds every map your program declares to a slot, creating it, or reusing a pinned map other programs share through the `Vm`, then rewrites the relocations targeting those maps to point at their slots. Finally, it passes the program through the verifier, checking all possible branches the code takes and tracking memory accesses, helper parameters, and more.
 
 ```rust
 let vm = Vm::new();
@@ -273,11 +273,11 @@ All events emitted by the program are piped through the `Capture` trait in the [
 
 #### Preparing
 
-Running a program requires a `Vm` struct because the map data has to live somewhere. When preparing a program to load (see [`Vm::prepare`](./src/vm/prepare.rs)), maps are effectively created in the VM, or matched against existing ones. `.bss`, `.rodata`, `.data` sections are treated as BPF Array maps, and initialized with the section data if present.
+When preparing a program to load (see [`Vm::prepare`](./src/vm/prepare.rs)), each map the program declares gets a slot, its position in the object's map list. The map in that slot is either created for this load, or for pinned maps, the one already pinned under that name in the `Vm`. `.bss`, `.rodata`, `.data` sections are treated as BPF Array maps, initialized with the section data, and never pinned.
 
-After FDs are assigned, the prepare function does one last pass rewriting the LD IMM64 instructions with the actual map FD and setting the source register to `BPF_PSEUDO_MAP_FD`.
+The LD IMM64 instructions targeting maps are then rewritten to carry the slot, with the source register set to `BPF_PSEUDO_MAP_IDX` (or `BPF_PSEUDO_MAP_IDX_VALUE` for data sections), the same encoding the kernel uses for map indices. Map pointers carry the slot too, so the program never touches a global map table at runtime.
 
-Then the verifier runs. Once that's done, a `PreparedProgram` is created, linked to that VM.
+Then the verifier runs against those slots. Nothing reaches the `Vm` before it passes: only then are new pinned maps registered, and the `PreparedProgram` is created. The program owns its private maps, dropping it frees them, while pinned maps stay until `Vm::unpin`.
 
 #### Helpers
 

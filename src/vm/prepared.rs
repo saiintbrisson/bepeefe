@@ -7,7 +7,7 @@ use super::{
     task::Task,
 };
 use crate::{
-    Value, btf::BtfKind, capture::Capture, error::RuntimeError, object::EbpfProgram,
+    Value, btf::BtfKind, capture::Capture, error::RuntimeError, maps::BpfMap, object::EbpfProgram,
     verifier::VerificationOutput,
 };
 
@@ -15,8 +15,9 @@ pub struct PreparedProgram {
     pub(super) vm: Arc<Vm>,
     pub(super) prog: Arc<EbpfProgram>,
     pub(super) ctx_size: usize,
-    /// Every map the program declares, by name, with the fd it was bound to.
-    pub(super) maps: Vec<(String, i32)>,
+    /// The maps this program is bound to, in the order it declares them.
+    /// `ld_imm64` and map pointers refer to a map by its index here.
+    pub(super) maps: Vec<Arc<BpfMap>>,
     pub(super) max_call_depth: usize,
 }
 
@@ -29,7 +30,7 @@ impl PreparedProgram {
         vm: Arc<Vm>,
         prog: Arc<EbpfProgram>,
         verification_output: VerificationOutput,
-        maps: Vec<(String, i32)>,
+        maps: Vec<Arc<BpfMap>>,
     ) -> Arc<Self> {
         let btf = &prog.btf;
         let total_param_size: u32 = prog
@@ -58,35 +59,46 @@ impl PreparedProgram {
     /// A map this program declares, whether it owns it or shares it through a
     /// pin.
     pub fn map(&self, name: &str) -> Option<MapHandle> {
-        let (_, fd) = self.maps.iter().find(|(n, _)| n == name)?;
-        MapHandle::new(self.vm.get_map(*fd as u16))
+        MapHandle::new(self.find_map(name)?.clone())
     }
 
     pub fn maps(&self) -> Vec<MapHandle> {
         self.maps
             .iter()
-            .filter_map(|(_, fd)| MapHandle::new(self.vm.get_map(*fd as u16)))
+            .cloned()
+            .filter_map(MapHandle::new)
             .collect()
     }
 
     pub fn datasecs(&self) -> Vec<DatasecHandle> {
         self.maps
             .iter()
-            .filter_map(|(name, fd)| self.datasec_at(name, *fd))
+            .filter(|map| map.spec.is_data_section())
+            .filter_map(|map| DatasecHandle::new(map.clone(), map.spec.name.clone()))
             .collect()
     }
 
     pub fn datasec(&self, name: &str) -> Option<DatasecHandle> {
-        let (name, fd) = self.maps.iter().find(|(n, _)| n == name)?;
-        self.datasec_at(name, *fd)
-    }
-
-    fn datasec_at(&self, name: &str, fd: i32) -> Option<DatasecHandle> {
-        let map = self.vm.get_map(fd as u16);
+        let map = self.find_map(name)?;
         if !map.spec.is_data_section() {
             return None;
         }
-        DatasecHandle::new(map, name.to_string())
+        DatasecHandle::new(map.clone(), map.spec.name.clone())
+    }
+
+    fn find_map(&self, name: &str) -> Option<&Arc<BpfMap>> {
+        self.maps.iter().find(|map| map.spec.name == name)
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `idx` is not one of this program's slots. Runtime callers
+    /// only see slots the verifier already checked.
+    #[expect(clippy::panic, reason = "caller is expected to run verifier")]
+    pub(crate) fn map_at(&self, idx: u16) -> &Arc<BpfMap> {
+        self.maps
+            .get(idx as usize)
+            .unwrap_or_else(|| panic!("unknown map slot {idx}"))
     }
 
     pub fn run(&self, image: CtxImage, capture: Option<Arc<dyn Capture>>) -> u64 {

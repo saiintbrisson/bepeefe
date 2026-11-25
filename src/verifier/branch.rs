@@ -167,7 +167,7 @@ pub(super) fn decide_branch(
             let mut result = BranchResult::default();
             let register_state = Some(
                 RegisterState::PtrToMapValue {
-                    map_fd: fd,
+                    map_idx: fd,
                     offset: ScalarRange::exact(0),
                 }
                 .into(),
@@ -387,7 +387,7 @@ mod tests {
     fn decide_branch_map_null() {
         let non_null = Some(
             RegisterState::PtrToMapValue {
-                map_fd: 0,
+                map_idx: 0,
                 offset: ScalarRange::exact(0),
             }
             .into(),

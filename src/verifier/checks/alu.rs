@@ -143,11 +143,11 @@ impl<'v, 'a> super::Walk<'v, 'a> {
                                 .ok_or(self.err("new ptr overflows stack"))?;
                             RegisterState::PtrToStack { offset }
                         }
-                        RegisterState::PtrToMapValue { map_fd, offset } => {
+                        RegisterState::PtrToMapValue { map_idx, offset } => {
                             let offset = offset
                                 .checked_add_signed_range(scalar_min, scalar_max, scalar_stride)
                                 .ok_or(self.err("new ptr to map value overflows map"))?;
-                            RegisterState::PtrToMapValue { map_fd, offset }
+                            RegisterState::PtrToMapValue { map_idx, offset }
                         }
                         _ => guard!(self, "invalid pointer arithmetic operation"),
                     },
@@ -180,11 +180,11 @@ impl<'v, 'a> super::Walk<'v, 'a> {
                                 size,
                             }
                         }
-                        RegisterState::PtrToMapValue { map_fd, offset } => {
+                        RegisterState::PtrToMapValue { map_idx, offset } => {
                             let offset = offset
                                 .checked_add_signed_range(sub_min, sub_max, scalar_stride)
                                 .ok_or(self.err("new ptr to map value overflows map"))?;
-                            RegisterState::PtrToMapValue { map_fd, offset }
+                            RegisterState::PtrToMapValue { map_idx, offset }
                         }
                         _ => guard!(self, "invalid pointer arithmetic operation"),
                     },

@@ -12,7 +12,7 @@ pub(crate) const BPF_F_CURRENT_CPU: u64 = BPF_F_INDEX_MASK;
 
 pub(crate) fn lookup_elem(map: &Map, key: &[u8]) -> Option<u64> {
     let elem = map.map.repr.lookup(key)?;
-    Some(TaggedPtr::map(map.fd, elem as u32))
+    Some(TaggedPtr::map(map.idx, elem as u32))
 }
 
 pub(crate) fn pop(cx: &mut Call<'_>, map: &Map, dst: &Out) -> Result<(), RuntimeError> {

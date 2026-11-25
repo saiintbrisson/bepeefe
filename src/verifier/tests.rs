@@ -25,7 +25,7 @@ use pretty_assertions::assert_eq;
 
 use super::*;
 use crate::{
-    isa::mem::BPF_PSEUDO_MAP_FD,
+    isa::mem::BPF_PSEUDO_MAP_IDX,
     maps::{BPF_MAP_TYPE_HASH, BpfMap, MapRepr, MapSpec},
     object::FunctionSignature,
     verifier::event::PayloadSlot,
@@ -76,7 +76,7 @@ enum RecordedEvent {
     PerfEventLayout {
         depth: usize,
         pc: usize,
-        map_fd: u16,
+        map_idx: u16,
         size: Option<u32>,
         slots: Vec<PayloadSlot>,
     },
@@ -398,11 +398,11 @@ fn verify_with_subprogs(
     Result<VerificationOutput, VerifierError>,
     Vec<RecordedEvent>,
 ) {
-    verify_in(&Vm::new(), insns, subprogs)
+    verify_in(&[], insns, subprogs)
 }
 
 fn verify_in(
-    vm: &Vm,
+    maps: &[Arc<BpfMap>],
     insns: Vec<Insn>,
     subprogs: BTreeMap<usize, FunctionSignature>,
 ) -> (
@@ -424,7 +424,7 @@ fn verify_in(
         capture: Some(log.clone()),
         ..Default::default()
     };
-    let result = Verifier::new(vm, Arc::new(prog), &config)
+    let result = Verifier::new(maps, Arc::new(prog), &config)
         .expect("verifier construction must succeed")
         .run();
     let events = std::mem::take(&mut *log.0.lock().expect("event log lock poisoned"));
@@ -489,17 +489,16 @@ fn helper_call(id: i32) -> Insn {
     encode(BPF_JMP | BPF_CALL | BPF_K, 0, BPF_HELPER_CALL, 0, id)
 }
 
-/// Two instruction words loading map `fd` into `dst`.
-fn ld_map_fd(dst: u8, fd: i32) -> [Insn; 2] {
+/// Two instruction words loading the map in slot `idx` into `dst`.
+fn ld_map_idx(dst: u8, idx: i32) -> [Insn; 2] {
     [
-        encode(0x18, dst, BPF_PSEUDO_MAP_FD, 0, fd),
+        encode(0x18, dst, BPF_PSEUDO_MAP_IDX, 0, idx),
         encode(0, 0, 0, 0, 0),
     ]
 }
 
-/// A VM holding one hash map at fd 0.
-fn vm_with_hash_map(key_size: u32, value_size: u32) -> Arc<Vm> {
-    let vm = Vm::new();
+/// Map slots holding one hash map at slot 0.
+fn hash_map_slots(key_size: u32, value_size: u32) -> Vec<Arc<BpfMap>> {
     let spec = MapSpec {
         name: "map".into(),
         r#type: Some(BPF_MAP_TYPE_HASH),
@@ -510,17 +509,7 @@ fn vm_with_hash_map(key_size: u32, value_size: u32) -> Arc<Vm> {
     };
     let btf = Arc::new(Btf::default());
     let repr = MapRepr::create_from_btf(&btf, &spec).expect("hash map spec must be valid");
-    vm.maps
-        .lock()
-        .expect("map lock poisoned")
-        .by_fd
-        .push(Arc::new(BpfMap {
-            fd: 0,
-            repr,
-            spec,
-            btf,
-        }));
-    vm
+    vec![Arc::new(BpfMap { repr, spec, btf })]
 }
 
 fn exit() -> Insn {
@@ -1017,16 +1006,16 @@ fn stack_read_spanning_two_slots_fails() {
 /// Looks up an 8 byte key whose pointer starts `key_offset` below r10, with
 /// a 4 byte scalar stored there first.
 fn lookup_with_key_at(key_offset: i16) -> Result<VerificationOutput, VerifierError> {
-    let vm = vm_with_hash_map(8, 8);
+    let maps = hash_map_slots(8, 8);
     let mut insns = vec![
         mov64_imm(1, 3000),
         stx(SIZE_W, 10, 1, -key_offset),
         mov64_reg(2, 10),
         alu64_imm(BPF_ADD, 2, -key_offset as i32),
     ];
-    insns.extend(ld_map_fd(1, 0));
+    insns.extend(ld_map_idx(1, 0));
     insns.extend([helper_call(1), exit()]);
-    verify_in(&vm, insns, BTreeMap::new()).0
+    verify_in(&maps, insns, BTreeMap::new()).0
 }
 
 #[test]
@@ -1045,15 +1034,15 @@ fn map_key_within_the_stack_verifies() {
 
 #[test]
 fn map_key_holding_a_spilled_pointer_fails() {
-    let vm = vm_with_hash_map(8, 8);
+    let maps = hash_map_slots(8, 8);
     let mut insns = vec![
         stx(SIZE_DW, 10, 10, -8),
         mov64_reg(2, 10),
         alu64_imm(BPF_ADD, 2, -8),
     ];
-    insns.extend(ld_map_fd(1, 0));
+    insns.extend(ld_map_idx(1, 0));
     insns.extend([helper_call(1), exit()]);
-    let (result, _) = verify_in(&vm, insns, BTreeMap::new());
+    let (result, _) = verify_in(&maps, insns, BTreeMap::new());
 
     let err = result.expect_err("passing a spilled pointer as a key must fail");
     assert!(

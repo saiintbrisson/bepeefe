@@ -1,5 +1,7 @@
 use crate::verifier::{RegisterState, ScalarRange};
-use crate::vm::Vm;
+use std::sync::Arc;
+
+use crate::maps::BpfMap;
 
 use super::args::{Call, Ctx, In, Key, Map, Num, Value, ValueOut};
 use super::{ArgRegs, BpfHelper, map_ops};
@@ -26,18 +28,18 @@ impl BpfHelper for MapLookupElem {
         map_ops::lookup_elem(&map, &key.0).unwrap_or_default()
     }
 
-    fn retval(&self, vm: &Vm, regs: ArgRegs) -> Result<RegisterState, &'static str> {
-        let RegisterState::PtrToMap { map_fd } = regs.get(1) else {
+    fn retval(&self, maps: &[Arc<BpfMap>], regs: ArgRegs) -> Result<RegisterState, &'static str> {
+        let RegisterState::PtrToMap { map_idx } = regs.get(1) else {
             return Err("map_lookup_elem: R1 must be PtrToMap");
         };
-        let map = vm.get_map(map_fd);
+        let map = maps.get(map_idx as usize).ok_or("unknown map slot")?;
         if map.spec.r#type == Some(crate::maps::BPF_MAP_TYPE_ARRAY) {
             Ok(RegisterState::PtrToMapValue {
-                map_fd,
+                map_idx,
                 offset: ScalarRange::exact(0),
             })
         } else {
-            Ok(RegisterState::PtrToMapValueOrNull { map_fd })
+            Ok(RegisterState::PtrToMapValueOrNull { map_idx })
         }
     }
 }
@@ -137,11 +139,11 @@ impl BpfHelper for PerfEventOutput {
         status(map_ops::perf_event_output(cx, &map, flags.0, &data.0))
     }
 
-    fn retval(&self, vm: &Vm, regs: ArgRegs) -> Result<RegisterState, &'static str> {
-        let RegisterState::PtrToMap { map_fd } = regs.get(2) else {
+    fn retval(&self, maps: &[Arc<BpfMap>], regs: ArgRegs) -> Result<RegisterState, &'static str> {
+        let RegisterState::PtrToMap { map_idx } = regs.get(2) else {
             return Err("perf_event_output: R2 must be PtrToMap");
         };
-        let map = vm.get_map(map_fd);
+        let map = maps.get(map_idx as usize).ok_or("unknown map slot")?;
         if map.spec.r#type != Some(crate::maps::BPF_MAP_TYPE_PERF_EVENT_ARRAY) {
             return Err("perf_event_output: R2 map must be BPF_MAP_TYPE_PERF_EVENT_ARRAY");
         }

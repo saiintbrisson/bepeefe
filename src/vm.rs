@@ -26,23 +26,10 @@ pub use task::{Task, TaskError};
 pub use world::World;
 
 pub struct Vm {
-    pub(super) maps: Mutex<MapTable>,
+    /// Maps shared by name across program loads. Every other map lives only as
+    /// long as the programs that hold it.
+    pub(super) pinned: Mutex<BTreeMap<String, Arc<BpfMap>>>,
     world: Mutex<World>,
-}
-
-/// Every map the Vm created, indexed by fd, plus the names programs can share.
-#[derive(Default)]
-pub(super) struct MapTable {
-    pub(super) by_fd: Vec<Arc<BpfMap>>,
-    pub(super) pinned: BTreeMap<String, i32>,
-}
-
-impl MapTable {
-    /// Drops every map from `fd` onwards, along with any pin pointing at one.
-    fn truncate(&mut self, fd: usize) {
-        self.by_fd.truncate(fd);
-        self.pinned.retain(|_, pinned| (*pinned as usize) < fd);
-    }
 }
 
 impl Vm {
@@ -52,27 +39,9 @@ impl Vm {
 
     pub fn with_world(world: World) -> Arc<Self> {
         Arc::new(Self {
-            maps: Default::default(),
+            pinned: Default::default(),
             world: Mutex::new(world),
         })
-    }
-
-    /// # Panics
-    ///
-    /// Panics if `fd` is not a known map FD. All runtime callers reach
-    /// this through verifier-validated register states; the verifier
-    /// itself uses [`Vm::has_map`] to check FDs before they are trusted.
-    #[expect(clippy::panic, reason = "caller is expected to run verifier")]
-    pub(crate) fn get_map(&self, fd: u16) -> Arc<BpfMap> {
-        let maps = self.maps.lock().unwrap();
-        maps.by_fd
-            .get(fd as usize)
-            .cloned()
-            .unwrap_or_else(|| panic!("unknown map fd {fd}"))
-    }
-
-    pub(crate) fn has_map(&self, fd: u16) -> bool {
-        self.maps.lock().unwrap().by_fd.get(fd as usize).is_some()
     }
 
     /// The mutable state shared across invocations.
@@ -83,18 +52,23 @@ impl Vm {
     /// A map shared under `name` by every program that pins it. Maps a single
     /// program owns are accessed through [`PreparedProgram::map`] instead.
     pub fn pinned_map(&self, name: &str) -> Option<MapHandle> {
-        let maps = self.maps.lock().unwrap();
-        let fd = *maps.pinned.get(name)?;
-        MapHandle::new(maps.by_fd.get(fd as usize)?.clone())
+        MapHandle::new(self.pinned.lock().unwrap().get(name)?.clone())
     }
 
     pub fn pinned_maps(&self) -> Vec<MapHandle> {
-        let maps = self.maps.lock().unwrap();
-        maps.pinned
+        self.pinned
+            .lock()
+            .unwrap()
             .values()
-            .filter_map(|&fd| maps.by_fd.get(fd as usize).cloned())
+            .cloned()
             .filter_map(MapHandle::new)
             .collect()
+    }
+
+    /// Removes the pin, so the next load declaring `name` creates a new map.
+    /// Programs already bound to the old map keep it until they're dropped.
+    pub fn unpin(&self, name: &str) -> bool {
+        self.pinned.lock().unwrap().remove(name).is_some()
     }
 }
 

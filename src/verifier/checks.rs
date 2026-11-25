@@ -11,6 +11,20 @@ impl<'v, 'a> Walk<'v, 'a> {
         Ok(())
     }
 
+    fn map(&self, idx: u16) -> Result<&'a Arc<BpfMap>, VerifierError> {
+        self.verifier()
+            .maps
+            .get(idx as usize)
+            .ok_or_else(|| self.err("referenced non-existing map slot"))
+    }
+
+    /// The map slot an `ld_imm64` names, once it's known to exist.
+    fn map_slot(&self, insn: &Insn) -> Result<u16, VerifierError> {
+        let idx = u16::try_from(insn.imm()).map_err(|_| self.err("map slot is out of range"))?;
+        self.map(idx)?;
+        Ok(idx)
+    }
+
     fn dst_state(&self, insn: &Insn) -> RegisterState {
         self.reg(insn.dst_reg())
     }
@@ -188,7 +202,7 @@ impl<'v, 'a> Walk<'v, 'a> {
 
         let lhs = match self.dst_state(insn) {
             RegisterState::Scalar(s) => scalar_to_expr(s),
-            RegisterState::PtrToMapValueOrNull { map_fd } => ExprVal::PtrToMapValueOrNull(map_fd),
+            RegisterState::PtrToMapValueOrNull { map_idx } => ExprVal::PtrToMapValueOrNull(map_idx),
             RegisterState::PtrToPacket { id, offset, .. } => ExprVal::Packet { id, offset },
             RegisterState::PtrToPacketEnd => ExprVal::PacketEnd,
 
@@ -203,8 +217,8 @@ impl<'v, 'a> Walk<'v, 'a> {
         let rhs = match insn.source() {
             Some(Src::Reg(_)) => match self.src_state(insn)? {
                 RegisterState::Scalar(s) => scalar_to_expr(s),
-                RegisterState::PtrToMapValueOrNull { map_fd } => {
-                    ExprVal::PtrToMapValueOrNull(map_fd)
+                RegisterState::PtrToMapValueOrNull { map_idx } => {
+                    ExprVal::PtrToMapValueOrNull(map_idx)
                 }
                 RegisterState::PtrToPacket { id, offset, .. } => ExprVal::Packet { id, offset },
                 RegisterState::PtrToPacketEnd => ExprVal::PacketEnd,
@@ -243,7 +257,7 @@ impl<'v, 'a> Walk<'v, 'a> {
                 }
 
                 let retval = helper
-                    .retval(self.verifier().vm, self.arg_regs())
+                    .retval(self.verifier().maps, self.arg_regs())
                     .map_err(|msg| self.err(msg))?;
                 self.set_reg(0, retval);
             }
