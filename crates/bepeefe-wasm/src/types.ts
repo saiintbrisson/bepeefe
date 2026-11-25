@@ -300,4 +300,7 @@ export interface JsonSchema {
   bit_offset?: number;
   /** Width in bits of a bitfield member. Absent on plain members. */
   bits?: number;
+  /** A struct or union past the `max_hops` budget, left without members.
+   *  Expand it with `type_schema(type_id, ...)`. */
+  truncated?: boolean;
 }

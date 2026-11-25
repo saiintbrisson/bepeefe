@@ -103,7 +103,7 @@ impl WasmObject {
                         .map(|(name, tid)| ParamSchema {
                             name: name.clone(),
                             type_id: tid.0,
-                            schema: schema::type_to_schema(*tid, self.btf.inner()),
+                            schema: schema::type_to_schema(*tid, self.btf.inner(), None),
                         })
                         .collect(),
                 }
@@ -128,8 +128,12 @@ impl WasmObject {
                 value_size: m.value_size,
                 key_type_id: m.key.map(|t| t.0),
                 value_type_id: m.value.map(|t| t.0),
-                key: m.key.map(|t| schema::type_to_schema(t, self.btf.inner())),
-                value: m.value.map(|t| schema::type_to_schema(t, self.btf.inner())),
+                key: m
+                    .key
+                    .map(|t| schema::type_to_schema(t, self.btf.inner(), None)),
+                value: m
+                    .value
+                    .map(|t| schema::type_to_schema(t, self.btf.inner(), None)),
             })
             .collect();
         to_js(&out)
@@ -137,8 +141,8 @@ impl WasmObject {
 
     /// Single-type schema lookup for an BTF id.
     #[wasm_bindgen(unchecked_return_type = "JsonSchema")]
-    pub fn type_schema(&self, type_id: u32) -> Result<JsValue, JsError> {
-        self.btf.type_schema(type_id)
+    pub fn type_schema(&self, type_id: u32, max_hops: Option<u32>) -> Result<JsValue, JsError> {
+        self.btf.type_schema(type_id, max_hops)
     }
 
     /// CO-RE relocations from .BTF.ext, each with its access path resolved

@@ -78,6 +78,11 @@ pub struct JsonSchema {
     /// Width in bits of a bitfield member. Absent on plain members.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bits: Option<u32>,
+
+    /// Set on a struct or union left unexpanded because the walk ran out of
+    /// pointer hops. `type_id` still points at the full definition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -99,12 +104,20 @@ pub struct JsonSchemaVariant {
     pub schema: JsonSchema,
 }
 
-pub fn type_to_schema(type_id: BtfTypeId, btf: &Btf) -> JsonSchema {
+/// `max_hops` caps how many pointers the walk follows into their pointees.
+/// Every pointer path is expanded separately, so a graph as connected as
+/// vmlinux grows exponentially with depth and never finishes unbounded.
+pub fn type_to_schema(type_id: BtfTypeId, btf: &Btf, max_hops: Option<u32>) -> JsonSchema {
     let mut seen = HashSet::new();
-    walk(type_id, btf, &mut seen)
+    walk(type_id, btf, &mut seen, max_hops)
 }
 
-fn walk(type_id: BtfTypeId, btf: &Btf, seen: &mut HashSet<BtfTypeId>) -> JsonSchema {
+fn walk(
+    type_id: BtfTypeId,
+    btf: &Btf,
+    seen: &mut HashSet<BtfTypeId>,
+    hops: Option<u32>,
+) -> JsonSchema {
     let mut ptr_depth: u32 = 0;
     let mut walk_id = type_id;
     let mut typedef_name: Option<String> = None;
@@ -152,6 +165,17 @@ fn walk(type_id: BtfTypeId, btf: &Btf, seen: &mut HashSet<BtfTypeId>) -> JsonSch
         });
     };
 
+    let hops = match hops.map(|h| h.checked_sub(ptr_depth)) {
+        Some(None) if matches!(ty.kind, BtfKind::Struct(_) | BtfKind::Union(_)) => {
+            let union = matches!(ty.kind, BtfKind::Union(_));
+            return finish(JsonSchema {
+                truncated: Some(true),
+                ..recursive_stub(union)
+            });
+        }
+        hops => hops.map(Option::unwrap_or_default),
+    };
+
     let schema = match &ty.kind {
         BtfKind::DeclTag => JsonSchema {
             schema_type: Some(JsonSchemaType::Integer),
@@ -189,7 +213,7 @@ fn walk(type_id: BtfTypeId, btf: &Btf, seen: &mut HashSet<BtfTypeId>) -> JsonSch
                 .enumerate()
                 .map(|(idx, member)| {
                     let key = btf.member_name(member, idx).into_owned();
-                    (key, member_schema(member, btf, seen))
+                    (key, member_schema(member, btf, seen, hops))
                 })
                 .collect();
             seen.remove(&walk_id);
@@ -212,7 +236,7 @@ fn walk(type_id: BtfTypeId, btf: &Btf, seen: &mut HashSet<BtfTypeId>) -> JsonSch
                 .iter()
                 .enumerate()
                 .map(|(idx, member)| {
-                    let mut sub = member_schema(member, btf, seen);
+                    let mut sub = member_schema(member, btf, seen, hops);
                     let title = match named(btf, member.name_off) {
                         Some(name) => {
                             sub.member = Some(name.clone());
@@ -239,7 +263,7 @@ fn walk(type_id: BtfTypeId, btf: &Btf, seen: &mut HashSet<BtfTypeId>) -> JsonSch
 
         BtfKind::Array(a) => JsonSchema {
             schema_type: Some(JsonSchemaType::Array),
-            items: Some(Box::new(walk(a.r#type, btf, seen))),
+            items: Some(Box::new(walk(a.r#type, btf, seen, hops))),
             min_items: Some(a.no_elems),
             max_items: Some(a.no_elems),
             ..Default::default()
@@ -311,8 +335,13 @@ fn recursive_stub(union: bool) -> JsonSchema {
     }
 }
 
-fn member_schema(member: &StructMember, btf: &Btf, seen: &mut HashSet<BtfTypeId>) -> JsonSchema {
-    let mut sub = walk(member.r#type, btf, seen);
+fn member_schema(
+    member: &StructMember,
+    btf: &Btf,
+    seen: &mut HashSet<BtfTypeId>,
+    hops: Option<u32>,
+) -> JsonSchema {
+    let mut sub = walk(member.r#type, btf, seen, hops);
     sub.bit_offset = Some(member.offset);
     sub.bits = bitfield_width(member.bitfield_size);
     sub
@@ -371,7 +400,7 @@ mod tests {
     use serde_json::json;
 
     fn schema_json(id: BtfTypeId, btf: &Btf) -> serde_json::Value {
-        serde_json::to_value(type_to_schema(id, btf)).unwrap()
+        serde_json::to_value(type_to_schema(id, btf, None)).unwrap()
     }
 
     #[test]
@@ -463,5 +492,40 @@ mod tests {
         assert_eq!(v["properties"]["a"]["bits"], json!(4));
         assert_eq!(v["properties"]["a"]["bit_offset"], json!(0));
         assert_eq!(v["required"][0], "a");
+    }
+
+    #[test]
+    fn hop_budget_truncates_pointees_past_it() {
+        let mut b = BtfBuilder::default();
+        let int = b.add_int("int", 4, BTF_INT_SIGNED);
+        let leaf = b.make_struct("leaf", 4, |s| {
+            s.field("x", int, 0);
+        });
+        let leaf_ptr = b.add_ptr(leaf);
+        let mid = b.make_struct("mid", 8, |s| {
+            s.field("leaf", leaf_ptr, 0);
+        });
+        let mid_ptr = b.add_ptr(mid);
+        let int_ptr = b.add_ptr(int);
+        let root = b.make_struct("root", 16, |s| {
+            s.field("mid", mid_ptr, 0).field("count", int_ptr, 64);
+        });
+        let btf = b.build();
+
+        let at = |hops| serde_json::to_value(type_to_schema(root, &btf, Some(hops))).unwrap();
+
+        let v = at(0);
+        assert_eq!(v["properties"]["mid"]["truncated"], true);
+        assert_eq!(v["properties"]["mid"]["type_id"], json!(mid.0));
+        assert_eq!(v["properties"]["count"]["type"], "integer");
+
+        let v = at(1);
+        let mid = &v["properties"]["mid"];
+        assert_eq!(mid["truncated"], serde_json::Value::Null);
+        assert_eq!(mid["properties"]["leaf"]["truncated"], true);
+
+        let v = at(2);
+        let leaf = &v["properties"]["mid"]["properties"]["leaf"];
+        assert_eq!(leaf["properties"]["x"]["type"], "integer");
     }
 }

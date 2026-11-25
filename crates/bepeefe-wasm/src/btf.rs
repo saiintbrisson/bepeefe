@@ -93,9 +93,16 @@ impl WasmBtf {
         serde_json::to_string(&value).map_err(js_err)
     }
 
+    /// Follows at most `max_hops` pointers into their pointees, or all of
+    /// them when unset. Leave it unset only for small object BTF, since
+    /// vmlinux reaches millions of nodes within ten hops.
     #[wasm_bindgen(unchecked_return_type = "JsonSchema")]
-    pub fn type_schema(&self, type_id: u32) -> Result<JsValue, JsError> {
-        to_js(&schema::type_to_schema(BtfTypeId(type_id), &self.inner))
+    pub fn type_schema(&self, type_id: u32, max_hops: Option<u32>) -> Result<JsValue, JsError> {
+        to_js(&schema::type_to_schema(
+            BtfTypeId(type_id),
+            &self.inner,
+            max_hops,
+        ))
     }
 }
 
