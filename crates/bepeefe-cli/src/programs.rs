@@ -1,15 +1,15 @@
 //! The `programs` subcommand. Listing, inspecting, and disassembling.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use bepeefe::{
     EbpfObject,
-    btf::Btf,
+    btf::{Btf, BtfTypeId},
     capture::Capture,
     hook::{Attach, Hook},
     isa::Insn,
     object::FunctionSignature,
-    verifier::VerifierConfig,
+    verifier::{FieldRule, VerifierConfig},
     vm::{MapReuseStrategy, Vm},
 };
 use tabled::Tabled;

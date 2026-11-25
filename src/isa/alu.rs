@@ -133,7 +133,7 @@ macro_rules! signed_alu {
                         let $imm = insn.imm() as u64;
                         $func as u64
                     })+
-                    _ => unreachable!(),
+                    _ => unreachable!(concat!(stringify!($name), "does not support a given offset")),
                 };
                 state.set_reg(dst_idx, val);
             }

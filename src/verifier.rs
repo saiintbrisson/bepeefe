@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use branch::{ExprRange, ExprVal, decide_branch, scalar_reg};
+use branch::{ExprRange, ExprVal, decide_branch};
 
 use crate::{
     btf::{Btf, BtfKind, BtfTypeId},
@@ -124,6 +124,8 @@ pub enum RegisterState {
         /// same packet section as `ptr(id=1, offset=0)`.
         id: u32,
         offset: ScalarRange<u32>,
+        known_ceiling: Option<ScalarRange<u32>>,
+        access: FieldAccess,
     },
     /// Pointer one past the last valid packet byte. Used only as the right
     /// operand of comparisons that refine a [`PtrToPacket`].
@@ -133,6 +135,8 @@ pub enum RegisterState {
     PtrToPacketMeta {
         id: u32,
         offset: ScalarRange<u32>,
+        known_ceiling: Option<ScalarRange<u32>>,
+        access: FieldAccess,
     },
     PtrToStack {
         offset: ScalarRange<u32>,
@@ -223,8 +227,11 @@ impl<T: Copy + PartialEq + PartialOrd> ScalarRange<T> {
     pub fn contains(&self, val: T) -> bool {
         val >= self.min && val <= self.max
     }
-    pub fn overlap(&self, other: &Self) -> bool {
+    pub fn overlaps(&self, other: &Self) -> bool {
         self.min <= other.max && other.min <= self.max
+    }
+    pub fn contains_range(&self, other: &Self) -> bool {
+        self.min <= other.min && other.max <= self.max
     }
 }
 
@@ -468,6 +475,13 @@ impl RegisterState {
         }
     }
 
+    pub fn is_pkt_pointer(&self) -> bool {
+        matches!(
+            self,
+            Self::PtrToPacket { .. } | Self::PtrToPacketEnd | Self::PtrToPacketMeta { .. }
+        )
+    }
+
     pub fn is_scalar(&self) -> bool {
         matches!(self, Self::Scalar(_))
     }
@@ -477,6 +491,24 @@ pub struct VerifierConfig {
     pub max_insns: usize,
     pub max_ctx_params: usize,
     pub allow_unreachable: bool,
+    /// Like the Kernel's env flag.
+    ///
+    /// Pointer leaks means that non ALU64 operations on pointer registers are
+    /// allowed, demoting their state to a unknown scalar. Specially useful when
+    /// computing things like `PTR_TO_PKT_END - PTR_TO_PKT`, which use ALU32
+    /// instructions.
+    ///
+    /// Here, this flag has a more limited reading: the _only_ case I cared to
+    /// implement was the one mentioned above.
+    ///
+    /// Why "leaks"? Well, the verifier is very careful to avoid exposing
+    /// pointer values to things like print helpers. The printk helper only
+    /// takes scalar values, for example. The flag allows you to do things such
+    /// as  `PTR_TO_STACK - PTR_TO_MAP_VALUE_OR_NULL` while the latter is NULL,
+    /// meaning the kernel stack pointer becomes a scalar and can be leaked.
+    ///
+    /// True by default.
+    pub allow_ptr_leaks: bool,
     /// Per-field policy for context pointers.
     ///
     /// Allows configuring custom verifier behavior like matching
@@ -497,6 +529,7 @@ impl Default for VerifierConfig {
             max_insns: u16::MAX as usize,
             max_ctx_params: 1,
             allow_unreachable: false,
+            allow_ptr_leaks: true,
             field_rules: BTreeMap::new(),
             capture: None,
         }
@@ -511,7 +544,8 @@ pub struct FieldRule {
     pub load_reg: Option<FieldRegKind>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub enum FieldAccess {
     Read,
     Write,
@@ -590,26 +624,47 @@ impl<'de> serde::Deserialize<'de> for RegMask {
 ///
 /// The size and verifier state stored there, plus the pc of the store that
 /// wrote it. Written and read by the store/load checks.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StackSlot {
-    size: u32,
+    size: MemSize,
     state: RegisterState,
     pc: usize,
 }
 
+/// How does the stack slot overlap with the given range?
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StackSlotOverlap {
+    /// The ranges don't overlap.
+    Disjoint,
+    /// Ranges match exactly.
+    Exact,
+    /// The ranges intersect but don't match exactly.
+    Partial(Bounds),
+}
+
+/// Is the partial overlap within slot bounds or crosses them?
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bounds {
+    /// Access is entirely within slot.
+    Within,
+    /// The access runs past at least one of the slot's boundaries.
+    Crossing,
+}
+
 impl StackSlot {
-    /// Whether a store of `store_size` bytes at `dst` partially overwrites this
-    /// slot sitting at `addr`, meaning the two byte ranges intersect but the
-    /// store does not exactly replace the slot.
-    ///
-    /// An exact replacement overwrites cleanly and a disjoint store leaves the
-    /// slot alone, only a partial overlap has to clear the stale slot.
-    fn partially_overwritten_by(&self, addr: u32, dst: u32, store_size: u32) -> bool {
-        let obj_end = addr + self.size;
-        let write_end = dst + store_size;
-        let exact = addr == dst && self.size == store_size;
-        let disjoint = write_end <= addr || dst >= obj_end;
-        !exact && !disjoint
+    /// Whether an `access` range overlaps against this slot at `addr`.
+    fn overlap(&self, addr: u32, access: Range<u32>) -> StackSlotOverlap {
+        let slot = addr..addr + self.size.bytes();
+
+        if access == slot {
+            StackSlotOverlap::Exact
+        } else if access.end <= slot.start || access.start >= slot.end {
+            StackSlotOverlap::Disjoint
+        } else if access.start >= slot.start && access.end <= slot.end {
+            StackSlotOverlap::Partial(Bounds::Within)
+        } else {
+            StackSlotOverlap::Partial(Bounds::Crossing)
+        }
     }
 }
 
@@ -657,13 +712,29 @@ impl Frame {
             expected_return,
         }
     }
+
+    /// Every slot intersecting with an `access` range, in address order, and
+    /// how they overlap.
+    ///
+    /// Slots are keyed by their first byte and are at most
+    /// [`MemSize::MAX_BYTES`] bytes in length, so anything overlapping with
+    /// `access` starts within that distance below it.
+    fn slots_overlapping(
+        &self,
+        access: Range<u32>,
+    ) -> impl Iterator<Item = (u32, &StackSlot, StackSlotOverlap)> {
+        self.stack_objects
+            .range(access.start.saturating_sub(MemSize::MAX_BYTES)..access.end)
+            .filter_map(
+                move |(&addr, slot)| match slot.overlap(addr, access.clone()) {
+                    StackSlotOverlap::Disjoint => None,
+                    overlap => Some((addr, slot, overlap)),
+                },
+            )
+    }
 }
 
-/// The addressable stack, from the lowest byte to just past the top. Every
-/// frame uses the whole `0..STACK_SIZE` range.
-const STACK_RANGE: Range<u32> = 0..STACK_SIZE as u32;
-
-/// How a walk came to exist.
+/// What started this walk.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 #[cfg_attr(test, derive(serde::Deserialize))]
 pub enum WalkOrigin {

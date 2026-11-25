@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use wasm_bindgen::prelude::*;
 
 use bepeefe::{
-    btf::value::Value,
+    btf::{BtfTypeId, value::Value},
     maps::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY},
-    verifier::VerifierConfig,
+    verifier::{FieldRule, VerifierConfig},
     vm::{Cpu, CtxImage, MapHandle, MapReuseStrategy, PreparedProgram, Task, Vm, World},
 };
 

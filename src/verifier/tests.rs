@@ -446,6 +446,14 @@ fn alu64_reg(op: u8, dst: u8, src: u8) -> Insn {
     encode(BPF_ALU64 | op | BPF_X, dst, src, 0, 0)
 }
 
+fn stx(size: u8, dst: u8, src: u8, offset: i16) -> Insn {
+    encode(BPF_STX | MODE_MEM | size, dst, src, offset, 0)
+}
+
+fn ldx(size: u8, dst: u8, src: u8, offset: i16) -> Insn {
+    encode(BPF_LDX | MODE_MEM | size, dst, src, offset, 0)
+}
+
 fn jeq_imm(dst: u8, imm: i32, offset: i16) -> Insn {
     encode(BPF_JMP | BPF_JEQ | BPF_K, dst, 0, offset, imm)
 }
@@ -873,21 +881,82 @@ fn stack_pointer_underflow_fails() {
 }
 
 #[test]
-fn stack_slot_partial_overwrite_detection() {
-    let slot = |size: u32| StackSlot {
+fn stack_slot_overlap() {
+    let slot = |size: MemSize| StackSlot {
         size,
         state: unknown(),
         pc: 0,
     };
 
-    assert!(!slot(4).partially_overwritten_by(8, 8, 4));
+    use MemSize::{Dword, Half, Word};
+    use StackSlotOverlap::{Disjoint, Exact, Partial};
 
-    assert!(!slot(4).partially_overwritten_by(0, 8, 4));
-    assert!(!slot(4).partially_overwritten_by(16, 8, 4));
-    assert!(!slot(4).partially_overwritten_by(12, 8, 4));
+    // an access of the same size at the same address
+    assert_eq!(slot(Word).overlap(8, 8..12), Exact);
 
-    assert!(slot(8).partially_overwritten_by(10, 8, 4));
-    assert!(slot(8).partially_overwritten_by(4, 8, 4));
-    assert!(slot(8).partially_overwritten_by(8, 8, 4));
-    assert!(slot(2).partially_overwritten_by(8, 8, 8));
+    // slots sitting entirely before or after the access
+    assert_eq!(slot(Word).overlap(0, 8..12), Disjoint);
+    assert_eq!(slot(Word).overlap(16, 8..12), Disjoint);
+    assert_eq!(slot(Word).overlap(12, 8..12), Disjoint);
+
+    // the access sits inside the slot, sharing its head, its tail, or neither
+    assert_eq!(slot(Dword).overlap(8, 8..12), Partial(Bounds::Within));
+    assert_eq!(slot(Dword).overlap(4, 8..12), Partial(Bounds::Within));
+    assert_eq!(slot(Dword).overlap(6, 8..12), Partial(Bounds::Within));
+
+    // the access runs off the slot's front, its back, and both at once
+    assert_eq!(slot(Dword).overlap(10, 8..12), Partial(Bounds::Crossing));
+    assert_eq!(slot(Dword).overlap(2, 8..12), Partial(Bounds::Crossing));
+    assert_eq!(slot(Half).overlap(8, 8..16), Partial(Bounds::Crossing));
+}
+
+#[test]
+fn partial_stack_read_of_a_scalar_is_unknown() {
+    let (result, _) = verify(vec![
+        mov64_imm(1, 0x1234),
+        stx(SIZE_DW, 10, 1, -8),
+        ldx(SIZE_W, 0, 10, -8),
+        exit(),
+    ]);
+
+    result.expect("reading half of a scalar slot must verify");
+}
+
+#[test]
+fn partial_stack_read_of_a_pointer_fails() {
+    let (result, _) = verify(vec![
+        stx(SIZE_DW, 10, 10, -8),
+        ldx(SIZE_W, 0, 10, -8),
+        exit(),
+    ]);
+
+    let err = result.expect_err("reading half of a pointer must fail verification");
+    assert!(err.to_string().contains("would leak a pointer"));
+}
+
+#[test]
+fn stack_read_crossing_a_slot_fails() {
+    let (result, _) = verify(vec![
+        mov64_imm(1, 1),
+        stx(SIZE_W, 10, 1, -8),
+        ldx(SIZE_DW, 0, 10, -8),
+        exit(),
+    ]);
+
+    let err = result.expect_err("reading past a slot's end must fail verification");
+    assert!(err.to_string().contains("crosses a slot boundary"));
+}
+
+#[test]
+fn stack_read_spanning_two_slots_fails() {
+    let (result, _) = verify(vec![
+        mov64_imm(1, 1),
+        stx(SIZE_W, 10, 1, -8),
+        stx(SIZE_W, 10, 1, -4),
+        ldx(SIZE_DW, 0, 10, -8),
+        exit(),
+    ]);
+
+    let err = result.expect_err("reading across two slots must fail verification");
+    assert!(err.to_string().contains("crosses a slot boundary"));
 }

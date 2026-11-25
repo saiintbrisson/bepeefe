@@ -10,27 +10,18 @@ impl<'v, 'a> Walk<'v, 'a> {
         Ok(())
     }
 
-    fn dst_reg(&self, insn: &Insn) -> RegisterState {
+    fn dst_state(&self, insn: &Insn) -> RegisterState {
         self.reg(insn.dst_reg())
     }
 
-    fn src_reg(&self, insn: &Insn) -> Result<RegisterState, VerifierError> {
+    fn src_state(&self, insn: &Insn) -> Result<RegisterState, VerifierError> {
         guard!(self, insn.src_reg() <= 10, "invalid src register value");
 
-        let jmp_op = insn.opcode() & JMP_OP_MASK;
-        let is_x = insn.opcode() & BPF_X == BPF_X;
-
-        let has_src = match insn.class() {
-            BPF_ALU32 | BPF_ALU64 => is_x,
-            BPF_LDX => true,
-            BPF_ST | BPF_STX => insn.class() == BPF_STX,
-            BPF_JMP32 | BPF_JMP if jmp_op == BPF_CALL => false,
-            BPF_JMP32 | BPF_JMP => is_x,
-            _ => false,
+        let Some(Src::Reg(reg)) = insn.source() else {
+            guard!(self, "instruction doesn't take src register")
         };
 
-        guard!(self, has_src, "instruction doesn't take src register");
-        Ok(self.reg(insn.src_reg()))
+        Ok(self.reg(reg))
     }
 
     /// Emits warning events for common pitfalls a developer might make.
@@ -123,10 +114,8 @@ impl<'v, 'a> Walk<'v, 'a> {
             return Ok(());
         }
 
-        let offset = if insn.opcode() == BPF_JMP32 | BPF_K | BPF_JA {
-            insn.imm()
-        } else {
-            insn.offset() as i32
+        let Some(offset) = insn.jump_offset() else {
+            guard!(self, "jump without a target")
         };
         let target_pc = self.next_pc() as isize + offset as isize;
 
@@ -139,15 +128,14 @@ impl<'v, 'a> Walk<'v, 'a> {
         );
 
         if jmp_op == BPF_JA {
-            // TODO: this is an unconditional jump we shouldnt run it in a separate state
-            // just override the current PC
             return self.run_decision(insn, BranchResult::skip_fallthrough());
         }
 
         let signed = matches!(jmp_op, BPF_JSGT | BPF_JSGE | BPF_JSLT | BPF_JSLE);
+        let jmp32 = insn.width().is_32();
 
         let known_val = |val: u64| {
-            let val = if insn.class() == BPF_JMP32 {
+            let val = if jmp32 {
                 if signed {
                     val as u32 as i32 as i64 as u64
                 } else {
@@ -163,8 +151,7 @@ impl<'v, 'a> Walk<'v, 'a> {
             })
         };
 
-        let scalar_to_expr = |s: Scalar, class: u8| -> ExprVal {
-            let jmp32 = class == BPF_JMP32;
+        let scalar_to_expr = |s: Scalar| -> ExprVal {
             let mask = if jmp32 { u32::MAX as u64 } else { u64::MAX };
             let (min, max, stride) = match s {
                 Scalar::U32(r) => (r.min as u64, r.max as u64, r.stride as u64),
@@ -193,9 +180,11 @@ impl<'v, 'a> Walk<'v, 'a> {
             }
         };
 
-        let lhs = match self.dst_reg(insn) {
-            RegisterState::Scalar(s) => scalar_to_expr(s, insn.class()),
+        let lhs = match self.dst_state(insn) {
+            RegisterState::Scalar(s) => scalar_to_expr(s),
             RegisterState::PtrToMapValueOrNull { map_fd } => ExprVal::PtrToMapValueOrNull(map_fd),
+            RegisterState::PtrToPacket { id, offset, .. } => ExprVal::Packet { id, offset },
+            RegisterState::PtrToPacketEnd => ExprVal::PacketEnd,
 
             // There's no refinement to be done
             RegisterState::PtrToMapValue { .. } => {
@@ -205,23 +194,26 @@ impl<'v, 'a> Walk<'v, 'a> {
             _ => guard!(self, "unsupported dst register for comparison"),
         };
 
-        let rhs = match self.src_reg(insn) {
-            Err(_) => known_val(insn.imm() as u32 as u64),
-            Ok(RegisterState::Scalar(s)) => scalar_to_expr(s, insn.class()),
-            Ok(RegisterState::PtrToMapValueOrNull { map_fd }) => {
-                ExprVal::PtrToMapValueOrNull(map_fd)
-            }
+        let rhs = match insn.source() {
+            Some(Src::Reg(_)) => match self.src_state(insn)? {
+                RegisterState::Scalar(s) => scalar_to_expr(s),
+                RegisterState::PtrToMapValueOrNull { map_fd } => {
+                    ExprVal::PtrToMapValueOrNull(map_fd)
+                }
+                RegisterState::PtrToPacket { id, offset, .. } => ExprVal::Packet { id, offset },
+                RegisterState::PtrToPacketEnd => ExprVal::PacketEnd,
 
-            // There's no refinement to be done
-            Ok(RegisterState::PtrToMapValue { .. }) => {
-                return self.run_decision(insn, BranchResult::both());
-            }
+                // There's no refinement to be done
+                RegisterState::PtrToMapValue { .. } => {
+                    return self.run_decision(insn, BranchResult::both());
+                }
 
-            Ok(_) => guard!(self, "unsupported src register for comparison"),
+                _ => guard!(self, "unsupported src register for comparison"),
+            },
+            _ => known_val(insn.imm() as u32 as u64),
         };
 
-        let branch = decide_branch(jmp_op, lhs, rhs, insn.class() == BPF_JMP32)
-            .map_err(|msg| self.err(msg))?;
+        let branch = decide_branch(jmp_op, lhs, rhs, jmp32).map_err(|msg| self.err(msg))?;
 
         self.run_decision(insn, branch)
     }
@@ -233,17 +225,17 @@ impl<'v, 'a> Walk<'v, 'a> {
             "call must be BPF_JMP | BPF_K"
         );
 
-        match insn.src_reg() {
-            BPF_PSEUDO_CALL => self.check_pseudo_call(insn)?,
-            BPF_HELPER_CALL => {
-                let helper = helpers::lookup(insn.imm())
+        match insn.call_kind() {
+            Some(CallKind::Subprog(_)) => self.check_pseudo_call(insn)?,
+            Some(CallKind::Helper(id)) => {
+                let helper = helpers::lookup(id)
                     .ok_or_else(|| self.err("BPF_HELPER_CALL refers to invalid helper ID"))?;
                 let args = self.arg_regs();
                 helper
                     .params(self.verifier().vm, args, *insn)
                     .map_err(|_| self.err("helper parameter validation failed"))?;
 
-                if insn.imm() == helpers::PerfEventOutput::ID {
+                if id == helpers::PerfEventOutput::ID {
                     self.record_perf_event_layout();
                 }
 
@@ -259,7 +251,10 @@ impl<'v, 'a> Walk<'v, 'a> {
     }
 
     fn check_pseudo_call(&mut self, insn: &Insn) -> Result<(), VerifierError> {
-        let target_pc = (self.next_pc() as isize + insn.imm() as isize) as usize;
+        let Some(target_pc) = insn.jump_target(self.this_pc()) else {
+            guard!(self, "call target is not a subprogram call")
+        };
+        let target_pc = target_pc as usize;
         let callee_sig = self
             .verifier()
             .prog
@@ -312,6 +307,7 @@ impl<'v, 'a> Walk<'v, 'a> {
 
         let sub = self.enter_subprog(target_pc, callee_sig.return_type, callee_registers);
         let sub_out = sub.run()?;
+        // TODO: ensure this is a scalar
         self.set_reg(0, sub_out.r0);
 
         for i in 1..=5 {

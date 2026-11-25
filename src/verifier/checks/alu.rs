@@ -1,12 +1,13 @@
 use super::*;
 
-impl<'v, 'a> Walk<'v, 'a> {
+impl<'v, 'a> super::Walk<'v, 'a> {
     pub(super) fn check_alu(&mut self, insn: &Insn) -> Result<(), VerifierError> {
         let op = insn.opcode() & ALU_OP_MASK;
 
-        let src = if let Ok(src_state) = self.src_reg(insn) {
+        let src = if let Some(Src::Reg(_)) = insn.source() {
             guard!(self, insn.imm() == 0, "illegal reserved imm field");
 
+            let src_state = self.src_state(insn)?;
             guard!(
                 self,
                 src_state != RegisterState::Uninit,
@@ -21,10 +22,18 @@ impl<'v, 'a> Walk<'v, 'a> {
                 "illegal reserved src register field"
             );
 
+            if insn.is_swap() {
+                guard!(
+                    self,
+                    insn.imm() as u64 & !BYTE_SWAP_ALLOWED_IMM == 0,
+                    "illegal reserved imm field"
+                );
+            }
+
             None
         };
 
-        let size = if insn.class() == BPF_ALU32 { 32 } else { 64 };
+        let size = insn.width().bits() as i32;
 
         match (op, src) {
             (BPF_MOV, _) => return self.check_alu_mov(insn),
@@ -43,19 +52,27 @@ impl<'v, 'a> Walk<'v, 'a> {
             "illegal reserved offset field"
         );
 
-        let dst = self.dst_reg(insn);
+        let dst = self.dst_state(insn);
         guard!(
             self,
             dst != RegisterState::Uninit,
             "illegal uninit dst register"
         );
 
-        if insn.class() != BPF_ALU64 {
-            guard!(
-                self,
-                !dst.is_pointer() && src.is_none_or(|src| !src.is_pointer()),
-                "ALU32 cannot perform pointer arithmetic"
-            );
+        if insn.width().is_32() {
+            if self.verifier().config.allow_ptr_leaks
+                && op == BPF_SUB
+                && dst.is_pkt_pointer()
+                && src.is_none_or(|src| src.is_pkt_pointer())
+            {
+                // Hopefully this means a PKT_END - PKT on the same object!
+            } else {
+                guard!(
+                    self,
+                    !dst.is_pointer() && src.is_none_or(|src| !src.is_pointer()),
+                    "ALU32 cannot perform pointer arithmetic"
+                );
+            }
 
             // TODO: track scalar operations like add, sub, mul, etc
             // 32bit ALU operations produce scalars
@@ -66,7 +83,7 @@ impl<'v, 'a> Walk<'v, 'a> {
         let (ptr, scalar) = match (dst, src) {
             (RegisterState::Scalar(_), None | Some(RegisterState::Scalar(_))) => {
                 // 64bit scalar operation tracking
-                return self.check_alu_scalars(insn);
+                return self.check_alu64_scalars(insn);
             }
 
             (RegisterState::Scalar(dst), Some(src)) if src.is_pointer() => {
@@ -180,6 +197,129 @@ impl<'v, 'a> Walk<'v, 'a> {
         Ok(())
     }
 
+    /// Checks an ALU MOV instruction and updates registers.
+    ///
+    /// * Moving a pointer simply copies the pointer to DST, only ALU64 can
+    ///   perform pointer moves.
+    /// * When moving known scalars, the value is trimmed according to the ALU
+    ///   class. If the insn is a MOVSX (sign-extension), the offset is checked
+    ///   and the known value is sign-extended accordingly.
+    /// * Moving unknown scalars simply copy the unknown status.
+    /// * Moving IMMs result in known scalars with size according to the class.
+    fn check_alu_mov(&mut self, insn: &Insn) -> Result<(), VerifierError> {
+        let state = match insn.source() {
+            Some(Src::Reg(_)) => match self.src_state(insn)? {
+                src if src.is_pointer() => {
+                    guard!(
+                        self,
+                        src.is_pkt_pointer() || !insn.width().is_32(),
+                        "partial copy of pointer"
+                    );
+                    guard!(self, insn.offset() == 0, "sign extension on pointer");
+
+                    src
+                }
+                RegisterState::Scalar(scalar) if scalar.is_known() => {
+                    let scalar = match (insn.width(), scalar) {
+                        (Width::W32, Scalar::U64(r)) => {
+                            Scalar::U32(ScalarRange::exact(r.min as u32))
+                        }
+                        (Width::W64, Scalar::U32(r)) => {
+                            Scalar::U64(ScalarRange::exact(r.min as u64))
+                        }
+                        _ => scalar,
+                    };
+
+                    let scalar = match (insn.offset() as u32, scalar) {
+                        (0, _) => scalar,
+                        (offset @ (8 | 16), Scalar::U32(r)) => {
+                            let shift = u32::BITS - offset;
+                            Scalar::U32(ScalarRange::exact(
+                                ((r.min as i32) << shift >> shift) as u32,
+                            ))
+                        }
+                        (offset @ (8 | 16 | 32), Scalar::U64(r)) => {
+                            let shift = u64::BITS - offset;
+                            Scalar::U64(ScalarRange::exact(
+                                ((r.min as i64) << shift >> shift) as u64,
+                            ))
+                        }
+                        _ => guard!(self, "mov with invalid offset"),
+                    };
+
+                    RegisterState::Scalar(scalar)
+                }
+                src if src.is_scalar() => src,
+                _ => guard!(self, "mov with invalid src register"),
+            },
+            _ => {
+                if insn.width().is_32() {
+                    RegisterState::Scalar(Scalar::U32(ScalarRange::exact(insn.imm() as u32)))
+                } else {
+                    RegisterState::Scalar(Scalar::U64(ScalarRange::exact(insn.imm() as u64)))
+                }
+            }
+        };
+
+        self.set_reg(insn.dst_reg(), state);
+
+        Ok(())
+    }
+
+    /// Checks ALU operations for ADD, SUB, LSH, RSH, ARSH and adjusts the
+    /// registers.
+    ///
+    /// Known scalars are stored as ranges with a min, max, and stride fields.
+    /// This function performs adjustments on both ends, min and max, and
+    /// adjusts the stride when needed.
+    ///
+    /// For now, we only adjust if SRC represents a single value, either the
+    /// immediate or a scalar with min==max.
+    ///
+    /// * ADD/SUB keeps the stride if the absolute SRC value is a multiple of
+    ///   it, otherwise resets to 1.
+    /// * LSH shifts the stride to the left. On overflow, it resets to 1.
+    /// * RSH/ARSH shifts the stride to the right. On underflow, it resets to 1.
+    ///
+    /// If SRC is a range or if an operation fails for any reason, DST is marked
+    /// as unknown.
+    ///
+    /// Ref: <https://github.com/torvalds/linux/blob/ea1013c1539270e372fc99854bc6e4d94eaeff66/kernel/bpf/verifier.c#L15505>
+    fn check_alu64_scalars(&mut self, insn: &Insn) -> Result<(), VerifierError> {
+        let src_val = match insn.source() {
+            Some(Src::Reg(_)) => match self.src_state(insn)? {
+                RegisterState::Scalar(Scalar::U32(r)) => match r.single_val() {
+                    Some(v) => v as i32 as i64,
+                    None => return self.mark_unknown(insn.dst_reg()),
+                },
+                _ => return self.mark_unknown(insn.dst_reg()),
+            },
+            Some(Src::Imm(imm)) => imm as i64,
+            None => return self.mark_unknown(insn.dst_reg()),
+        };
+
+        // TODO: track scalar operations like mul, neg, and, or, xor
+        let alu_fn = match insn.opcode() & ALU_OP_MASK {
+            BPF_ADD => Scalar::alu_add,
+            BPF_SUB => Scalar::alu_sub,
+            BPF_LSH => Scalar::alu_lsh,
+            BPF_RSH => Scalar::alu_rsh,
+            BPF_ARSH => Scalar::alu_arsh,
+            _ => return self.mark_unknown(insn.dst_reg()),
+        };
+
+        if let RegisterState::Scalar(s) = self.dst_state(insn) {
+            if let Some(result) = alu_fn(s, src_val) {
+                self.set_reg(insn.dst_reg(), RegisterState::Scalar(result));
+                Ok(())
+            } else {
+                self.mark_unknown(insn.dst_reg())
+            }
+        } else {
+            self.mark_unknown(insn.dst_reg())
+        }
+    }
+
     /// Pointer arithmetic on packet pointers (data and meta).
     ///
     /// A packet pointer is a pair `(id, offset)`. The id pins the pointer to a
@@ -206,8 +346,8 @@ impl<'v, 'a> Walk<'v, 'a> {
         );
 
         let (id, offset) = match ptr {
-            RegisterState::PtrToPacket { id, offset }
-            | RegisterState::PtrToPacketMeta { id, offset } => (id, offset),
+            RegisterState::PtrToPacket { id, offset, .. }
+            | RegisterState::PtrToPacketMeta { id, offset, .. } => (id, offset),
             _ => return Err(self.err("caller filtered to packet pointers")),
         };
 
@@ -235,128 +375,30 @@ impl<'v, 'a> Walk<'v, 'a> {
         };
 
         let new_ptr = match ptr {
-            RegisterState::PtrToPacket { .. } => RegisterState::PtrToPacket {
+            RegisterState::PtrToPacket {
+                known_ceiling,
+                access,
+                ..
+            } => RegisterState::PtrToPacket {
                 id: new_id,
                 offset: new_offset,
+                known_ceiling,
+                access,
             },
-            RegisterState::PtrToPacketMeta { .. } => RegisterState::PtrToPacketMeta {
+            RegisterState::PtrToPacketMeta {
+                known_ceiling,
+                access,
+                ..
+            } => RegisterState::PtrToPacketMeta {
                 id: new_id,
                 offset: new_offset,
+                known_ceiling,
+                access,
             },
             _ => return Err(self.err("caller filtered to packet pointers")),
         };
 
         self.set_reg(insn.dst_reg(), new_ptr);
-        Ok(())
-    }
-
-    /// Checks ALU operations for ADD, SUB, LSH, RSH, ARSH and adjusts the
-    /// registers.
-    ///
-    /// Known scalars are stored as ranges with a min, max, and stride fields.
-    /// This function performs adjustments on both ends, min and max, and
-    /// adjusts the stride when needed.
-    ///
-    /// For now, we only adjust if SRC represents a single value, either the
-    /// immediate or a scalar with min==max.
-    ///
-    /// * ADD/SUB keeps the stride if the absolute SRC value is a multiple of
-    ///   it, otherwise resets to 1.
-    /// * LSH shifts the stride to the left. On overflow, it resets to 1.
-    /// * RSH/ARSH shifts the stride to the right. On underflow, it resets to 1.
-    ///
-    /// If SRC is a range or if an operation fails for any reason, DST is marked
-    /// as unknown.
-    ///
-    /// Ref: <https://github.com/torvalds/linux/blob/ea1013c1539270e372fc99854bc6e4d94eaeff66/kernel/bpf/verifier.c#L15505>
-    fn check_alu_scalars(&mut self, insn: &Insn) -> Result<(), VerifierError> {
-        let src_val = match self.src_reg(insn) {
-            Ok(RegisterState::Scalar(Scalar::U32(r))) => match r.single_val() {
-                Some(v) => v as i32 as i64,
-                None => return self.mark_unknown(insn.dst_reg()),
-            },
-            Err(_) => insn.imm() as i64,
-            _ => return self.mark_unknown(insn.dst_reg()),
-        };
-
-        // TODO: track scalar operations like mul, neg, and, or, xor
-        let alu_fn = match insn.opcode() & ALU_OP_MASK {
-            BPF_ADD => Scalar::alu_add,
-            BPF_SUB => Scalar::alu_sub,
-            BPF_LSH => Scalar::alu_lsh,
-            BPF_RSH => Scalar::alu_rsh,
-            BPF_ARSH => Scalar::alu_arsh,
-            _ => return self.mark_unknown(insn.dst_reg()),
-        };
-
-        if let RegisterState::Scalar(s) = self.dst_reg(insn) {
-            if let Some(result) = alu_fn(s, src_val) {
-                self.set_reg(insn.dst_reg(), RegisterState::Scalar(result));
-                Ok(())
-            } else {
-                self.mark_unknown(insn.dst_reg())
-            }
-        } else {
-            self.mark_unknown(insn.dst_reg())
-        }
-    }
-
-    /// Checks an ALU MOV instruction and updates registers.
-    ///
-    /// * Moving a pointer simply copies the pointer to DST, only ALU64 can
-    ///   perform pointer moves.
-    /// * When moving known scalars, the value is trimmed according to the ALU
-    ///   class. If the insn is a MOVSX (sign-extension), the offset is checked
-    ///   and the known value is sign-extended accordingly.
-    /// * Moving unknown scalars simply copy the unknown status.
-    /// * Moving IMMs result in known scalars with size according to the class.
-    fn check_alu_mov(&mut self, insn: &Insn) -> Result<(), VerifierError> {
-        let state = match self.src_reg(insn) {
-            Ok(src) if src.is_pointer() => {
-                guard!(self, insn.class() == BPF_ALU64, "partial copy of pointer");
-                guard!(self, insn.offset() == 0, "sign extension on pointer");
-
-                src
-            }
-            Ok(RegisterState::Scalar(scalar)) if scalar.is_known() => {
-                let scalar = match (insn.class(), scalar) {
-                    (BPF_ALU32, Scalar::U64(r)) => Scalar::U32(ScalarRange::exact(r.min as u32)),
-                    (BPF_ALU64, Scalar::U32(r)) => Scalar::U64(ScalarRange::exact(r.min as u64)),
-                    _ => scalar,
-                };
-
-                let scalar = match (insn.offset() as u32, scalar) {
-                    (0, _) => scalar,
-                    (offset @ (8 | 16), Scalar::U32(r)) => {
-                        let shift = u32::BITS - offset;
-                        Scalar::U32(ScalarRange::exact(
-                            ((r.min as i32) << shift >> shift) as u32,
-                        ))
-                    }
-                    (offset @ (8 | 16 | 32), Scalar::U64(r)) => {
-                        let shift = u64::BITS - offset;
-                        Scalar::U64(ScalarRange::exact(
-                            ((r.min as i64) << shift >> shift) as u64,
-                        ))
-                    }
-                    _ => guard!(self, "mov with invalid offset"),
-                };
-
-                RegisterState::Scalar(scalar)
-            }
-            Ok(src) if src.is_scalar() => src,
-            Ok(_) => guard!(self, "mov with invalid src register"),
-            Err(_) => {
-                if insn.class() == BPF_ALU32 {
-                    RegisterState::Scalar(Scalar::U32(ScalarRange::exact(insn.imm() as u32)))
-                } else {
-                    RegisterState::Scalar(Scalar::U64(ScalarRange::exact(insn.imm() as u64)))
-                }
-            }
-        };
-
-        self.set_reg(insn.dst_reg(), state);
-
         Ok(())
     }
 }

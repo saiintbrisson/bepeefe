@@ -6,12 +6,16 @@ use crate::isa::jmp::*;
 use super::{RegisterState, Scalar, ScalarRange};
 
 pub(super) type ExprRange = ScalarRange<u64>;
+pub(super) type PacketRange = ScalarRange<u32>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExprVal {
     Known(ExprRange),
     Unkown,
     PtrToMapValueOrNull(u16),
+
+    Packet { id: u32, offset: PacketRange },
+    PacketEnd,
 }
 
 impl ExprVal {
@@ -24,11 +28,24 @@ impl ExprVal {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
+pub enum Refinement {
+    Plain(RegisterState),
+    PacketWithinBounds { id: u32, max_offset: PacketRange },
+}
+
+impl From<RegisterState> for Refinement {
+    fn from(value: RegisterState) -> Self {
+        Self::Plain(value)
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct BranchResult {
     pub(super) decision: BranchDecision,
-    pub(super) branch_reg: Option<RegisterState>,
-    pub(super) fallthrough_reg: Option<RegisterState>,
+    pub(super) branch_reg: Option<Refinement>,
+    pub(super) fallthrough_reg: Option<Refinement>,
 }
 
 impl BranchResult {
@@ -41,14 +58,14 @@ impl BranchResult {
 
     pub fn skip_branch() -> Self {
         Self {
-            decision: BranchDecision::SkipBranch,
+            decision: BranchDecision::Fallthrough,
             ..Self::default()
         }
     }
 
     pub fn skip_fallthrough() -> Self {
         Self {
-            decision: BranchDecision::SkipFallthrough,
+            decision: BranchDecision::TakeBranch,
             ..Self::default()
         }
     }
@@ -62,12 +79,12 @@ impl BranchResult {
 pub enum BranchDecision {
     #[default]
     Both,
-    SkipBranch,
-    SkipFallthrough,
+    Fallthrough,
+    TakeBranch,
 }
 
-pub(super) fn scalar_reg(r: ExprRange) -> RegisterState {
-    RegisterState::Scalar(Scalar::U64(r))
+pub(super) fn scalar_reg(r: ExprRange) -> Refinement {
+    RegisterState::Scalar(Scalar::U64(r)).into()
 }
 
 /// Decides how the branch will be taken and refines the registers.
@@ -148,10 +165,13 @@ pub(super) fn decide_branch(
         // TODO: prove for JGE, JLE, JGT, JLT
         (ExprVal::PtrToMapValueOrNull(fd), ExprVal::Known(val)) => {
             let mut result = BranchResult::default();
-            let register_state = Some(RegisterState::PtrToMapValue {
-                map_fd: fd,
-                offset: ScalarRange::exact(0),
-            });
+            let register_state = Some(
+                RegisterState::PtrToMapValue {
+                    map_fd: fd,
+                    offset: ScalarRange::exact(0),
+                }
+                .into(),
+            );
 
             match op {
                 BPF_JEQ if val.single_val() == Some(0) => result.fallthrough_reg = register_state,
@@ -165,6 +185,22 @@ pub(super) fn decide_branch(
 
         (ExprVal::Known(a), ExprVal::Known(b)) => (a, b),
 
+        (ExprVal::Packet { id, offset }, ExprVal::PacketEnd) if op == BPF_JGT => {
+            return Ok(BranchResult {
+                decision: BranchDecision::Both,
+                fallthrough_reg: Some(Refinement::PacketWithinBounds {
+                    id,
+                    max_offset: offset,
+                }),
+                branch_reg: None,
+            });
+        }
+
+        (_, ExprVal::Packet { .. } | ExprVal::PacketEnd)
+        | (ExprVal::Packet { .. } | ExprVal::PacketEnd, _) => {
+            return Err("unsupported packet pointer comparsion");
+        }
+
         (ExprVal::Known(_), ExprVal::PtrToMapValueOrNull(_))
         | (ExprVal::Unkown, ExprVal::PtrToMapValueOrNull(_))
         | (ExprVal::PtrToMapValueOrNull(_), ExprVal::PtrToMapValueOrNull(_)) => {
@@ -176,7 +212,7 @@ pub(super) fn decide_branch(
 
     match op {
         BPF_JEQ => {
-            if !dst.overlap(&src) {
+            if !dst.overlaps(&src) {
                 return Ok(BranchResult::skip_branch());
             }
             // Branch: dst must equal src, so narrow to intersection
@@ -188,17 +224,17 @@ pub(super) fn decide_branch(
                 stride: if min == max { 1 } else { dst.stride },
             };
             result.branch_reg = Some(scalar_reg(intersection));
-            // Fallthrough: dst != src. We can only exclude a boundary
-            // point; interior holes can't be represented.
+            // Fallthrough: dst != src. We can only exclude a boundary point,
+            // interior holes can't be represented.
             if let Some(src_val) = src.single_val() {
                 match dst.exclude(src_val) {
                     Some(r) => result.fallthrough_reg = Some(scalar_reg(r)),
-                    None => result.decision = BranchDecision::SkipFallthrough,
+                    None => result.decision = BranchDecision::TakeBranch,
                 }
             }
         }
         BPF_JNE => {
-            if !dst.overlap(&src) {
+            if !dst.overlaps(&src) {
                 return Ok(BranchResult::skip_fallthrough());
             }
             // Fallthrough: dst == src, so narrow to intersection
@@ -214,13 +250,13 @@ pub(super) fn decide_branch(
             if let Some(src_val) = src.single_val() {
                 match dst.exclude(src_val) {
                     Some(r) => result.branch_reg = Some(scalar_reg(r)),
-                    None => result.decision = BranchDecision::SkipBranch,
+                    None => result.decision = BranchDecision::Fallthrough,
                 }
             }
         }
         BPF_JGT => {
             if src.min >= dst.max {
-                result.decision = BranchDecision::SkipBranch;
+                result.decision = BranchDecision::Fallthrough;
             } else {
                 result.branch_reg = Some(scalar_reg(ExprRange {
                     min: (src.min + 1).max(dst.min),
@@ -230,7 +266,7 @@ pub(super) fn decide_branch(
             }
 
             if src.max < dst.min {
-                result.decision = BranchDecision::SkipFallthrough;
+                result.decision = BranchDecision::TakeBranch;
             } else {
                 result.fallthrough_reg = Some(scalar_reg(ExprRange {
                     min: dst.min,
@@ -246,7 +282,7 @@ pub(super) fn decide_branch(
             let src_smax = src.max as i64;
 
             if src_smin >= dst_smax {
-                result.decision = BranchDecision::SkipBranch;
+                result.decision = BranchDecision::Fallthrough;
             } else {
                 let smin = (src_smin + 1).max(dst_smin);
                 let smax = dst_smax;
@@ -260,7 +296,7 @@ pub(super) fn decide_branch(
             }
 
             if src_smax < dst_smin {
-                result.decision = BranchDecision::SkipFallthrough;
+                result.decision = BranchDecision::TakeBranch;
             } else {
                 let smin = dst_smin;
                 let smax = src_smax.min(dst_smax);
@@ -271,6 +307,28 @@ pub(super) fn decide_branch(
                         stride: dst.stride,
                     }));
                 }
+            }
+        }
+
+        BPF_JLT => {
+            if src.max <= dst.min {
+                result.decision = BranchDecision::Fallthrough;
+            } else {
+                result.branch_reg = Some(scalar_reg(ExprRange {
+                    min: dst.min,
+                    max: (src.max - 1).min(dst.max),
+                    stride: dst.stride,
+                }));
+            }
+
+            if src.min > dst.max {
+                result.decision = BranchDecision::TakeBranch;
+            } else {
+                result.fallthrough_reg = Some(scalar_reg(ExprRange {
+                    min: src.min,
+                    max: src.max.max(dst.max),
+                    stride: dst.stride,
+                }));
             }
         }
         _ => {}
@@ -300,19 +358,19 @@ mod tests {
         let neg10 = -10i32 as u32 as u64;
 
         let cases: &[(u8, (u64, u64, u64), (u64, u64, u64), BranchDecision)] = &[
-            (BPF_JEQ, (1, 1, 1), (1, 1, 1), SkipFallthrough),
-            (BPF_JNE, (1, 1, 1), (1, 1, 1), SkipBranch),
+            (BPF_JEQ, (1, 1, 1), (1, 1, 1), TakeBranch),
+            (BPF_JNE, (1, 1, 1), (1, 1, 1), Fallthrough),
             (BPF_JEQ, (0, 64, 4), (0, 64, 4), Both),
             (BPF_JEQ, (0, 32, 2), (32, 64, 4), Both),
-            (BPF_JEQ, (0, 31, 2), (32, 64, 4), SkipBranch),
-            (BPF_JNE, (0, 31, 2), (32, 64, 4), SkipFallthrough),
+            (BPF_JEQ, (0, 31, 2), (32, 64, 4), Fallthrough),
+            (BPF_JNE, (0, 31, 2), (32, 64, 4), TakeBranch),
             // -1i32 as u32 == -1i32 as u32
-            (BPF_JEQ, (neg1, neg1, 1), (neg1, neg1, 1), SkipFallthrough),
+            (BPF_JEQ, (neg1, neg1, 1), (neg1, neg1, 1), TakeBranch),
             // [-10..-1] vs [-5..-1]: overlapping
             (BPF_JEQ, (neg10, neg1, 1), (neg5, neg1, 1), Both),
             // [0..10] vs [-5..-1]: no overlap (unsigned: 0..10 vs 0xFFFFFFFB..0xFFFFFFFF)
-            (BPF_JEQ, (0, 10, 1), (neg5, neg1, 1), SkipBranch),
-            (BPF_JNE, (0, 10, 1), (neg5, neg1, 1), SkipFallthrough),
+            (BPF_JEQ, (0, 10, 1), (neg5, neg1, 1), Fallthrough),
+            (BPF_JNE, (0, 10, 1), (neg5, neg1, 1), TakeBranch),
         ];
 
         for (op, lhs, rhs, expected) in cases {
@@ -327,17 +385,15 @@ mod tests {
 
     #[test]
     fn decide_branch_map_null() {
-        let non_null = Some(RegisterState::PtrToMapValue {
-            map_fd: 0,
-            offset: ScalarRange::exact(0),
-        });
+        let non_null = Some(
+            RegisterState::PtrToMapValue {
+                map_fd: 0,
+                offset: ScalarRange::exact(0),
+            }
+            .into(),
+        );
 
-        let cases: &[(
-            u8,
-            (u64, u64, u64),
-            Option<RegisterState>,
-            Option<RegisterState>,
-        )] = &[
+        let cases: &[(u8, (u64, u64, u64), Option<Refinement>, Option<Refinement>)] = &[
             // if equal to 0, ptr is null on branch, fallthrough is non-null
             (BPF_JEQ, (0, 0, 1), None, non_null),
             // can't prove it will be non-null on fallthrough, but ptr can't be 0 on branch
@@ -395,7 +451,7 @@ mod tests {
             ExprVal::Known(er(5, 5, 1)),
             ExprVal::Known(er(5, 5, 1)),
         );
-        assert_eq!(r.decision, SkipFallthrough);
+        assert_eq!(r.decision, TakeBranch);
 
         // range [2..8] JEQ 99, branch never taken
         let r = db32(
@@ -403,7 +459,7 @@ mod tests {
             ExprVal::Known(er(2, 8, 1)),
             ExprVal::Known(er(99, 99, 1)),
         );
-        assert_eq!(r.decision, SkipBranch);
+        assert_eq!(r.decision, Fallthrough);
 
         let neg1 = -1i32 as u32 as u64;
         let neg5 = -5i32 as u32 as u64;
@@ -446,15 +502,15 @@ mod tests {
 
         let sr = |min, max, stride| Some(scalar_reg(er(min, max, stride)));
 
-        // range [0..10] JGT 5, branch [6..10], fallthrough [0..5]
+        // range [10..20] JGT 10, branch [11..20], fallthrough [10..10]
         let r = db32(
             BPF_JGT,
-            ExprVal::Known(er(0, 10, 1)),
-            ExprVal::Known(er(5, 5, 1)),
+            ExprVal::Known(er(10, 20, 1)),
+            ExprVal::Known(er(10, 10, 1)),
         );
         assert_eq!(r.decision, Both);
-        assert_eq!(r.branch_reg, sr(6, 10, 1));
-        assert_eq!(r.fallthrough_reg, sr(0, 5, 1));
+        assert_eq!(r.branch_reg, sr(11, 20, 1));
+        assert_eq!(r.fallthrough_reg, sr(10, 10, 1));
 
         // range [0..5] JGT 10, branch impossible
         let r = db32(
@@ -462,7 +518,7 @@ mod tests {
             ExprVal::Known(er(0, 5, 1)),
             ExprVal::Known(er(10, 10, 1)),
         );
-        assert_eq!(r.decision, SkipBranch);
+        assert_eq!(r.decision, Fallthrough);
 
         // range [10..20] JGT 5, fallthrough impossible
         let r = db32(
@@ -470,7 +526,7 @@ mod tests {
             ExprVal::Known(er(10, 20, 1)),
             ExprVal::Known(er(5, 5, 1)),
         );
-        assert_eq!(r.decision, SkipFallthrough);
+        assert_eq!(r.decision, TakeBranch);
 
         // [0..20] JGT [3..7]: branch min = 3+1=4, fallthrough max = 7
         let r = db32(
@@ -488,7 +544,7 @@ mod tests {
             ExprVal::Known(er(0, 5, 1)),
             ExprVal::Known(er(5, 10, 1)),
         );
-        assert_eq!(r.decision, SkipBranch);
+        assert_eq!(r.decision, Fallthrough);
 
         // [10..20] JGT [0..5]: dst.min(10) > src.max(5), fallthrough impossible
         let r = db32(
@@ -496,7 +552,77 @@ mod tests {
             ExprVal::Known(er(10, 20, 1)),
             ExprVal::Known(er(0, 5, 1)),
         );
-        assert_eq!(r.decision, SkipFallthrough);
+        assert_eq!(r.decision, TakeBranch);
+
+        // [0..10] JGT [0..10]: overlapping, both paths possible
+        // branch min = 0+1=1, fallthrough max = 10
+        let r = db32(
+            BPF_JGT,
+            ExprVal::Known(er(0, 10, 1)),
+            ExprVal::Known(er(0, 10, 1)),
+        );
+        assert_eq!(r.decision, Both);
+        assert_eq!(r.branch_reg, sr(1, 10, 1));
+        assert_eq!(r.fallthrough_reg, sr(0, 10, 1));
+    }
+
+    #[test]
+    fn decide_branch_jlt_refinement() {
+        use BranchDecision::*;
+
+        let sr = |min, max, stride| Some(scalar_reg(er(min, max, stride)));
+
+        // range [0..10] JLT 10, branch [0..9], fallthrough [10..10]
+        let r = db32(
+            BPF_JLT,
+            ExprVal::Known(er(0, 10, 1)),
+            ExprVal::Known(er(10, 10, 1)),
+        );
+        assert_eq!(r.decision, Both);
+        assert_eq!(r.branch_reg, sr(0, 9, 1));
+        assert_eq!(r.fallthrough_reg, sr(10, 10, 1));
+
+        // range [10..20] JLT 10, branch impossible
+        let r = db32(
+            BPF_JLT,
+            ExprVal::Known(er(10, 20, 1)),
+            ExprVal::Known(er(10, 10, 1)),
+        );
+        assert_eq!(r.decision, Fallthrough);
+
+        // range [0..4] JLT 5, fallthrough impossible
+        let r = db32(
+            BPF_JLT,
+            ExprVal::Known(er(0, 4, 1)),
+            ExprVal::Known(er(5, 5, 1)),
+        );
+        assert_eq!(r.decision, TakeBranch);
+
+        // [0..20] JLT [3..7]: branch max = 7-1=6, fallthrough min = 7
+        let r = db32(
+            BPF_JLT,
+            ExprVal::Known(er(0, 20, 1)),
+            ExprVal::Known(er(3, 7, 1)),
+        );
+        assert_eq!(r.decision, Both);
+        assert_eq!(r.branch_reg, sr(0, 6, 1));
+        assert_eq!(r.fallthrough_reg, sr(3, 20, 1));
+
+        // [5..10] JLT [0..5]: dst.max(10) <= src.min(0), branch impossible
+        let r = db32(
+            BPF_JLT,
+            ExprVal::Known(er(5, 10, 1)),
+            ExprVal::Known(er(0, 5, 1)),
+        );
+        assert_eq!(r.decision, Fallthrough);
+
+        // [0..5] JLT [10..20]: dst.min(0) > src.max(20), fallthrough impossible
+        let r = db32(
+            BPF_JLT,
+            ExprVal::Known(er(0, 5, 1)),
+            ExprVal::Known(er(10, 20, 1)),
+        );
+        assert_eq!(r.decision, TakeBranch);
 
         // [0..10] JGT [0..10]: overlapping, both paths possible
         // branch min = 0+1=1, fallthrough max = 10
@@ -584,7 +710,7 @@ mod tests {
             ExprVal::Known(er(s(-5), s(-1), 1)),
             ExprVal::Known(er(0, 0, 1)),
         );
-        assert_eq!(r.decision, SkipBranch);
+        assert_eq!(r.decision, Fallthrough);
 
         // [5..10] JSGT 0: all > 0, fallthrough impossible
         let r = db32(
@@ -592,7 +718,7 @@ mod tests {
             ExprVal::Known(er(5, 10, 1)),
             ExprVal::Known(er(0, 0, 1)),
         );
-        assert_eq!(r.decision, SkipFallthrough);
+        assert_eq!(r.decision, TakeBranch);
 
         // [-10..10] JSGT [-5..5]: range vs range
         // branch min = -5+1 = -4, clamped to dst_min(-10) -> -4; max = 10
@@ -612,6 +738,6 @@ mod tests {
             ExprVal::Known(er(5, 5, 1)),
             ExprVal::Known(er(5, 5, 1)),
         );
-        assert_eq!(r.decision, SkipBranch);
+        assert_eq!(r.decision, Fallthrough);
     }
 }

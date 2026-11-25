@@ -104,7 +104,7 @@ impl StateSnapshot {
 /// reads flow through the raw register array rather than the tracked
 /// accessors.
 fn static_jmp_reads(insn: &Insn) -> RegMask {
-    if !matches!(insn.class(), BPF_JMP | BPF_JMP32) {
+    if !insn.is_jmp() {
         return RegMask::empty();
     }
 
@@ -113,8 +113,8 @@ fn static_jmp_reads(insn: &Insn) -> RegMask {
         BPF_CALL | BPF_JA => RegMask::empty(),
         _ => {
             let mut mask = RegMask::single(insn.dst_reg());
-            if insn.opcode() & BPF_X == BPF_X {
-                mask |= RegMask::single(insn.src_reg());
+            if let Some(Src::Reg(reg)) = insn.source() {
+                mask |= RegMask::single(reg);
             }
             mask
         }
@@ -450,10 +450,10 @@ impl<'v, 'a> Walk<'v, 'a> {
                 self.frame
                     .stack_objects
                     .range(base..end)
-                    .filter(|&(&addr, slot)| addr.saturating_add(slot.size) <= end)
+                    .filter(|&(&addr, slot)| addr.saturating_add(slot.size.bytes()) <= end)
                     .map(|(&addr, slot)| PayloadSlot {
                         offset: addr - base,
-                        size: slot.size,
+                        size: slot.size.bytes(),
                         state: slot.state,
                         pc: slot.pc,
                     })
@@ -477,10 +477,11 @@ impl<'v, 'a> Walk<'v, 'a> {
     /// follow them in the stream. Everything else records after, with the
     /// registers reflecting what the instruction wrote.
     fn records_before_check(insn: &Insn) -> bool {
-        if !matches!(insn.class(), BPF_JMP | BPF_JMP32) {
-            return false;
+        match insn.call_kind() {
+            Some(CallKind::Subprog(_)) => true,
+            Some(_) => false,
+            None => insn.is_jmp(),
         }
-        insn.opcode() & JMP_OP_MASK != BPF_CALL || insn.src_reg() == BPF_PSEUDO_CALL
     }
 
     pub fn warn(&self, message: impl Into<Cow<'static, str>>) {
@@ -508,7 +509,9 @@ impl<'v, 'a> Walk<'v, 'a> {
     }
 
     /// Run a fork to completion and absorb its outputs.
-    fn run_fork(&mut self, pc: usize, origin: WalkOrigin) -> Result<(), VerifierError> {
+    ///
+    /// Returns the r0 value.
+    fn run_fork(&self, pc: usize, origin: WalkOrigin) -> Result<RegisterState, VerifierError> {
         let fork = self.fork_at(pc, origin);
 
         match origin {
@@ -517,24 +520,46 @@ impl<'v, 'a> Walk<'v, 'a> {
             _ => return Err(self.err("called run_fork for Call walker")),
         }
 
-        let out = fork.run()?;
-        self.set_reg(0, out.r0);
+        Ok(fork.run()?.r0)
+    }
 
-        Ok(())
+    fn broadcast_pkt_range(&mut self, pkt_id: u32, max_offset: ScalarRange<u32>) {
+        for (reg_idx, state) in (*self.regs()).into_iter().enumerate() {
+            let RegisterState::PtrToPacket {
+                id,
+                offset,
+                known_ceiling,
+                access,
+            } = state
+            else {
+                continue;
+            };
+
+            if id != pkt_id || known_ceiling.is_some_and(|r| r.max > max_offset.max) {
+                continue;
+            }
+
+            self.set_reg(
+                reg_idx as u8,
+                RegisterState::PtrToPacket {
+                    id,
+                    offset,
+                    known_ceiling: Some(max_offset),
+                    access,
+                },
+            );
+        }
     }
 
     /// Executes branching based on a decision.
-    pub fn run_decision(&mut self, insn: &Insn, branch: BranchResult) -> Result<(), VerifierError> {
-        let offset = if insn.opcode() == BPF_JMP32 | BPF_K | BPF_JA {
-            insn.imm()
-        } else {
-            insn.offset() as i32
+    pub fn run_decision(&mut self, insn: &Insn, res: BranchResult) -> Result<(), VerifierError> {
+        let target_pc = match insn.jump_target(self.this_pc()) {
+            Some(target) if target >= 0 => target as usize,
+            _ => return Err(self.err("branch on an instruction that does not jump")),
         };
 
-        let target_pc = (self.next_pc() as isize + offset as isize) as usize;
-
         let narrow = |reg: RegisterState| -> RegisterState {
-            if insn.class() != BPF_JMP32 {
+            if !insn.width().is_32() {
                 return reg;
             }
 
@@ -552,34 +577,49 @@ impl<'v, 'a> Walk<'v, 'a> {
 
         self.snapshot_state(PruneSite::Jump);
 
+        let branch_reg = res.branch_reg.map(|reg| match reg {
+            branch::Refinement::Plain(s) => narrow(s),
+            branch::Refinement::PacketWithinBounds { id, max_offset } => {
+                self.broadcast_pkt_range(id, max_offset);
+                self.reg(insn.dst_reg())
+            }
+        });
+        let fallthrough_reg = res.fallthrough_reg.map(|reg| match reg {
+            branch::Refinement::Plain(s) => narrow(s),
+            branch::Refinement::PacketWithinBounds { id, max_offset } => {
+                self.broadcast_pkt_range(id, max_offset);
+                self.reg(insn.dst_reg())
+            }
+        });
+
         let fork_pc = self.this_pc();
         let branch_origin = WalkOrigin::Branch {
-            refined: branch.branch_reg.map(|reg| (insn.dst_reg(), narrow(reg))),
+            refined: branch_reg.map(|reg| (insn.dst_reg(), reg)),
             fork_pc,
         };
 
         let fallthrough_origin = WalkOrigin::Fallthrough {
-            refined: branch
-                .fallthrough_reg
-                .map(|reg| (insn.dst_reg(), narrow(reg))),
+            refined: fallthrough_reg.map(|reg| (insn.dst_reg(), reg)),
             fork_pc,
         };
 
-        match branch.decision {
+        let out = match res.decision {
             BranchDecision::Both => {
                 self.run_fork(target_pc, branch_origin)?;
-                self.run_fork(self.next_pc(), fallthrough_origin)?;
+                self.run_fork(self.next_pc(), fallthrough_origin)?
             }
-            BranchDecision::SkipBranch => {
+            BranchDecision::Fallthrough => {
                 self.record_branch_dead(target_pc, branch_origin);
-                self.run_fork(self.next_pc(), fallthrough_origin)?;
+                self.run_fork(self.next_pc(), fallthrough_origin)?
             }
-            BranchDecision::SkipFallthrough => {
-                self.run_fork(target_pc, branch_origin)?;
+            BranchDecision::TakeBranch => {
+                let out = self.run_fork(target_pc, branch_origin)?;
                 self.record_branch_dead(self.next_pc(), fallthrough_origin);
+                out
             }
-        }
+        };
 
+        self.set_reg(0, out);
         self.mark_exit();
 
         Ok(())
@@ -588,13 +628,10 @@ impl<'v, 'a> Walk<'v, 'a> {
     /// Argument registers a subprogram call reads. r1 through the last
     /// parameter the callee's BTF signature declares.
     fn pseudo_call_reads(&self, insn: &Insn) -> RegMask {
-        let is_pseudo_call = matches!(insn.class(), BPF_JMP | BPF_JMP32)
-            && insn.opcode() & JMP_OP_MASK == BPF_CALL
-            && insn.src_reg() == BPF_PSEUDO_CALL;
-        if !is_pseudo_call {
-            return RegMask::empty();
-        }
-        let target_pc = (self.next_pc() as isize + insn.imm() as isize) as usize;
+        let target_pc = match insn.jump_target(self.this_pc()) {
+            Some(target) if insn.is_pseudo_call() => target as usize,
+            _ => return RegMask::empty(),
+        };
         let argc = self
             .verifier
             .prog
