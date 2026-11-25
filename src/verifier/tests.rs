@@ -513,6 +513,7 @@ fn vm_with_hash_map(key_size: u32, value_size: u32) -> Arc<Vm> {
     vm.maps
         .lock()
         .expect("map lock poisoned")
+        .by_fd
         .push(Arc::new(BpfMap {
             fd: 0,
             repr,

@@ -13,7 +13,7 @@ fn main() {
     let init_kbs = Value::Number(3070);
     let local_port = Value::Number(3000);
 
-    let map = vm.map("port_map").unwrap();
+    let map = prog.map("port_map").unwrap();
     map.update(&local_port, &init_kbs).unwrap();
 
     let image = prog

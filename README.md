@@ -54,7 +54,7 @@ let vm = Vm::new();
 let prog: Arc<PreparedProgram> = vm.prepare(prog, MapReuseStrategy::None, &VerifierConfig::default())?;
 ```
 
-> `MapReuseStrategy` is either `None` or `MatchByName`. The former fails if a new map declaration conflicts with an existing map, regardless of type. The latter searches for existing maps with the same name. Libbpf's `pinning` attribute on maps overrides this behavior.
+> Maps belong to the program load that created them, so two programs can each declare a map with the same name, and you reach them through `PreparedProgram::map`. Maps declaring libbpf's `pinning = LIBBPF_PIN_BY_NAME` are shared instead: the first load creates them, later loads bind to the same map, and `Vm::pinned_map` finds them by name. A later load only binds if its declaration matches the pinned map's type, key and value sizes, max entries, and flags. `MapReuseStrategy::MatchByName` treats every map as pinned by name, while `None` leaves pinning up to each declaration.
 
 Great! Your program passed the verifier, it's safe to execute, all helper calls, memory reads and writes, context accesses are valid. Now onto running it! `bepeefe`'s API allows building the execution image, host env, and interacting with registers:
 
@@ -203,7 +203,7 @@ decl_map!(render_events {
     max_entries: 1024,
 });
 
-let mut map = vm.map("render_events").unwrap();
+let mut map = prog.map("render_events").unwrap();
 if let Some(ev) = map.pop::<RenderEvent>().unwrap() {
   match ev.ty {
       RenderEventType::Clear => todo!(),

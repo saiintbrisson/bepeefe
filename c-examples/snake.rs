@@ -57,7 +57,7 @@ fn main() {
             .unwrap();
         let r0 = prog.run(image, None);
 
-        let mut map = vm.map("render_events").unwrap();
+        let mut map = prog.map("render_events").unwrap();
         while let Some(Value::Map(ev)) = map.pop::<Value>().unwrap() {
             let (&Value::Number(color), &Value::Number(x), &Value::Number(y)) = (
                 ev.get("color").unwrap(),

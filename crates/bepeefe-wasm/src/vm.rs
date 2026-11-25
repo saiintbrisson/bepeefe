@@ -4,11 +4,8 @@ use wasm_bindgen::prelude::*;
 
 use bepeefe::{
     btf::{BtfTypeId, value::Value},
-    maps::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY},
     verifier::{FieldRule, VerifierConfig},
-    vm::{
-        Cpu, CtxImage, MapHandle, MapReuseStrategy as MapReuse, PreparedProgram, Task, Vm, World,
-    },
+    vm::{Cpu, CtxImage, MapReuseStrategy as MapReuse, PreparedProgram, Task, Vm, World},
 };
 
 use crate::{capture::WasmCapture, disasm, js_err, object::WasmObject};
@@ -18,10 +15,11 @@ use crate::{capture::WasmCapture, disasm, js_err, object::WasmObject};
 #[wasm_bindgen]
 #[derive(Clone, Copy, Default)]
 pub enum MapReuseStrategy {
-    /// Every load gets fresh maps.
+    /// Only maps pinned by name are shared, the rest are private to the load.
     #[default]
     None,
-    /// Maps share state with an earlier program's map of the same name.
+    /// Every map is pinned by name, so it shares state with a compatible map
+    /// of the same name from an earlier load.
     MatchByName,
 }
 
@@ -92,84 +90,35 @@ impl WasmVm {
         Ok(WasmProgram { prepared })
     }
 
-    pub fn map_pop(&self, name: &str) -> Result<JsValue, JsError> {
-        let Some(mut handle) = self.inner.map(name) else {
-            return Ok(JsValue::NULL);
-        };
-        match handle.pop_value().map_err(js_err)? {
-            Some(pv) => to_json_value(&pv),
-            None => Ok(JsValue::NULL),
-        }
+    /// Maps pinned by name, shared by every program that pins them. A
+    /// program's own maps go through [`WasmProgram`] instead.
+    pub fn pinned_map_pop(&self, name: &str) -> Result<JsValue, JsError> {
+        map_ops::pop(self.inner.pinned_map(name))
     }
 
-    pub fn map_lookup(&self, name: &str, key_json: &str) -> Result<JsValue, JsError> {
-        let Some(handle) = self.inner.map(name) else {
-            return Ok(JsValue::NULL);
-        };
-        let key: Value = serde_json::from_str(key_json).map_err(js_err)?;
-        match handle.lookup_value(&key).map_err(js_err)? {
-            Some(pv) => to_json_value(&pv),
-            None => Ok(JsValue::NULL),
-        }
+    pub fn pinned_map_lookup(&self, name: &str, key_json: &str) -> Result<JsValue, JsError> {
+        map_ops::lookup(self.inner.pinned_map(name), key_json)
     }
 
-    pub fn dump_maps(&self) -> Result<String, JsError> {
-        #[derive(serde::Serialize)]
-        struct MapDump {
-            name: String,
-            map_type: Option<u32>,
-            key_type_id: u32,
-            value_type_id: u32,
-            entries: Vec<(Value, Value)>,
-        }
-        let dumps: Vec<MapDump> = self
-            .inner
-            .maps()
-            .iter()
-            .map(|h| {
-                let is_array = matches!(
-                    h.map_type(),
-                    Some(BPF_MAP_TYPE_ARRAY | BPF_MAP_TYPE_PERCPU_ARRAY)
-                );
-                Ok(MapDump {
-                    name: h.name().to_string(),
-                    map_type: h.map_type(),
-                    key_type_id: h.key_type().0,
-                    value_type_id: h.value_type().0,
-                    entries: h.entries_filtered(|_, v| !is_array || v.iter().any(|b| *b != 0))?,
-                })
-            })
-            .collect::<Result<_, bepeefe::RuntimeError>>()
-            .map_err(js_err)?;
-        serde_json::to_string(&dumps).map_err(js_err)
+    pub fn pinned_map_update(
+        &self,
+        name: &str,
+        key_json: &str,
+        val_json: &str,
+    ) -> Result<(), JsError> {
+        map_ops::update(self.inner.pinned_map(name), name, key_json, val_json)
     }
 
-    pub fn map_update(&self, name: &str, key_json: &str, val_json: &str) -> Result<(), JsError> {
-        let handle = self.typed_map(name)?;
-        let key: Value = serde_json::from_str(key_json).map_err(js_err)?;
-        let val: Value = serde_json::from_str(val_json).map_err(js_err)?;
-        handle.update(&key, &val).map_err(js_err)
+    pub fn pinned_map_delete(&self, name: &str, key_json: &str) -> Result<(), JsError> {
+        map_ops::delete(self.inner.pinned_map(name), name, key_json)
     }
 
-    pub fn map_delete(&self, name: &str, key_json: &str) -> Result<(), JsError> {
-        let handle = self.typed_map(name)?;
-        let key: Value = serde_json::from_str(key_json).map_err(js_err)?;
-        handle.delete(&key).map_err(js_err)
+    pub fn pinned_map_clear(&self, name: &str) {
+        map_ops::clear(self.inner.pinned_map(name));
     }
 
-    pub fn map_clear(&self, name: &str) -> Result<(), JsError> {
-        if let Some(mut handle) = self.inner.map(name) {
-            handle.clear();
-        }
-        Ok(())
-    }
-}
-
-impl WasmVm {
-    fn typed_map(&self, name: &str) -> Result<MapHandle, JsError> {
-        self.inner
-            .map(name)
-            .ok_or_else(|| JsError::new(&format!("map {name:?} is not typed")))
+    pub fn dump_pinned_maps(&self) -> Result<String, JsError> {
+        map_ops::dump(self.inner.pinned_maps())
     }
 }
 
@@ -230,6 +179,31 @@ impl WasmProgram {
             .ok_or_else(|| JsError::new(&format!("program has no data section {name:?}")))?;
         sec.write(&parse_map(vars_json)?).map_err(js_err)
     }
+
+    /// Every map this program declares, pinned or not.
+    pub fn map_pop(&self, name: &str) -> Result<JsValue, JsError> {
+        map_ops::pop(self.prepared.map(name))
+    }
+
+    pub fn map_lookup(&self, name: &str, key_json: &str) -> Result<JsValue, JsError> {
+        map_ops::lookup(self.prepared.map(name), key_json)
+    }
+
+    pub fn map_update(&self, name: &str, key_json: &str, val_json: &str) -> Result<(), JsError> {
+        map_ops::update(self.prepared.map(name), name, key_json, val_json)
+    }
+
+    pub fn map_delete(&self, name: &str, key_json: &str) -> Result<(), JsError> {
+        map_ops::delete(self.prepared.map(name), name, key_json)
+    }
+
+    pub fn map_clear(&self, name: &str) {
+        map_ops::clear(self.prepared.map(name));
+    }
+
+    pub fn dump_maps(&self) -> Result<String, JsError> {
+        map_ops::dump(self.prepared.maps())
+    }
 }
 
 impl WasmProgram {
@@ -289,4 +263,96 @@ fn parse_map(json: &str) -> Result<BTreeMap<String, Value>, JsError> {
 fn to_json_value<T: serde::Serialize>(value: &T) -> Result<JsValue, JsError> {
     let json = serde_json::to_string(value).map_err(js_err)?;
     Ok(JsValue::from_str(&json))
+}
+
+/// The map calls `WasmVm` and `WasmProgram` share, each over the handle its
+/// own lookup found.
+mod map_ops {
+    use bepeefe::{
+        btf::value::Value,
+        maps::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY},
+        vm::MapHandle,
+    };
+    use wasm_bindgen::prelude::*;
+
+    use super::to_json_value;
+    use crate::js_err;
+
+    fn typed(handle: Option<MapHandle>, name: &str) -> Result<MapHandle, JsError> {
+        handle.ok_or_else(|| JsError::new(&format!("map {name:?} is not typed")))
+    }
+
+    pub fn pop(handle: Option<MapHandle>) -> Result<JsValue, JsError> {
+        let Some(mut handle) = handle else {
+            return Ok(JsValue::NULL);
+        };
+        match handle.pop_value().map_err(js_err)? {
+            Some(pv) => to_json_value(&pv),
+            None => Ok(JsValue::NULL),
+        }
+    }
+
+    pub fn lookup(handle: Option<MapHandle>, key_json: &str) -> Result<JsValue, JsError> {
+        let Some(handle) = handle else {
+            return Ok(JsValue::NULL);
+        };
+        let key: Value = serde_json::from_str(key_json).map_err(js_err)?;
+        match handle.lookup_value(&key).map_err(js_err)? {
+            Some(pv) => to_json_value(&pv),
+            None => Ok(JsValue::NULL),
+        }
+    }
+
+    pub fn update(
+        handle: Option<MapHandle>,
+        name: &str,
+        key_json: &str,
+        val_json: &str,
+    ) -> Result<(), JsError> {
+        let handle = typed(handle, name)?;
+        let key: Value = serde_json::from_str(key_json).map_err(js_err)?;
+        let val: Value = serde_json::from_str(val_json).map_err(js_err)?;
+        handle.update(&key, &val).map_err(js_err)
+    }
+
+    pub fn delete(handle: Option<MapHandle>, name: &str, key_json: &str) -> Result<(), JsError> {
+        let handle = typed(handle, name)?;
+        let key: Value = serde_json::from_str(key_json).map_err(js_err)?;
+        handle.delete(&key).map_err(js_err)
+    }
+
+    pub fn clear(handle: Option<MapHandle>) {
+        if let Some(mut handle) = handle {
+            handle.clear();
+        }
+    }
+
+    pub fn dump(handles: Vec<MapHandle>) -> Result<String, JsError> {
+        #[derive(serde::Serialize)]
+        struct MapDump {
+            name: String,
+            map_type: Option<u32>,
+            key_type_id: u32,
+            value_type_id: u32,
+            entries: Vec<(Value, Value)>,
+        }
+        let dumps: Vec<MapDump> = handles
+            .iter()
+            .map(|h| {
+                let is_array = matches!(
+                    h.map_type(),
+                    Some(BPF_MAP_TYPE_ARRAY | BPF_MAP_TYPE_PERCPU_ARRAY)
+                );
+                Ok(MapDump {
+                    name: h.name().to_string(),
+                    map_type: h.map_type(),
+                    key_type_id: h.key_type().0,
+                    value_type_id: h.value_type().0,
+                    entries: h.entries_filtered(|_, v| !is_array || v.iter().any(|b| *b != 0))?,
+                })
+            })
+            .collect::<Result<_, bepeefe::RuntimeError>>()
+            .map_err(js_err)?;
+        serde_json::to_string(&dumps).map_err(js_err)
+    }
 }

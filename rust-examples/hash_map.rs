@@ -96,7 +96,7 @@ fn main() {
         t.join().unwrap();
     }
 
-    let counters = vm.map("counters").unwrap();
+    let counters = vm.pinned_map("counters").unwrap();
     for id in 1u32..=16 {
         let stats: PacketStats = counters.lookup(&id).unwrap().unwrap();
         assert_eq!(stats.tx_bytes, 100, "id {id} tx mismatch");

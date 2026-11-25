@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, reason = "Mutex::lock only fails if poisoned")]
 
 use std::{
+    collections::BTreeMap,
     ops::DerefMut,
     sync::{Arc, Mutex},
 };
@@ -25,8 +26,23 @@ pub use task::{Task, TaskError};
 pub use world::World;
 
 pub struct Vm {
-    pub(super) maps: Mutex<Vec<Arc<BpfMap>>>,
+    pub(super) maps: Mutex<MapTable>,
     world: Mutex<World>,
+}
+
+/// Every map the Vm created, indexed by fd, plus the names programs can share.
+#[derive(Default)]
+pub(super) struct MapTable {
+    pub(super) by_fd: Vec<Arc<BpfMap>>,
+    pub(super) pinned: BTreeMap<String, i32>,
+}
+
+impl MapTable {
+    /// Drops every map from `fd` onwards, along with any pin pointing at one.
+    fn truncate(&mut self, fd: usize) {
+        self.by_fd.truncate(fd);
+        self.pinned.retain(|_, pinned| (*pinned as usize) < fd);
+    }
 }
 
 impl Vm {
@@ -49,13 +65,14 @@ impl Vm {
     #[expect(clippy::panic, reason = "caller is expected to run verifier")]
     pub(crate) fn get_map(&self, fd: u16) -> Arc<BpfMap> {
         let maps = self.maps.lock().unwrap();
-        maps.get(fd as usize)
+        maps.by_fd
+            .get(fd as usize)
             .cloned()
             .unwrap_or_else(|| panic!("unknown map fd {fd}"))
     }
 
     pub(crate) fn has_map(&self, fd: u16) -> bool {
-        self.maps.lock().unwrap().get(fd as usize).is_some()
+        self.maps.lock().unwrap().by_fd.get(fd as usize).is_some()
     }
 
     /// The mutable state shared across invocations.
@@ -63,37 +80,33 @@ impl Vm {
         self.world.lock().unwrap()
     }
 
-    /// Looks up a typed map by name. Returns `None` for untyped
-    /// data maps (`.bss`, `.data`, `.rodata`, etc.), those have no
-    /// value BTF and can't be read or written through `MapHandle`.
-    pub fn map(&self, name: &str) -> Option<MapHandle> {
+    /// A map shared under `name` by every program that pins it. Maps a single
+    /// program owns are accessed through [`PreparedProgram::map`] instead.
+    pub fn pinned_map(&self, name: &str) -> Option<MapHandle> {
         let maps = self.maps.lock().unwrap();
-        let bpf_map = maps.iter().find(|map| map.spec.name == name)?.clone();
-        MapHandle::new(bpf_map)
+        let fd = *maps.pinned.get(name)?;
+        MapHandle::new(maps.by_fd.get(fd as usize)?.clone())
     }
 
-    /// All typed maps in the VM. Untyped data maps are filtered out.
-    pub fn maps(&self) -> Vec<MapHandle> {
-        self.maps
-            .lock()
-            .unwrap()
-            .iter()
-            .cloned()
+    pub fn pinned_maps(&self) -> Vec<MapHandle> {
+        let maps = self.maps.lock().unwrap();
+        maps.pinned
+            .values()
+            .filter_map(|&fd| maps.by_fd.get(fd as usize).cloned())
             .filter_map(MapHandle::new)
             .collect()
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MapReuseStrategy {
-    /// Maps with no pinning instruction will not be reused,
-    /// a new map and FD will be generated instead for each
-    /// program that declares maps.
+    /// Only maps declaring `pinning = LIBBPF_PIN_BY_NAME` are shared. Every
+    /// other map is created fresh for the program load.
     #[default]
     None,
-    /// Maps with no pinning instrucion will be matched to
-    /// existing maps with the same name, previously loaded
-    /// by other programs.
+    /// Every map is treated as pinned by name, so it binds to a compatible map
+    /// another program already pinned under that name. Data sections stay
+    /// private either way.
     MatchByName,
 }
 

@@ -1,7 +1,7 @@
 use std::{ops::Deref, sync::Arc};
 
 use super::{
-    DatasecHandle, Vm,
+    DatasecHandle, MapHandle, Vm,
     cpu::{Cpu, CtxImage},
     ptr::TaggedPtr,
     task::Task,
@@ -15,8 +15,8 @@ pub struct PreparedProgram {
     pub(super) vm: Arc<Vm>,
     pub(super) prog: Arc<EbpfProgram>,
     pub(super) ctx_size: usize,
-    /// Data sections by declared name, with the fd of this load's copy.
-    pub(super) datasecs: Vec<(String, i32)>,
+    /// Every map the program declares, by name, with the fd it was bound to.
+    pub(super) maps: Vec<(String, i32)>,
     pub(super) max_call_depth: usize,
 }
 
@@ -29,7 +29,7 @@ impl PreparedProgram {
         vm: Arc<Vm>,
         prog: Arc<EbpfProgram>,
         verification_output: VerificationOutput,
-        datasecs: Vec<(String, i32)>,
+        maps: Vec<(String, i32)>,
     ) -> Arc<Self> {
         let btf = &prog.btf;
         let total_param_size: u32 = prog
@@ -50,21 +50,43 @@ impl PreparedProgram {
             vm,
             prog,
             ctx_size,
-            datasecs,
+            maps,
             max_call_depth: verification_output.max_call_depth,
         })
     }
 
-    pub fn datasecs(&self) -> Vec<DatasecHandle> {
-        self.datasecs
+    /// A map this program declares, whether it owns it or shares it through a
+    /// pin.
+    pub fn map(&self, name: &str) -> Option<MapHandle> {
+        let (_, fd) = self.maps.iter().find(|(n, _)| n == name)?;
+        MapHandle::new(self.vm.get_map(*fd as u16))
+    }
+
+    pub fn maps(&self) -> Vec<MapHandle> {
+        self.maps
             .iter()
-            .filter_map(|(name, fd)| DatasecHandle::new(self.vm.get_map(*fd as u16), name.clone()))
+            .filter_map(|(_, fd)| MapHandle::new(self.vm.get_map(*fd as u16)))
+            .collect()
+    }
+
+    pub fn datasecs(&self) -> Vec<DatasecHandle> {
+        self.maps
+            .iter()
+            .filter_map(|(name, fd)| self.datasec_at(name, *fd))
             .collect()
     }
 
     pub fn datasec(&self, name: &str) -> Option<DatasecHandle> {
-        let (name, fd) = self.datasecs.iter().find(|(n, _)| n == name)?;
-        DatasecHandle::new(self.vm.get_map(*fd as u16), name.clone())
+        let (name, fd) = self.maps.iter().find(|(n, _)| n == name)?;
+        self.datasec_at(name, *fd)
+    }
+
+    fn datasec_at(&self, name: &str, fd: i32) -> Option<DatasecHandle> {
+        let map = self.vm.get_map(fd as u16);
+        if !map.spec.is_data_section() {
+            return None;
+        }
+        DatasecHandle::new(map, name.to_string())
     }
 
     pub fn run(&self, image: CtxImage, capture: Option<Arc<dyn Capture>>) -> u64 {

@@ -56,8 +56,13 @@ pub enum PrepareError {
     #[error("failed to create map {name:?}: {reason}")]
     InvalidMap { name: String, reason: &'static str },
 
-    #[error("duplicate map name {name:?}")]
-    DuplicateMap { name: String },
+    #[error("map {name:?} is pinned with {attr} {pinned}, but declared with {declared}")]
+    IncompatiblePinnedMap {
+        name: String,
+        attr: &'static str,
+        pinned: u32,
+        declared: u32,
+    },
 
     #[error("program has no data section {name:?}")]
     UnknownDatasec { name: String },

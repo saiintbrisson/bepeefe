@@ -23,8 +23,6 @@ impl DatasecHandle {
         })
     }
 
-    /// The section name as the object declares it, without the per-load
-    /// suffix the Vm adds to tell copies apart.
     pub fn name(&self) -> &str {
         &self.name
     }

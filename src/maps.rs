@@ -64,7 +64,32 @@ pub struct MapSpec {
     pub initial_data: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+impl MapSpec {
+    /// Key size as declared, or as the key's BTF type lays it out.
+    pub fn resolved_key_size(&self, btf: &Btf) -> Option<u32> {
+        self.key_size.or_else(|| {
+            self.key
+                .and_then(|id| btf.get_type(id))
+                .map(|t| t.kind.size(btf))
+        })
+    }
+
+    /// Value size as declared, or as the value's BTF type lays it out.
+    pub fn resolved_value_size(&self, btf: &Btf) -> Option<u32> {
+        self.value_size.or_else(|| {
+            self.value
+                .and_then(|id| btf.get_type(id))
+                .map(|t| t.kind.size(btf))
+        })
+    }
+
+    /// Data sections (`.rodata`, `.data`, `.bss`) carry their bytes along.
+    pub fn is_data_section(&self) -> bool {
+        self.initial_data.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MapPinning {
     #[default]
     None,
@@ -198,21 +223,11 @@ impl MapRepr {
             reason,
         };
         let key_size = || {
-            spec.key_size
-                .or_else(|| {
-                    spec.key
-                        .and_then(|id| btf.get_type(id))
-                        .map(|t| t.kind.size(btf))
-                })
+            spec.resolved_key_size(btf)
                 .ok_or_else(|| invalid("missing key size"))
         };
         let value_size = || {
-            spec.value_size
-                .or_else(|| {
-                    spec.value
-                        .and_then(|id| btf.get_type(id))
-                        .map(|t| t.kind.size(btf))
-                })
+            spec.resolved_value_size(btf)
                 .ok_or_else(|| invalid("missing value size"))
         };
         let max_entries = || {

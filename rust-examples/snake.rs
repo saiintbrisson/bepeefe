@@ -269,7 +269,7 @@ fn main() {
         let image = prog.build_image(&[TickCtx { dir }]).unwrap();
         let new_score = prog.run(image, None) as i64;
 
-        let mut map = vm.map("render_events").unwrap();
+        let mut map = prog.map("render_events").unwrap();
         while let Some(ev) = map.pop::<RenderEvent>().unwrap() {
             grid[ev.y as usize][ev.x as usize] = match ev.ty {
                 RenderEventType::Clear => ' ',
