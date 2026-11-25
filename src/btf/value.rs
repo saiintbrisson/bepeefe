@@ -122,6 +122,62 @@ impl Value {
         }
     }
 
+    /// Overwrites the named variables of a datasec in place, leaving every
+    /// other byte alone. Sections hold more than their BTF names, like the
+    /// padding and static locals between variables, so re-encoding the whole
+    /// section from a `Value` would zero them.
+    ///
+    /// A struct variable only changes in the fields `vars` mentions.
+    pub fn patch_datasec(
+        ty: BtfRef<'_>,
+        bytes: &mut [u8],
+        vars: &BTreeMap<String, Value>,
+    ) -> Result<(), ValueError> {
+        let known = ty.btf().datasec_vars(ty.id());
+        for (name, patch) in vars {
+            let var = known
+                .iter()
+                .find(|var| var.name == name.as_str())
+                .ok_or_else(|| ValueError::UnknownField(name.clone()))?;
+            let end = (var.offset + var.size) as usize;
+            let len = bytes.len();
+            let slot =
+                bytes
+                    .get_mut(var.offset as usize..end)
+                    .ok_or(ValueError::InsufficientBytes {
+                        ty: ty.id(),
+                        expected: end,
+                        got: len,
+                    })?;
+
+            let merged = match Value::from_bytes(var.ty, slot) {
+                Ok(current) => current.merge(patch.clone()),
+                Err(_) => patch.clone(),
+            };
+            for (dst, src) in slot.iter_mut().zip(merged.to_bytes(var.ty)?) {
+                *dst = src;
+            }
+        }
+        Ok(())
+    }
+
+    /// Lays `patch` over `self`, recursing where both are maps.
+    pub fn merge(self, patch: Value) -> Value {
+        match (self, patch) {
+            (Value::Map(mut base), Value::Map(patch)) => {
+                for (key, val) in patch {
+                    let merged = match base.remove(&key) {
+                        Some(old) => old.merge(val),
+                        None => val,
+                    };
+                    base.insert(key, merged);
+                }
+                Value::Map(base)
+            }
+            (_, patch) => patch,
+        }
+    }
+
     pub fn from_bytes(ty: BtfRef<'_>, bytes: &[u8]) -> Result<Value, ValueError> {
         match ty.kind() {
             BtfKind::Int(int) => from::scalar(int.size, ty, bytes).map(Value::Number),
@@ -129,7 +185,7 @@ impl Value {
             BtfKind::Enum64(e) => from::scalar(e.size, ty, bytes).map(Value::Number),
             BtfKind::Float(float) => from::float(float.size, ty, bytes),
             BtfKind::Array(arr) => from::array(arr, ty, bytes),
-            BtfKind::Datasec(_) => from::datasec(bytes),
+            BtfKind::Datasec(_) => from::datasec(ty, bytes),
             BtfKind::Struct(s) => from::strct(s, ty, bytes),
             BtfKind::Ptr(_) => from::scalar(8, ty, bytes).map(Value::Number),
             _ => Err(ValueError::UnsupportedKind(ty.kind().into(), ty.id())),
@@ -276,8 +332,17 @@ mod to {
         match ty.kind() {
             BtfKind::Struct(_) => strct(map, ty),
             BtfKind::Union(_) => union(map, ty),
+            BtfKind::Datasec(_) => {
+                let mut buf = vec![0; ty.size() as usize];
+                Value::patch_datasec(ty, &mut buf, map)?;
+                Ok(buf)
+            }
             _ => Err(ValueError::IncompatibleTypes {
-                expected: &[BtfKindDiscriminants::Struct, BtfKindDiscriminants::Union],
+                expected: &[
+                    BtfKindDiscriminants::Struct,
+                    BtfKindDiscriminants::Union,
+                    BtfKindDiscriminants::Datasec,
+                ],
                 got: ty.kind().into(),
             }),
         }
@@ -429,12 +494,29 @@ mod from {
         Ok(Value::Array(elems))
     }
 
-    pub(super) fn datasec(bytes: &[u8]) -> Result<Value, ValueError> {
-        let mut elems = Vec::with_capacity(bytes.len());
-        for ele in bytes {
-            elems.push(Value::Number(*ele as i64));
+    /// Keyed by variable name, or raw bytes for sections with no variables
+    /// to name, like `.rodata.str1.1`.
+    pub(super) fn datasec(ty: BtfRef<'_>, bytes: &[u8]) -> Result<Value, ValueError> {
+        let vars = ty.btf().datasec_vars(ty.id());
+        if vars.is_empty() {
+            let elems = bytes.iter().map(|b| Value::Number(*b as i64)).collect();
+            return Ok(Value::Array(elems));
         }
-        Ok(Value::Array(elems))
+
+        let mut map = BTreeMap::new();
+        for var in vars {
+            let end = (var.offset + var.size) as usize;
+            let chunk =
+                bytes
+                    .get(var.offset as usize..end)
+                    .ok_or(ValueError::InsufficientBytes {
+                        ty: ty.id(),
+                        expected: end,
+                        got: bytes.len(),
+                    })?;
+            map.insert(var.name.into_owned(), Value::from_bytes(var.ty, chunk)?);
+        }
+        Ok(Value::Map(map))
     }
 
     pub(super) fn strct(s: &Struct, ty: BtfRef<'_>, bytes: &[u8]) -> Result<Value, ValueError> {
@@ -1566,5 +1648,74 @@ mod tests {
             }
             other => panic!("expected TaggedPtr, got {other:?}"),
         }
+    }
+
+    fn data_section() -> (crate::btf::Btf, crate::btf::BtfTypeId) {
+        use crate::btf::VariableLinkage;
+
+        let mut b = BtfBuilder::default();
+        let u32_ty = b.add_int("u32", 4, 0);
+        let thr = b.make_struct("thresholds", 8, |s| {
+            s.field("low", u32_ty, 0).field("high", u32_ty, 32);
+        });
+        let verbose = b.add_var("verbose", u32_ty, VariableLinkage::GlobalAllocated);
+        let limits = b.add_var("limits", thr, VariableLinkage::GlobalAllocated);
+        let sec = b.make_datasec(".data", 16, |d| {
+            d.var(verbose, 0, 4).var(limits, 8, 8);
+        });
+        (b.build(), sec)
+    }
+
+    #[test]
+    fn datasec_decodes_by_variable_name() {
+        let (btf, sec) = data_section();
+        let mut bytes = vec![0xAA; 16];
+        bytes[..4].copy_from_slice(&1u32.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&2u32.to_ne_bytes());
+        bytes[12..].copy_from_slice(&3u32.to_ne_bytes());
+
+        let val = Value::from_bytes(btf.resolve_must(sec), &bytes).unwrap();
+        let Value::Map(vars) = val else {
+            panic!("expected a map, got {val:?}")
+        };
+        assert!(matches!(vars["verbose"], Value::Number(1)));
+        let Value::Map(limits) = &vars["limits"] else {
+            panic!("expected limits to be a struct")
+        };
+        assert!(matches!(limits["low"], Value::Number(2)));
+        assert!(matches!(limits["high"], Value::Number(3)));
+    }
+
+    #[test]
+    fn datasec_patch_keeps_untouched_bytes_and_fields() {
+        let (btf, sec) = data_section();
+        let mut bytes = vec![0xAA; 16];
+        let patch = BTreeMap::from([(
+            "limits".to_string(),
+            Value::from([("high", Value::Number(9))]),
+        )]);
+
+        Value::patch_datasec(btf.resolve_must(sec), &mut bytes, &patch).unwrap();
+
+        assert_eq!(&bytes[..12], &[0xAA; 12]);
+        assert_eq!(&bytes[12..], &9u32.to_ne_bytes());
+    }
+
+    #[test]
+    fn datasec_patch_rejects_unknown_variables() {
+        let (btf, sec) = data_section();
+        let patch = BTreeMap::from([("missing".to_string(), Value::Number(1))]);
+        let err = Value::patch_datasec(btf.resolve_must(sec), &mut [0; 16], &patch).unwrap_err();
+        assert!(matches!(err, ValueError::UnknownField(name) if name == "missing"));
+    }
+
+    #[test]
+    fn opaque_datasec_decodes_as_bytes() {
+        let mut b = BtfBuilder::default();
+        let sec = b.make_datasec(".rodata.str1.1", 2, |_| {});
+        let btf = b.build();
+
+        let val = Value::from_bytes(btf.resolve_must(sec), &[7, 8]).unwrap();
+        assert!(matches!(val, Value::Array(ref v) if v.len() == 2));
     }
 }

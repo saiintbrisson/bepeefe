@@ -1,7 +1,7 @@
 use std::{ops::Deref, sync::Arc};
 
 use super::{
-    Vm,
+    DatasecHandle, Vm,
     cpu::{Cpu, CtxImage},
     ptr::TaggedPtr,
     task::Task,
@@ -15,6 +15,8 @@ pub struct PreparedProgram {
     pub(super) vm: Arc<Vm>,
     pub(super) prog: Arc<EbpfProgram>,
     pub(super) ctx_size: usize,
+    /// Data sections by declared name, with the fd of this load's copy.
+    pub(super) datasecs: Vec<(String, i32)>,
     pub(super) max_call_depth: usize,
 }
 
@@ -27,6 +29,7 @@ impl PreparedProgram {
         vm: Arc<Vm>,
         prog: Arc<EbpfProgram>,
         verification_output: VerificationOutput,
+        datasecs: Vec<(String, i32)>,
     ) -> Arc<Self> {
         let btf = &prog.btf;
         let total_param_size: u32 = prog
@@ -47,8 +50,21 @@ impl PreparedProgram {
             vm,
             prog,
             ctx_size,
+            datasecs,
             max_call_depth: verification_output.max_call_depth,
         })
+    }
+
+    pub fn datasecs(&self) -> Vec<DatasecHandle> {
+        self.datasecs
+            .iter()
+            .filter_map(|(name, fd)| DatasecHandle::new(self.vm.get_map(*fd as u16), name.clone()))
+            .collect()
+    }
+
+    pub fn datasec(&self, name: &str) -> Option<DatasecHandle> {
+        let (name, fd) = self.datasecs.iter().find(|(n, _)| n == name)?;
+        DatasecHandle::new(self.vm.get_map(*fd as u16), name.clone())
     }
 
     pub fn run(&self, image: CtxImage, capture: Option<Arc<dyn Capture>>) -> u64 {

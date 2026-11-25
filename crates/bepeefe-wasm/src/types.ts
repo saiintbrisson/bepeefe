@@ -60,6 +60,30 @@ export interface MapSchema {
   value?: JsonSchema;
 }
 
+/** A data section such as `.rodata`, `.data` or `.bss`, returned by
+ *  datasec_schemas. Variables are what a program exposes for configuration,
+ *  so they're listed one by one rather than as a single map value. */
+export interface DatasecSchema {
+  name: string;
+  size: number;
+  /** `.rodata*` sections, which the program can't write. `datasec_write`
+   *  still can. */
+  readonly: boolean;
+  type_id?: number;
+  /** Empty for sections without BTF variables, like `.rodata.str1.1`. Their
+   *  contents still read and write as a byte array. */
+  vars: VarSchema[];
+}
+
+export interface VarSchema {
+  name: string;
+  /** Byte offset within the section. */
+  offset: number;
+  size: number;
+  type_id: number;
+  schema: JsonSchema;
+}
+
 /** A named, sized type entry returned by browseable_types. The label
  *  is pre-formatted ("struct sock", "u32", ...) so JS callers never
  *  need to walk BTF strings. */

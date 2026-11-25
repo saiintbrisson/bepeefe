@@ -75,6 +75,17 @@ impl std::fmt::Debug for BtfRef<'_> {
     }
 }
 
+/// A variable inside a datasec, such as a `const volatile` config in `.rodata`.
+#[derive(Clone, Debug)]
+pub struct DatasecVar<'a> {
+    pub name: Cow<'a, str>,
+    pub offset: u32,
+    pub size: u32,
+    /// The variable's declared type, typedefs and all.
+    pub type_id: BtfTypeId,
+    pub ty: BtfRef<'a>,
+}
+
 type BtfStrOffset = u32;
 
 #[derive(Clone, Debug, Default)]
@@ -119,6 +130,31 @@ impl Btf {
 
     pub fn get_type(&self, idx: BtfTypeId) -> Option<&BtfType> {
         self.resolve_indirections(self.types.get(&idx)?)
+    }
+
+    /// The variables a datasec lays out, in offset order. Secinfos that aren't
+    /// variables are skipped. Synthesized sections carry no secinfos and come
+    /// back empty.
+    pub fn datasec_vars(&self, id: BtfTypeId) -> Vec<DatasecVar<'_>> {
+        let Some(BtfKind::Datasec(sec)) = self.types.get(&id).map(|ty| &ty.kind) else {
+            return Vec::new();
+        };
+        sec.secinfos
+            .iter()
+            .filter_map(|info| {
+                let var = self.types.get(&info.r#type)?;
+                let BtfKind::Var(Var { ty, .. }) = var.kind else {
+                    return None;
+                };
+                Some(DatasecVar {
+                    name: self.string(var.name_off)?,
+                    offset: info.offset,
+                    size: info.size,
+                    type_id: ty,
+                    ty: self.resolve(ty)?,
+                })
+            })
+            .collect()
     }
 
     /// Byte size of the type at `idx`. Returns 0 if the id doesn't resolve or

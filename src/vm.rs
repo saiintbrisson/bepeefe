@@ -8,6 +8,7 @@ use std::{
 use crate::maps::BpfMap;
 
 mod cpu;
+mod datasec;
 pub(crate) mod helpers;
 mod map_handle;
 mod prepare;
@@ -17,6 +18,7 @@ mod task;
 mod world;
 
 pub use cpu::{Cpu, CtxImage};
+pub use datasec::DatasecHandle;
 pub use map_handle::MapHandle;
 pub use prepared::PreparedProgram;
 pub use task::{Task, TaskError};

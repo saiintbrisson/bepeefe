@@ -261,6 +261,35 @@ fn walk(
             }
         }
 
+        BtfKind::Datasec(sec) => {
+            let vars = btf.datasec_vars(walk_id);
+            if vars.is_empty() {
+                JsonSchema {
+                    schema_type: Some(JsonSchemaType::Array),
+                    items: Some(Box::new(int_schema(0, 8))),
+                    min_items: Some(sec.size),
+                    max_items: Some(sec.size),
+                    ..Default::default()
+                }
+            } else {
+                let properties: IndexMap<String, JsonSchema> = vars
+                    .into_iter()
+                    .map(|var| {
+                        let mut sub = walk(var.type_id, btf, seen, hops);
+                        sub.bit_offset = Some(var.offset * 8);
+                        (var.name.into_owned(), sub)
+                    })
+                    .collect();
+                let required = properties.keys().cloned().collect();
+                JsonSchema {
+                    schema_type: Some(JsonSchemaType::Object),
+                    properties: Some(properties),
+                    required: Some(required),
+                    ..Default::default()
+                }
+            }
+        }
+
         BtfKind::Array(a) => JsonSchema {
             schema_type: Some(JsonSchemaType::Array),
             items: Some(Box::new(walk(a.r#type, btf, seen, hops))),
@@ -527,5 +556,28 @@ mod tests {
         let v = at(2);
         let leaf = &v["properties"]["mid"]["properties"]["leaf"];
         assert_eq!(leaf["properties"]["x"]["type"], "integer");
+    }
+
+    #[test]
+    fn datasec_lists_variables_as_properties() {
+        use bepeefe::btf::VariableLinkage;
+
+        let mut b = BtfBuilder::default();
+        let u32t = b.add_int("u32", 4, 0);
+        let var = b.add_var("max_len", u32t, VariableLinkage::GlobalAllocated);
+        let sec = b.make_datasec(".rodata", 8, |d| {
+            d.var(var, 4, 4);
+        });
+        let opaque = b.make_datasec(".rodata.str1.1", 3, |_| {});
+        let btf = b.build();
+
+        let v = schema_json(sec, &btf);
+        assert_eq!(v["type"], "object");
+        assert_eq!(v["properties"]["max_len"]["title"], "u32");
+        assert_eq!(v["properties"]["max_len"]["bit_offset"], 32);
+
+        let v = schema_json(opaque, &btf);
+        assert_eq!(v["type"], "array");
+        assert_eq!(v["maxItems"], 3);
     }
 }

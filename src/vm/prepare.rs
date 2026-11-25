@@ -156,6 +156,12 @@ impl Vm {
             }
         }
 
+        let datasecs = maps_fds
+            .iter()
+            .filter(|(spec, _)| spec.initial_data.is_some())
+            .map(|(spec, fd)| (spec.name.clone(), *fd))
+            .collect();
+
         let prog = Arc::new(prog);
         let verifier = Verifier::new(self, prog.clone(), verifier_config).map_err(|source| {
             PrepareError::Verifier {
@@ -172,6 +178,7 @@ impl Vm {
             self.clone(),
             prog,
             verification_output,
+            datasecs,
         ))
     }
 }

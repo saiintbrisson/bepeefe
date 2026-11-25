@@ -55,17 +55,32 @@ impl WasmVm {
         Ok(())
     }
 
+    /// `datasecs_json` sets data section variables before the program is
+    /// verified. It's a `Value` map from
+    /// section name to a map of the variables to change, and anything it
+    /// leaves out keeps the compiled-in value.
     pub fn load(
         &self,
         obj: &WasmObject,
         prog_name: &str,
         capture: Option<WasmCapture>,
         map_reuse: Option<MapReuseStrategy>,
+        datasecs_json: Option<String>,
     ) -> Result<WasmProgram, JsError> {
-        let prog = obj
+        let mut prog = obj
             .program(prog_name)
             .ok_or_else(|| JsError::new(&format!("program '{prog_name}' not found")))?
             .clone();
+        if let Some(json) = datasecs_json {
+            for (section, vars) in parse_map(&json)? {
+                let Value::Map(vars) = vars else {
+                    return Err(JsError::new(&format!(
+                        "variables for {section:?} must be a Map value"
+                    )));
+                };
+                prog.set_datasec_vars(&section, &vars).map_err(js_err)?;
+            }
+        }
         let verifier_config = VerifierConfig {
             capture: capture.map(|c| c.inner),
             ..Default::default()
@@ -194,6 +209,27 @@ impl WasmProgram {
     pub fn disasm(&self) -> Result<String, JsError> {
         disasm::to_json(&self.prepared)
     }
+
+    /// This load's copy of a data section as a `Value` JSON string, or null
+    /// when the program has no such section.
+    #[wasm_bindgen(unchecked_return_type = "string | null")]
+    pub fn datasec_read(&self, name: &str) -> Result<Option<String>, JsError> {
+        let Some(sec) = self.prepared.datasec(name) else {
+            return Ok(None);
+        };
+        let value = sec.read().map_err(js_err)?;
+        serde_json::to_string(&value).map(Some).map_err(js_err)
+    }
+
+    /// Changes the variables `vars_json`, a `Value` map, names. Works on
+    /// `.rodata` too, since only the program is bound by its `const`.
+    pub fn datasec_write(&self, name: &str, vars_json: &str) -> Result<(), JsError> {
+        let sec = self
+            .prepared
+            .datasec(name)
+            .ok_or_else(|| JsError::new(&format!("program has no data section {name:?}")))?;
+        sec.write(&parse_map(vars_json)?).map_err(js_err)
+    }
 }
 
 impl WasmProgram {
@@ -241,6 +277,13 @@ fn parse_task(task_json: &str) -> Result<Task, JsError> {
         return Ok(Task::default());
     }
     serde_json::from_str(trimmed).map_err(js_err)
+}
+
+fn parse_map(json: &str) -> Result<BTreeMap<String, Value>, JsError> {
+    match serde_json::from_str(json).map_err(js_err)? {
+        Value::Map(map) => Ok(map),
+        _ => Err(JsError::new("expected a Map value")),
+    }
 }
 
 fn to_json_value<T: serde::Serialize>(value: &T) -> Result<JsValue, JsError> {

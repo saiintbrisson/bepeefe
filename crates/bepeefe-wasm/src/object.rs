@@ -4,8 +4,9 @@ use wasm_bindgen::prelude::*;
 
 use bepeefe::{
     EbpfObject,
-    btf::{Btf, BtfTypeId, Hop, ext::CoreRelo},
+    btf::{Btf, BtfTypeId, Hop, ext::CoreRelo, value::Value},
     hook::Hook,
+    maps::MapSpec,
     object::{EbpfProgram, FunctionSignature},
 };
 
@@ -21,6 +22,7 @@ pub struct WasmObject {
     programs: BTreeMap<String, EbpfProgram>,
     signatures: Vec<FunctionSignature>,
     sections: BTreeMap<String, String>,
+    datasecs: Vec<MapSpec>,
     btf: WasmBtf,
 }
 
@@ -41,10 +43,18 @@ impl WasmObject {
             }
         }
 
+        let datasecs = obj
+            .maps()
+            .iter()
+            .filter(|m| m.initial_data.is_some())
+            .cloned()
+            .collect();
+
         Ok(WasmObject {
             programs,
             signatures,
             sections,
+            datasecs,
             btf,
         })
     }
@@ -137,6 +147,58 @@ impl WasmObject {
             })
             .collect();
         to_js(&out)
+    }
+
+    /// Data sections (`.rodata`, `.data`, `.bss` and custom ones) with a
+    /// schema per variable. Sections without BTF variables, like
+    /// `.rodata.str1.1`, come back with no `vars`.
+    #[wasm_bindgen(unchecked_return_type = "DatasecSchema[]")]
+    pub fn datasec_schemas(&self) -> Result<JsValue, JsError> {
+        let btf = self.btf.inner();
+        let out: Vec<DatasecSchema> = self
+            .datasecs
+            .iter()
+            .map(|spec| DatasecSchema {
+                name: spec.name.clone(),
+                size: spec.value_size.unwrap_or_default(),
+                readonly: spec.name.starts_with(".rodata"),
+                type_id: spec.value.map(|t| t.0),
+                vars: spec
+                    .value
+                    .map(|id| btf.datasec_vars(id))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|var| VarSchema {
+                        name: var.name.into_owned(),
+                        offset: var.offset,
+                        size: var.size,
+                        type_id: var.type_id.0,
+                        schema: schema::type_to_schema(var.type_id, btf, None),
+                    })
+                    .collect(),
+            })
+            .collect();
+        to_js(&out)
+    }
+
+    /// A data section's contents as compiled into the object, as a `Value`
+    /// JSON string. Variables are keyed by name, or the section is a byte
+    /// array when it has none.
+    #[wasm_bindgen(unchecked_return_type = "string | null")]
+    pub fn datasec_initial(&self, name: &str) -> Result<Option<String>, JsError> {
+        let Some(spec) = self.datasecs.iter().find(|spec| spec.name == name) else {
+            return Ok(None);
+        };
+        let (Some(id), Some(data)) = (spec.value, &spec.initial_data) else {
+            return Ok(None);
+        };
+        let ty = self
+            .btf
+            .inner()
+            .resolve(id)
+            .ok_or_else(|| JsError::new(&format!("unknown type id {}", id.0)))?;
+        let value = Value::from_bytes(ty, data).map_err(js_err)?;
+        serde_json::to_string(&value).map(Some).map_err(js_err)
     }
 
     /// Single-type schema lookup for an BTF id.
@@ -285,6 +347,25 @@ struct CoreReloEntry {
 struct CoreReloHop {
     name: String,
     type_id: u32,
+}
+
+#[derive(serde::Serialize)]
+struct DatasecSchema {
+    name: String,
+    size: u32,
+    readonly: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    type_id: Option<u32>,
+    vars: Vec<VarSchema>,
+}
+
+#[derive(serde::Serialize)]
+struct VarSchema {
+    name: String,
+    offset: u32,
+    size: u32,
+    type_id: u32,
+    schema: JsonSchema,
 }
 
 #[derive(serde::Serialize)]

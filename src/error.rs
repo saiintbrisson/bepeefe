@@ -59,6 +59,12 @@ pub enum PrepareError {
     #[error("duplicate map name {name:?}")]
     DuplicateMap { name: String },
 
+    #[error("program has no data section {name:?}")]
+    UnknownDatasec { name: String },
+
+    #[error("can't set variables of data section {name:?}: {source}")]
+    DatasecVars { name: String, source: ValueError },
+
     #[error("failed to write initial data for map {name:?}: {source}")]
     InitialDataWrite {
         name: String,

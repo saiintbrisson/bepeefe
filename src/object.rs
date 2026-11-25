@@ -903,6 +903,33 @@ pub struct EbpfProgram {
 }
 
 impl EbpfProgram {
+    /// Overrides variables in this program's copy of a data section, the way
+    /// a libbpf skeleton sets `const volatile`.
+    pub fn set_datasec_vars(
+        &mut self,
+        section: &str,
+        vars: &BTreeMap<String, crate::Value>,
+    ) -> Result<(), crate::error::PrepareError> {
+        use crate::error::PrepareError;
+
+        let unknown = || PrepareError::UnknownDatasec {
+            name: section.to_string(),
+        };
+        let spec = self
+            .maps
+            .iter_mut()
+            .find(|spec| spec.name == section)
+            .ok_or_else(unknown)?;
+        let (Some(data), Some(id)) = (spec.initial_data.as_mut(), spec.value) else {
+            return Err(unknown());
+        };
+        let ty = self.btf.resolve(id).ok_or_else(unknown)?;
+        crate::Value::patch_datasec(ty, data, vars).map_err(|source| PrepareError::DatasecVars {
+            name: section.to_string(),
+            source,
+        })
+    }
+
     pub fn insns(&self) -> &[Insn] {
         &self.insns
     }
