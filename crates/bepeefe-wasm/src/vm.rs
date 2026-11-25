@@ -4,6 +4,7 @@ use wasm_bindgen::prelude::*;
 
 use bepeefe::{
     btf::value::Value,
+    maps::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY},
     verifier::VerifierConfig,
     vm::{Cpu, CtxImage, MapHandle, MapReuseStrategy, PreparedProgram, Task, Vm, World},
 };
@@ -87,12 +88,16 @@ impl WasmVm {
             .maps()
             .iter()
             .map(|h| {
+                let is_array = matches!(
+                    h.map_type(),
+                    Some(BPF_MAP_TYPE_ARRAY | BPF_MAP_TYPE_PERCPU_ARRAY)
+                );
                 Ok(MapDump {
                     name: h.name().to_string(),
                     map_type: h.map_type(),
                     key_type_id: h.key_type().0,
                     value_type_id: h.value_type().0,
-                    entries: h.entries_filtered(|_, v| v.iter().any(|b| *b != 0))?,
+                    entries: h.entries_filtered(|_, v| !is_array || v.iter().any(|b| *b != 0))?,
                 })
             })
             .collect::<Result<_, bepeefe::RuntimeError>>()

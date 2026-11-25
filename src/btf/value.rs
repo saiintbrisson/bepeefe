@@ -129,6 +129,7 @@ impl Value {
             BtfKind::Enum64(e) => from::scalar(e.size, ty, bytes).map(Value::Number),
             BtfKind::Float(float) => from::float(float.size, ty, bytes),
             BtfKind::Array(arr) => from::array(arr, ty, bytes),
+            BtfKind::Datasec(_) => from::datasec(bytes),
             BtfKind::Struct(s) => from::strct(s, ty, bytes),
             _ => Err(ValueError::UnsupportedKind(ty.kind().into(), ty.id())),
         }
@@ -236,6 +237,23 @@ mod to {
 
                 number(i64::from_ne_bytes(padded), ty)
             }
+            BtfKind::Datasec(sec) => {
+                let mut buf = Vec::with_capacity(sec.size as usize);
+                for ele in elems {
+                    let Value::Number(num) = ele else {
+                        return Err(ValueError::IncompatibleTypes {
+                            expected: &[BtfKindDiscriminants::Int],
+                            got: ty.kind().into(),
+                        });
+                    };
+
+                    let num: u8 = (*num)
+                        .try_into()
+                        .map_err(|_| ValueError::NumberOverflow(*num, u8::BITS as u8))?;
+                    buf.push(num);
+                }
+                Ok(buf)
+            }
             _ => Err(ValueError::IncompatibleTypes {
                 expected: &[
                     BtfKindDiscriminants::Array,
@@ -243,6 +261,7 @@ mod to {
                     BtfKindDiscriminants::Enum,
                     BtfKindDiscriminants::Enum64,
                     BtfKindDiscriminants::Ptr,
+                    BtfKindDiscriminants::Datasec,
                 ],
                 got: ty.kind().into(),
             }),
@@ -405,6 +424,14 @@ mod from {
                         got: bytes.len(),
                     })?;
             elems.push(Value::from_bytes(elem_ty, chunk)?);
+        }
+        Ok(Value::Array(elems))
+    }
+
+    pub(super) fn datasec(bytes: &[u8]) -> Result<Value, ValueError> {
+        let mut elems = Vec::with_capacity(bytes.len());
+        for ele in bytes {
+            elems.push(Value::Number(*ele as i64));
         }
         Ok(Value::Array(elems))
     }

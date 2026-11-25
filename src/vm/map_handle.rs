@@ -19,10 +19,6 @@ pub struct MapHandle {
 impl MapHandle {
     /// Constructs a handle, refusing untyped data maps (no value BTF).
     pub(super) fn new(map: Arc<BpfMap>) -> Option<Self> {
-        if map.spec.initial_data.is_some() {
-            return None;
-        }
-
         let value_id = map.spec.value?;
         let (key_btf, key_id) = match map.spec.key {
             Some(id) => (map.btf.clone(), id),

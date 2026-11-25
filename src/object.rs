@@ -247,17 +247,19 @@ impl ProgLoader {
             })?
             .as_chunks::<{ Insn::BYTES }>();
 
-        self.insns.reserve(chunks.len());
+        let floor = self.insns.len();
+        let mut sec_off = func.section_offset;
+
+        self.insns
+            .extend(chunks.iter().map(|c| Insn(u64::from_le_bytes(*c))));
         self.loaded_progs.push(LoadedSubprog {
-            insn_pc: self.insns.len(),
+            insn_pc: floor,
             func: func.clone(),
         });
 
-        let mut sec_off = func.section_offset;
-        for chunk in chunks {
+        for (i, chunk) in chunks.iter().enumerate() {
             let insn = Insn(u64::from_le_bytes(*chunk));
-            let flat_pc = self.insns.len();
-            self.insns.push(insn);
+            let flat_pc = floor + i;
 
             match sec.relocations().find(|(r, _)| *r as usize == sec_off) {
                 Some((_, rel)) if insn.is_subprog_call() => {
@@ -529,16 +531,17 @@ fn parse_btf<'a>(
     for sec in file.sections() {
         let Ok(name) = sec.name() else { continue };
 
-        if [".rodata", ".data", ".bss"]
-            .iter()
-            .all(|exp| !name.starts_with(exp))
-        {
-            continue;
-        }
+        let size = sec.size();
+        let data = match sec.kind() {
+            SectionKind::Data | SectionKind::ReadOnlyData | SectionKind::ReadOnlyString => {
+                sec.data()?.to_vec()
+            }
+            SectionKind::UninitializedData => vec![0; size as usize],
+            _ => continue,
+        };
 
         let datasec_id = find_or_create_datasec(&mut btf, &sec)?;
 
-        let data = sec.data()?;
         maps.push(MapSpec {
             name: name.to_string(),
             r#type: Some(BPF_MAP_TYPE_ARRAY),
@@ -546,9 +549,9 @@ fn parse_btf<'a>(
             sec_offset: 0,
             max_entries: Some(1),
             key_size: Some(4),
-            value_size: Some(data.len() as u32),
+            value_size: Some(sec.size() as u32),
             value: Some(datasec_id),
-            initial_data: Some(data.to_vec()),
+            initial_data: Some(data),
             ..Default::default()
         });
     }
@@ -597,17 +600,27 @@ fn fixup_btf_datasecs<'a>(btf: &mut Btf, file: &'a File<'a, &'a [u8]>) {
             continue;
         };
 
+        let Some(sec) = btf
+            .string(ty.name_off)
+            .and_then(|sec| file.section_by_name(&sec))
+        else {
+            continue;
+        };
+
+        datasec.size = sec.size() as u32;
+
         for info in &mut datasec.secinfos {
-            if let Some(sec) = btf
+            if let Some(sym) = btf
                 .types
                 .get(&info.r#type)
                 .and_then(|ty| btf.string(ty.name_off))
-                .and_then(|sym| file.symbol_by_name(sym.as_ref()))
+                .and_then(|sym| file.symbol_by_name(&sym))
             {
-                info.offset = sec.address() as u32;
-                info.size = sec.size() as u32;
+                info.offset = sym.address() as u32;
+                info.size = sym.size() as u32;
             }
         }
+
         datasec.secinfos.sort_unstable_by_key(|ty| ty.offset);
 
         btf.types.insert(id, ty);
@@ -769,7 +782,7 @@ fn collect_functions<'file>(
     for info in &btf.ext.func_info {
         let sec_name = name(info.sec_name_off)?;
         for func in &info.data {
-            let section_offset = func.insn_off as usize * Insn::BYTES;
+            let func_off = func.insn_off as usize;
             let func_btf_id = func.type_id;
             let func = btf.resolve_must(func.type_id).ty();
             let func_name = name(func.name_off)?;
@@ -801,7 +814,7 @@ fn collect_functions<'file>(
 
             ext_programs.insert(
                 (sec_name.clone(), func_name.clone()),
-                (section_offset, func_btf_id, params_types, proto.return_type),
+                (func_off, func_btf_id, params_types, proto.return_type),
             );
         }
     }
@@ -844,7 +857,7 @@ fn collect_functions<'file>(
                 Some((offset, _, _, _)) if prog_addr != *offset => {
                     return Err(LoaderError::Malformed(format!(
                         "func_info insn offset {offset} does not match symbol address \
-                         for {sec_name}:{prog_name}"
+                         for {sec_name}:{prog_name} reported at {prog_addr}"
                     )));
                 }
                 Some((_, btf_id, params, ret)) => (Some(*btf_id), params.clone(), Some(*ret)),
