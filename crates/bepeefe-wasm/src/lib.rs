@@ -10,7 +10,7 @@ mod vm;
 pub use btf::WasmBtf;
 pub use capture::WasmCapture;
 pub use object::WasmObject;
-pub use vm::{WasmProgram, WasmSession, WasmVm};
+pub use vm::{MapReuseStrategy, WasmProgram, WasmSession, WasmVm};
 
 /// Serialize with BTF maps rendered as plain objects instead of ES
 /// `Map`s.

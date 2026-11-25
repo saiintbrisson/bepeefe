@@ -6,10 +6,33 @@ use bepeefe::{
     btf::{BtfTypeId, value::Value},
     maps::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY},
     verifier::{FieldRule, VerifierConfig},
-    vm::{Cpu, CtxImage, MapHandle, MapReuseStrategy, PreparedProgram, Task, Vm, World},
+    vm::{
+        Cpu, CtxImage, MapHandle, MapReuseStrategy as MapReuse, PreparedProgram, Task, Vm, World,
+    },
 };
 
 use crate::{capture::WasmCapture, disasm, js_err, object::WasmObject};
+
+/// How `load` treats a program's unpinned maps. Mirrors the engine's
+/// `MapReuseStrategy`.
+#[wasm_bindgen]
+#[derive(Clone, Copy, Default)]
+pub enum MapReuseStrategy {
+    /// Every load gets fresh maps.
+    #[default]
+    None,
+    /// Maps share state with an earlier program's map of the same name.
+    MatchByName,
+}
+
+impl From<MapReuseStrategy> for MapReuse {
+    fn from(strategy: MapReuseStrategy) -> Self {
+        match strategy {
+            MapReuseStrategy::None => MapReuse::None,
+            MapReuseStrategy::MatchByName => MapReuse::MatchByName,
+        }
+    }
+}
 
 #[wasm_bindgen]
 pub struct WasmVm {
@@ -37,6 +60,7 @@ impl WasmVm {
         obj: &WasmObject,
         prog_name: &str,
         capture: Option<WasmCapture>,
+        map_reuse: Option<MapReuseStrategy>,
     ) -> Result<WasmProgram, JsError> {
         let prog = obj
             .program(prog_name)
@@ -48,7 +72,7 @@ impl WasmVm {
         };
         let prepared = self
             .inner
-            .prepare(prog, MapReuseStrategy::None, &verifier_config)
+            .prepare(prog, map_reuse.unwrap_or_default().into(), &verifier_config)
             .map_err(|e| JsError::new(&e.to_string()))?;
         Ok(WasmProgram { prepared })
     }
