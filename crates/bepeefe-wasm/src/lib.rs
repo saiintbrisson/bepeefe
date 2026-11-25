@@ -1,11 +1,13 @@
 use wasm_bindgen::prelude::*;
 
+mod btf;
 mod capture;
 mod disasm;
 mod object;
 mod schema;
 mod vm;
 
+pub use btf::WasmBtf;
 pub use capture::WasmCapture;
 pub use object::WasmObject;
 pub use vm::{WasmProgram, WasmSession, WasmVm};

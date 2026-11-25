@@ -1,15 +1,16 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 use wasm_bindgen::prelude::*;
 
 use bepeefe::{
     EbpfObject,
-    btf::{Btf, BtfKind, BtfType, BtfTypeId, Hop, ext::CoreRelo, value::Value},
+    btf::{Btf, BtfTypeId, Hop, ext::CoreRelo},
     hook::Hook,
     object::{EbpfProgram, FunctionSignature},
 };
 
 use crate::{
+    btf::{WasmBtf, type_label},
     disasm, js_err,
     schema::{self, JsonSchema},
     to_js,
@@ -20,14 +21,14 @@ pub struct WasmObject {
     programs: BTreeMap<String, EbpfProgram>,
     signatures: Vec<FunctionSignature>,
     sections: BTreeMap<String, String>,
-    btf: Arc<Btf>,
+    btf: WasmBtf,
 }
 
 #[wasm_bindgen]
 impl WasmObject {
     pub fn parse(elf: &[u8]) -> Result<WasmObject, JsError> {
         let obj = EbpfObject::from_elf(elf).map_err(js_err)?;
-        let btf = obj.btf().clone();
+        let btf = WasmBtf::new(obj.btf().clone());
         let signatures: Vec<_> = obj.programs().cloned().collect();
 
         let mut programs = BTreeMap::new();
@@ -53,66 +54,31 @@ impl WasmObject {
         disasm::to_json(self.lookup(prog_name)?)
     }
 
-    pub fn type_size(&self, type_id: u32) -> u32 {
-        self.btf.type_size(BtfTypeId(type_id))
+    /// The object's own BTF, for passing around without the programs.
+    pub fn btf(&self) -> WasmBtf {
+        self.btf.clone()
     }
 
-    /// Type labels, e.g. "struct sock", "u32", etc.
-    ///
-    /// Returns null when the type has no name or doesn't resolve.
+    pub fn type_size(&self, type_id: u32) -> u32 {
+        self.btf.type_size(type_id)
+    }
+
     #[wasm_bindgen(unchecked_return_type = "string | null")]
     pub fn type_label(&self, type_id: u32) -> Option<String> {
-        let ty = self.btf.types.get(&BtfTypeId(type_id))?;
-        type_label(&self.btf, ty)
+        self.btf.type_label(type_id)
     }
 
-    /// Named struct, union, enum, and int types in this object, sorted
-    /// by label.
     #[wasm_bindgen(unchecked_return_type = "BrowseEntry[]")]
     pub fn browseable_types(&self) -> Result<JsValue, JsError> {
-        let mut out: Vec<BrowseEntry> = Vec::new();
-        for (id, ty) in &self.btf.types {
-            let kind = match &ty.kind {
-                BtfKind::Struct(_) => "struct",
-                BtfKind::Union(_) => "union",
-                BtfKind::Enum(_) | BtfKind::Enum64(_) => "enum",
-                BtfKind::Int(_) => "int",
-                _ => continue,
-            };
-            let Some(label) = type_label(&self.btf, ty) else {
-                continue;
-            };
-            out.push(BrowseEntry {
-                type_id: id.0,
-                label,
-                kind: kind.into(),
-                size: ty.kind.size(&self.btf),
-            });
-        }
-        out.sort_by(|a, b| a.label.cmp(&b.label));
-        to_js(&out)
+        self.btf.browseable_types()
     }
 
-    /// Encode a JSON `Value` to bytes laid out per the given BTF type, matching
-    /// what the engine writes for that type at runtime.
     pub fn value_to_bytes(&self, type_id: u32, value_json: &str) -> Result<Vec<u8>, JsError> {
-        let ty = self
-            .btf
-            .resolve(BtfTypeId(type_id))
-            .ok_or_else(|| JsError::new(&format!("unknown type id {type_id}")))?;
-        let value: Value = serde_json::from_str(value_json).map_err(js_err)?;
-        value.to_bytes(ty).map_err(js_err)
+        self.btf.value_to_bytes(type_id, value_json)
     }
 
-    /// Inverse of `value_to_bytes`. Decode bytes into a `Value` shaped
-    /// by the given BTF type.
     pub fn value_from_bytes(&self, type_id: u32, bytes: &[u8]) -> Result<String, JsError> {
-        let ty = self
-            .btf
-            .resolve(BtfTypeId(type_id))
-            .ok_or_else(|| JsError::new(&format!("unknown type id {type_id}")))?;
-        let value = Value::from_bytes(ty, bytes).map_err(js_err)?;
-        serde_json::to_string(&value).map_err(js_err)
+        self.btf.value_from_bytes(type_id, bytes)
     }
 
     /// Programs in this object and their schemas.
@@ -137,7 +103,7 @@ impl WasmObject {
                         .map(|(name, tid)| ParamSchema {
                             name: name.clone(),
                             type_id: tid.0,
-                            schema: schema::type_to_schema(*tid, &self.btf),
+                            schema: schema::type_to_schema(*tid, self.btf.inner()),
                         })
                         .collect(),
                 }
@@ -162,8 +128,8 @@ impl WasmObject {
                 value_size: m.value_size,
                 key_type_id: m.key.map(|t| t.0),
                 value_type_id: m.value.map(|t| t.0),
-                key: m.key.map(|t| schema::type_to_schema(t, &self.btf)),
-                value: m.value.map(|t| schema::type_to_schema(t, &self.btf)),
+                key: m.key.map(|t| schema::type_to_schema(t, self.btf.inner())),
+                value: m.value.map(|t| schema::type_to_schema(t, self.btf.inner())),
             })
             .collect();
         to_js(&out)
@@ -172,7 +138,7 @@ impl WasmObject {
     /// Single-type schema lookup for an BTF id.
     #[wasm_bindgen(unchecked_return_type = "JsonSchema")]
     pub fn type_schema(&self, type_id: u32) -> Result<JsValue, JsError> {
-        to_js(&schema::type_to_schema(BtfTypeId(type_id), &self.btf))
+        self.btf.type_schema(type_id)
     }
 
     /// CO-RE relocations from .BTF.ext, each with its access path resolved
@@ -181,18 +147,20 @@ impl WasmObject {
     pub fn core_relos(&self) -> Result<JsValue, JsError> {
         let out: Vec<CoreReloEntry> = self
             .btf
+            .inner()
             .ext
             .core_relo
             .iter()
             .flat_map(|sec| {
                 let section = self
                     .btf
+                    .inner()
                     .string(sec.sec_name_off)
                     .unwrap_or_default()
                     .into_owned();
                 sec.data
                     .iter()
-                    .map(move |relo| core_relo_entry(&self.btf, &section, relo))
+                    .map(move |relo| core_relo_entry(self.btf.inner(), &section, relo))
             })
             .collect();
         to_js(&out)
@@ -268,21 +236,6 @@ fn hop_name(hop: &Hop<'_>) -> String {
     }
 }
 
-/// C-style label for a named type, or the bare name for kinds that don't take a
-/// prefix.
-fn type_label(btf: &Btf, ty: &BtfType) -> Option<String> {
-    let name = btf.string(ty.name_off)?;
-    if name.is_empty() {
-        return None;
-    }
-    Some(match &ty.kind {
-        BtfKind::Struct(_) => format!("struct {name}"),
-        BtfKind::Union(_) => format!("union {name}"),
-        BtfKind::Enum(_) | BtfKind::Enum64(_) => format!("enum {name}"),
-        _ => name.into_owned(),
-    })
-}
-
 #[derive(serde::Serialize)]
 struct ProgramSchema {
     name: String,
@@ -303,14 +256,6 @@ struct ParamSchema {
 #[derive(serde::Serialize)]
 struct HookInfo {
     raw: String,
-}
-
-#[derive(serde::Serialize)]
-struct BrowseEntry {
-    type_id: u32,
-    label: String,
-    kind: String,
-    size: u32,
 }
 
 #[derive(serde::Serialize)]
